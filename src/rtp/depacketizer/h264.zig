@@ -7,15 +7,20 @@ const Writer = std.Io.Writer;
 
 const annexb_start_code = @import("media").h264.annexb_start_code;
 const fu_header_size: usize = 2;
-const stapa_length_size: usize = 2;
 
 pub const PacketType = enum { annexb, avc };
 
 pub const Error = error{ ShortBuffer, UnsupportedNalType, InvalidFUAPacket, InvalidStapAPacket, UnsupportedPacketType };
 
+const FuHeader = packed struct {
+    nal_type: h264.NalType,
+    r: bool = false,
+    e: bool,
+    s: bool,
+};
+
 packet_type: PacketType = .annexb,
-fu_started: bool = false,
-fu_offset: usize = 0,
+fu_offset: ?usize = null,
 
 /// Initializes a new H264 depacketizer with the specified packet type.
 pub fn init(packet_type: PacketType) Self {
@@ -27,7 +32,8 @@ pub fn init(packet_type: PacketType) Self {
 /// Returns the number of bytes written in case the whole NAL units is written, null if more packets needed
 /// or an error if the packet is invalid or the buffer is too small.
 pub fn depacketize(self: *Self, payload: []const u8, dest: []u8) !?FrameInfo {
-    switch (payload[0] & 0x1F) {
+    const rtp_nal_header: h264.NalHeader = @bitCast(payload[0]);
+    switch (@intFromEnum(rtp_nal_header.nal_type)) {
         // Single NAL Unit Packet
         1...21 => {
             if (dest.len < payload.len + annexb_start_code.len) {
@@ -35,72 +41,78 @@ pub fn depacketize(self: *Self, payload: []const u8, dest: []u8) !?FrameInfo {
             }
             self.writePrefix(dest, payload.len);
             @memcpy(dest[annexb_start_code.len .. annexb_start_code.len + payload.len], payload);
-            return .{ .written = payload.len + annexb_start_code.len, .keyframe = h264.NalHeader.fromByte(payload[0]).type == .idr };
+            return .{ .written = payload.len + annexb_start_code.len, .keyframe = rtp_nal_header.nal_type == .idr };
         },
         // STAP-A Packet
-        24 => {
+        @intFromEnum(h264.NalType.stap_a) => {
             @branchHint(.unlikely);
-            var slice = payload[1..];
-            var offset: usize = 0;
             var keyframe = false;
 
-            while (slice.len > 0) {
-                if (slice.len < stapa_length_size) {
-                    return error.InvalidStapAPacket;
-                }
-
-                const nal_size = std.mem.readInt(u16, slice[0..stapa_length_size], .big);
-                slice = slice[stapa_length_size..];
-                if (slice.len < nal_size) return error.InvalidStapAPacket;
-                if (dest.len < offset + nal_size + annexb_start_code.len) return Error.ShortBuffer;
-
-                self.writePrefix(dest[offset .. offset + annexb_start_code.len], nal_size);
-                offset += annexb_start_code.len;
-                @memcpy(dest[offset .. offset + nal_size], slice[0..nal_size]);
-                offset += nal_size;
-
-                keyframe = keyframe or h264.NalHeader.fromByte(slice[0]).type == .idr;
-                slice = slice[nal_size..];
+            var reader = std.Io.Reader.fixed(payload[1..]);
+            var writer = std.Io.Writer.fixed(dest);
+            while (true) {
+                const nal_header = self.writeNal(&reader, &writer) catch |err| switch (err) {
+                    error.WriteFailed => return error.ShortBuffer,
+                    error.EndOfStream => if (reader.bufferedLen() == 0) break else return error.InvalidStapAPacket,
+                    else => unreachable,
+                };
+                keyframe = keyframe or nal_header.nal_type == .idr;
             }
 
-            return .{ .written = offset, .keyframe = keyframe };
+            return .{ .written = writer.buffered().len, .keyframe = keyframe };
         },
         // FU-A Packet
-        28 => {
+        @intFromEnum(h264.NalType.fu_a) => {
             @branchHint(.likely);
-            const start_bit = payload[1] & 0x80 != 0;
-            const end_bit = payload[1] & 0x40 != 0;
+            const fu_header: FuHeader = @bitCast(payload[1]);
 
-            if (start_bit and self.fu_started or end_bit and !self.fu_started) return error.InvalidFUAPacket;
+            if (fu_header.s and self.fu_offset != null or !fu_header.s and self.fu_offset == null) {
+                return error.InvalidFUAPacket;
+            }
+
             const expected_size = blk: {
                 const size = payload.len - fu_header_size;
-                if (start_bit) {
-                    self.fu_started = true;
+                if (fu_header.s) {
                     self.fu_offset = annexb_start_code.len + 1;
                     break :blk size + annexb_start_code.len + 1;
                 }
                 break :blk size;
             };
 
-            if (dest.len < self.fu_offset + expected_size) return error.ShortBuffer;
-            @memcpy(dest[self.fu_offset .. self.fu_offset + payload.len - fu_header_size], payload[fu_header_size..]);
-            self.fu_offset += payload.len - fu_header_size;
+            const write_pos = self.fu_offset.?;
+            if (dest.len < write_pos + expected_size) {
+                return error.ShortBuffer;
+            }
 
-            if (end_bit) {
-                const nri = (payload[0] >> 5) & 0x03;
-                self.writePrefix(dest[0..], self.fu_offset - annexb_start_code.len);
-                dest[annexb_start_code.len] = (nri << 5) | (payload[1] & 0x1F);
+            @memcpy(dest[write_pos .. write_pos + payload.len - fu_header_size], payload[fu_header_size..]);
+            self.fu_offset = write_pos + payload.len - fu_header_size;
 
-                const result = self.fu_offset;
-                self.fu_started = false;
-                self.fu_offset = 0;
-                return .{ .written = result, .keyframe = h264.NalHeader.fromByte(dest[annexb_start_code.len]).type == .idr };
+            if (fu_header.e) {
+                defer self.fu_offset = null;
+
+                self.writePrefix(dest[0..], self.fu_offset.? - annexb_start_code.len);
+                dest[annexb_start_code.len] = @bitCast(h264.NalHeader{
+                    .ref_idc = rtp_nal_header.ref_idc,
+                    .nal_type = fu_header.nal_type,
+                });
+
+                return .{ .written = self.fu_offset.?, .keyframe = fu_header.nal_type == .idr };
             }
 
             return null;
         },
         else => return error.UnsupportedNalType,
     }
+}
+
+fn writeNal(self: *Self, r: *std.Io.Reader, w: *std.Io.Writer) !h264.NalHeader {
+    const nal_size = try r.takeInt(u16, .big);
+    const slice = try w.writableSlice(4);
+    self.writePrefix(slice, nal_size);
+    const nal = try r.take(nal_size);
+    try w.writeAll(nal);
+
+    return h264.NalHeader.fromByte(nal[0]);
 }
 
 fn writePrefix(self: *Self, slice: []u8, nal_size: usize) void {
@@ -195,4 +207,24 @@ test "Invalid StapA packet" {
 
     const written = depacketizer.depacketize(&invalid_stap_a_packet, &buffer);
     try std.testing.expectError(Error.InvalidStapAPacket, written);
+}
+
+test "Depacketize FU-A" {
+    const fua_start = [_]u8{ 0x7C, 0x85 } ++ [_]u8{0xAB} ** 160;
+    const fua_middle = [_]u8{ 0x7C, 0x05 } ++ [_]u8{0xCD} ** 160;
+    const fua_end = [_]u8{ 0x7C, 0x45 } ++ [_]u8{0xEF} ** 160;
+
+    var buffer: [1024]u8 = undefined;
+    var depacketizer: Self = .init(.annexb);
+
+    var frame_info = try depacketizer.depacketize(&fua_start, &buffer);
+    try std.testing.expectEqual(null, frame_info);
+
+    frame_info = try depacketizer.depacketize(&fua_middle, &buffer);
+    try std.testing.expectEqual(null, frame_info);
+
+    frame_info = try depacketizer.depacketize(&fua_end, &buffer);
+    try std.testing.expect(frame_info != null);
+
+    try std.testing.expectEqual(485, frame_info.?.written);
 }
