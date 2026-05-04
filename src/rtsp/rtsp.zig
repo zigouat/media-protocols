@@ -161,9 +161,7 @@ pub const StatusLine = struct {
     }
 
     fn write(status_line: *const StatusLine, writer: *std.Io.Writer) !void {
-        try writer.writeAll("RTSP/1.0 ");
-        try writer.writeInt(u16, status_line.status_code, .big);
-        try writer.writeAll(status_line.reason_phrase);
+        try writer.print("RTSP/1.0 {} {s}\r\n", .{ status_line.status_code, status_line.reason_phrase });
     }
 };
 
@@ -220,6 +218,7 @@ pub const Parser = struct {
     pub fn getRequestLine(parser: *Parser) Error!RequestLine {
         if (parser.parse_state != .first_line) return error.ParseError;
         const line = try readLine(parser.reader);
+
         const result = try RequestLine.parse(line);
         parser.parse_state = .header;
         return result;
@@ -304,6 +303,11 @@ pub const Writer = struct {
     pub fn writeCSeq(self: *Writer, cseq: u64) std.Io.Writer.Error!void {
         _ = try self.writer.write("CSeq: ");
         try self.writer.print("{}\r\n", .{cseq});
+    }
+
+    pub fn writeContentLength(self: *Writer, size: usize) std.Io.Writer.Error!void {
+        _ = try self.writer.write("Content-Length: ");
+        try self.writer.print("{}\r\n", .{size});
     }
 
     pub fn writeTransportHeader(self: *Writer, header: TransportHeader) std.Io.Writer.Error!void {
