@@ -11,40 +11,12 @@ const Server = @This();
 reader: *Reader,
 writer: *Writer,
 
-pub const Method = enum {
-    OPTIONS,
-    DESCRIBE,
-    ANNOUNCE,
-    SETUP,
-    PLAY,
-    PAUSE,
-    TEARDOWN,
-    GET_PARAMETER,
-    SET_PARAMETER,
-    REDIRECT,
-    RECORD,
-
-    pub fn expectBody(self: Method) bool {
-        return switch (self) {
-            .ANNOUNCE, .SET_PARAMETER => true,
-            else => false,
-        };
-    }
-
-    pub fn responseExpectBody(self: Method) bool {
-        return switch (self) {
-            .DESCRIBE, .GET_PARAMETER => true,
-            else => false,
-        };
-    }
-};
-
 pub const Request = struct {
     server: *Server,
     head: Head,
 
     pub const Head = struct {
-        method: Method,
+        method: rtsp.Method,
         uri: []const u8,
         cseq: u32,
         session: ?[]const u8,
@@ -68,7 +40,7 @@ pub const Request = struct {
             var it2 = std.mem.splitScalar(u8, first_line, ' ');
 
             const method_str = it2.next() orelse return error.RtspHeadersInvalid;
-            const method = std.meta.stringToEnum(Method, method_str) orelse return error.UnknownRtspMethod;
+            const method = std.meta.stringToEnum(rtsp.Method, method_str) orelse return error.UnknownRtspMethod;
 
             const uri = it2.next() orelse return error.RtspHeadersInvalid;
             const version = std.mem.trim(u8, it2.rest(), " \t");
@@ -138,7 +110,7 @@ pub const Request = struct {
     };
 
     pub const RespondOptions = struct {
-        status: rtsp.Status = .ok,
+        status: rtsp.Status = .success,
         reason: ?[]const u8 = null,
         extra_headers: []const rtsp.Header = &.{},
     };
@@ -196,13 +168,14 @@ pub fn receiveHead(s: *Server) !Request {
 pub fn writeRtpPacket(s: *Server, channel: u8, packet: rtp.Packet) !void {
     try s.writer.writeByte('$');
     try s.writer.writeInt(u8, channel, .big);
-    try s.writer.writeInt(u16, @intCast(12 + packet.payload.len), .big);
+    try s.writer.writeInt(u16, @intCast(packet.size()), .big);
     try packet.write(s.writer);
 }
 
 fn receiveHeadFromReader(r: *Reader) ![]const u8 {
     const max_head_size = r.buffer.len;
     var head_len: usize = 0;
+    var hp = std.http.HeadParser{};
     while (true) {
         if (head_len >= max_head_size) return error.RtspHeadersOversize;
         const remaining = r.buffered()[head_len..];
@@ -214,9 +187,8 @@ fn receiveHeadFromReader(r: *Reader) ![]const u8 {
             continue;
         }
 
-        // find \r\n\r\n or \n\n
-        if (std.mem.findPos(u8, remaining, 0, "\r\n\r\n")) |pos| {
-            head_len += pos + 4;
+        head_len += hp.feed(remaining);
+        if (hp.state == .finished) {
             const result = r.buffered()[0..head_len];
             r.toss(head_len);
             return result;

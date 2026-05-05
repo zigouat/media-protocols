@@ -9,13 +9,74 @@ pub const Error = error{
     ParseError,
 } || std.mem.Allocator.Error || Reader.Error;
 
+pub const Method = enum {
+    OPTIONS,
+    DESCRIBE,
+    ANNOUNCE,
+    SETUP,
+    PLAY,
+    PAUSE,
+    TEARDOWN,
+    GET_PARAMETER,
+    SET_PARAMETER,
+    REDIRECT,
+    RECORD,
+
+    pub fn expectBody(self: Method) bool {
+        return switch (self) {
+            .ANNOUNCE, .SET_PARAMETER => true,
+            else => false,
+        };
+    }
+
+    pub fn responseExpectBody(self: Method) bool {
+        return switch (self) {
+            .DESCRIBE, .GET_PARAMETER => true,
+            else => false,
+        };
+    }
+};
+
 pub const Status = enum(u10) {
-    ok = 200,
+    success = 200,
+    low_on_storage = 250,
+
+    method_not_allowed = 405,
+    parameter_not_understood = 451,
+    conference_not_found = 452,
+    not_enough_bandwidth = 453,
+    session_not_found = 454,
+    invalid_method = 455,
+    invalid_header = 456,
+    invalid_range = 457,
+    parameter_readonly = 458,
+    aggregate_not_allowed = 459,
+    only_aggregate = 460,
+    unsupported_transport = 461,
+    destination_unreachable = 462,
+
+    option_not_supported = 551,
+
     _,
 
     pub fn phrase(self: Status) ?[]const u8 {
         return switch (self) {
-            .ok => "OK",
+            .success => "SUCCESS",
+            .low_on_storage => "Low on Storage Space",
+            .method_not_allowed => "Method Not Allowed",
+            .parameter_not_understood => "Parameter Not Understood",
+            .conference_not_found => "Parameter Not Understood",
+            .not_enough_bandwidth => "Not Enough Bandwidth",
+            .session_not_found => "Session Not Found",
+            .invalid_method => "Method Not Valid in This State",
+            .invalid_header => "Header Field Not Valid for Resource",
+            .invalid_range => "Invalid Range",
+            .parameter_readonly => "Parameter Is Read-Only",
+            .aggregate_not_allowed => "Aggregate Operation Not Allowed",
+            .only_aggregate => "Only Aggregate Operation Allowed",
+            .unsupported_transport => "Unsupported Transport",
+            .destination_unreachable => "Destination Unreachable",
+            .option_not_supported => "Option not supported",
             else => null,
         };
     }
@@ -63,73 +124,6 @@ pub const Header = struct {
         const header = Header{ .name = "CSeq", .value = "2" };
         try header.write(&writer);
         try std.testing.expectEqualStrings("CSeq: 2\r\n", writer.buffer[0..writer.end]);
-    }
-};
-
-const methods = std.StaticStringMap(Method).initComptime(&.{
-    .{ "OPTIONS", Method.options },
-    .{ "DESCRIBE", Method.describe },
-    .{ "ANNOUNCE", Method.announce },
-    .{ "SETUP", Method.setup },
-    .{ "PLAY", Method.play },
-    .{ "PAUSE", Method.pause },
-    .{ "TEARDOWN", Method.teardown },
-    .{ "GET_PARAMETER", Method.get_parameter },
-    .{ "SET_PARAMETER", Method.set_parameter },
-    .{ "REDIRECT", Method.redirect },
-    .{ "RECORD", Method.record },
-});
-
-pub const uri_flags: std.Uri.Format.Flags = .{
-    .authentication = false,
-    .scheme = true,
-    .authority = true,
-    .path = true,
-    .query = true,
-    .fragment = true,
-};
-
-pub const Method = enum {
-    options,
-    describe,
-    announce,
-    setup,
-    play,
-    pause,
-    teardown,
-    get_parameter,
-    set_parameter,
-    redirect,
-    record,
-
-    pub fn toString(self: *const Method) []const u8 {
-        return switch (self.*) {
-            .options => "OPTIONS",
-            .describe => "DESCRIBE",
-            .announce => "ANNOUNCE",
-            .setup => "SETUP",
-            .play => "PLAY",
-            .pause => "PAUSE",
-            .teardown => "TEARDOWN",
-            .get_parameter => "GET_PARAMETER",
-            .set_parameter => "SET_PARAMETER",
-            .redirect => "REDIRECT",
-            .record => "RECORD",
-        };
-    }
-
-    test "toString" {
-        try std.testing.expectEqualStrings("OPTIONS", Method.options.toString());
-        try std.testing.expectEqualStrings("DESCRIBE", Method.describe.toString());
-        try std.testing.expectEqualStrings("ANNOUNCE", Method.announce.toString());
-        try std.testing.expectEqualStrings("SETUP", Method.setup.toString());
-        try std.testing.expectEqualStrings("PLAY", Method.play.toString());
-        try std.testing.expectEqualStrings("PAUSE", Method.pause.toString());
-        try std.testing.expectEqualStrings("TEARDOWN", Method.teardown.toString());
-        try std.testing.expectEqualStrings("GET_PARAMETER", Method.get_parameter.toString());
-        try std.testing.expectEqualStrings("SET_PARAMETER", Method.set_parameter.toString());
-        try std.testing.expectEqualStrings("REDIRECT", Method.redirect.toString());
-        try std.testing.expectEqualStrings("RECORD", Method.record.toString());
     }
 };
 
@@ -195,6 +189,15 @@ pub const TransportHeader = struct {
     }
 };
 
+pub const uri_flags: std.Uri.Format.Flags = .{
+    .authentication = false,
+    .scheme = true,
+    .authority = true,
+    .path = true,
+    .query = true,
+    .fragment = true,
+};
+
 pub const StatusLine = struct {
     version: []const u8,
     status_code: u16,
@@ -223,44 +226,6 @@ pub const StatusLine = struct {
     }
 };
 
-pub const RequestLine = struct {
-    method: Method,
-    uri: std.Uri,
-
-    pub fn parse(line: []const u8) !RequestLine {
-        var iterator = std.mem.tokenizeScalar(u8, line, ' ');
-        const method = blk: {
-            if (iterator.next()) |str| {
-                if (methods.get(str)) |method| break :blk method else return error.ParseError;
-            } else return error.ParseError;
-        };
-        const uri = iterator.next() orelse return error.ParseError;
-        if (!std.mem.eql(u8, iterator.rest(), "RTSP/1.0")) return error.ParseError;
-
-        return .{ .method = method, .uri = std.Uri.parse(uri) catch return error.ParseError };
-    }
-
-    pub fn write(self: *const RequestLine, path: ?[]const u8, writer: *std.Io.Writer) std.Io.Writer.Error!void {
-        _ = try writer.write(self.method.toString());
-        _ = try writer.writeByte(' ');
-
-        const absolute_path = if (path) |p| std.mem.startsWith(u8, p, "rtsp") else false;
-
-        if (!absolute_path) {
-            try std.Uri.writeToStream(&self.uri, writer, uri_flags);
-        }
-
-        if (path) |p| {
-            if (!std.mem.startsWith(u8, p, "/")) {
-                _ = try writer.writeByte('/');
-            }
-            _ = try writer.write(p);
-        }
-
-        _ = try writer.write(" RTSP/1.0\r\n");
-    }
-};
-
 /// A lazy parser for RTSP messages.
 pub const Parser = struct {
     reader: *Reader,
@@ -271,15 +236,6 @@ pub const Parser = struct {
 
     pub fn init(reader: *Reader) Parser {
         return Parser{ .reader = reader };
-    }
-
-    pub fn getRequestLine(parser: *Parser) Error!RequestLine {
-        if (parser.parse_state != .first_line) return error.ParseError;
-        const line = try readLine(parser.reader);
-
-        const result = try RequestLine.parse(line);
-        parser.parse_state = .header;
-        return result;
     }
 
     pub fn getResponseStatus(parser: *Parser) Error!StatusLine {
@@ -344,10 +300,6 @@ pub const Writer = struct {
 
     pub fn init(writer: *std.Io.Writer) Writer {
         return Writer{ .writer = writer };
-    }
-
-    pub fn writeRequestLine(self: *Writer, path: ?[]const u8, request_line: RequestLine) std.Io.Writer.Error!void {
-        try request_line.write(path, self.writer);
     }
 
     pub fn writeStatusLine(self: *Writer, status_line: StatusLine) std.Io.Writer.Error!void {
@@ -645,12 +597,6 @@ test "DigestAuthParams: parse" {
     try std.testing.expectEqualStrings("abc123", auth_params.nonce);
 }
 
-test "request line: invalid request" {
-    try std.testing.expectError(error.ParseError, RequestLine.parse("METHOD /url RTSP/1.0"));
-    try std.testing.expectError(error.ParseError, RequestLine.parse("DESCRIBE /hello RTSP/1.0"));
-    try std.testing.expectError(error.ParseError, RequestLine.parse("DESCRIBE rtsp://example.com/hello RTSP/1.1"));
-}
-
 test "response parser" {
     const response_text = "RTSP/1.0 200 OK\r\nCSeq: 2\r\nSession: 12345678\r\nContent-Length: 13\r\n\r\nHello, World!";
     var reader = Reader.fixed(response_text);
@@ -683,40 +629,6 @@ test "response parser" {
     try std.testing.expectEqualStrings("Hello, World!", body.?);
 }
 
-test "request parser" {
-    const response_text = "ANNOUNCE  rtsp://example.com/my/stream RTSP/1.0\nCSeq: 2\r\nSession: 12345678\r\nContent-Length: 13\r\n\r\nHello, World!";
-    var reader = Reader.fixed(response_text);
-    var parser = Parser.init(&reader);
-
-    const request_line = try parser.getRequestLine();
-
-    try std.testing.expectEqual(.announce, request_line.method);
-    try std.testing.expectEqualStrings("/my/stream", request_line.uri.path.percent_encoded);
-
-    var header = try parser.nextHeader();
-    try std.testing.expect(header != null);
-    try std.testing.expectEqualStrings("CSeq", header.?.name);
-    try std.testing.expectEqualStrings("2", header.?.value);
-
-    header = try parser.nextHeader();
-    try std.testing.expect(header != null);
-    try std.testing.expectEqualStrings("Session", header.?.name);
-    try std.testing.expectEqualStrings("12345678", header.?.value);
-
-    header = try parser.nextHeader();
-    try std.testing.expect(header != null);
-    try std.testing.expectEqualStrings("Content-Length", header.?.name);
-    try std.testing.expectEqualStrings("13", header.?.value);
-
-    header = try parser.nextHeader();
-    try std.testing.expect(header == null);
-
-    const body = try parser.getBody();
-    try std.testing.expect(body != null);
-    try std.testing.expectEqualStrings("Hello, World!", body.?);
-}
-
 test {
     std.testing.refAllDecls(@This());
-    _ = @import("server.zig");
 }
