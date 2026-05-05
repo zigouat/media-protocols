@@ -41,6 +41,10 @@ pub const Extension = struct {
         try writer.writeInt(u16, @intCast(@divExact(ext.data.len, 4)), .big);
         try writer.writeAll(ext.data);
     }
+
+    inline fn size(ext: *const Extension) usize {
+        return ext.data.len + 4;
+    }
 };
 
 header: Header,
@@ -111,6 +115,14 @@ pub fn format(self: Self, writer: *std.Io.Writer) !void {
     try writer.print("{d} bytes\n", .{self.payload.len});
 }
 
+const header_size = @divExact(@bitSizeOf(Header), 8);
+
+pub fn size(packet: *const Self) usize {
+    const ext_size = if (packet.extension) |ext| ext.size() else 0;
+    const padding_size = if (packet.header.padding) 4 - @rem(packet.payload.len + ext_size, 4) else 0;
+    return header_size + packet.csrc_list.len * 4 + ext_size + packet.payload.len + padding_size;
+}
+
 test "parse packet" {
     const rtp_packet: [16]u8 = [_]u8{
         0x80, 0xE0, 0x51, 0xA4, 0x00, 0x0D, 0xDF,
@@ -130,6 +142,8 @@ test "parse packet" {
     try std.testing.expect(packet.header.timestamp == 0x000DDF22);
     try std.testing.expect(packet.header.ssrc == 0x54A7D4F3);
     try std.testing.expectEqualSlices(u8, &[_]u8{ 0x01, 0x02, 0x03, 0x04 }, packet.payload);
+
+    try std.testing.expectEqual(16, packet.size());
 }
 
 test "packet too short" {
@@ -157,6 +171,8 @@ test "packet with csrc" {
     for (csrc_list, parsed_packet.csrc_list) |csrc, parsed_csrc| {
         try std.testing.expect(csrc == parsed_csrc);
     }
+
+    try std.testing.expectEqual(29, parsed_packet.size());
 }
 
 test "packet with extension" {
@@ -183,12 +199,14 @@ test "packet with padding" {
         0xB8, 0x30, 0x73, 0xBD, 0xDE, 0x00, 0x03,
         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x05, 0x00, 0x09, 0x00, 0x00, 0x00, 0x04,
+        0x05, 0x00, 0x00, 0x00, 0x00, 0x04,
     };
 
     const parsed_packet = try Self.parse(packet[0..]);
     try std.testing.expect(parsed_packet.header.padding);
     try std.testing.expect(parsed_packet.padding_size == 4);
+
+    try std.testing.expectEqual(48, parsed_packet.size());
 }
 
 test "write packet" {
