@@ -1,6 +1,7 @@
 //! Handles a single client session
 const std = @import("std");
 const rtsp = @import("rtsp.zig");
+const rtp = @import("rtp");
 
 const Reader = std.Io.Reader;
 const Writer = std.Io.Writer;
@@ -189,6 +190,14 @@ pub fn receiveHead(s: *Server) !Request {
         .head = Request.Head.parse(head_buffer) catch return error.RtspHeadersInvalid,
         .server = s,
     };
+}
+
+/// Writes rtp packet interleaved with RTSP/RTCP packets.
+pub fn writeRtpPacket(s: *Server, channel: u8, packet: rtp.Packet) !void {
+    try s.writer.writeByte('$');
+    try s.writer.writeInt(u8, channel, .big);
+    try s.writer.writeInt(u16, @intCast(12 + packet.payload.len), .big);
+    try packet.write(s.writer);
 }
 
 fn receiveHeadFromReader(r: *Reader) ![]const u8 {
