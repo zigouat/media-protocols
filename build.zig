@@ -31,7 +31,12 @@ pub fn build(b: *std.Build) void {
         },
     });
 
-    _ = b.addModule("protocols", .{
+    const stun = b.addModule("stun", .{
+        .root_source_file = b.path("src/stun/stun.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .imports = &.{
@@ -61,10 +66,17 @@ pub fn build(b: *std.Build) void {
         });
         const run_rtsp_tests = b.addRunArtifact(rtsp_tests);
 
+        const stun_tests = b.addTest(.{
+            .root_module = stun,
+            .filters = test_filters,
+        });
+        const run_stun_tests = b.addRunArtifact(stun_tests);
+
         const test_step = b.step("test", "Run tests");
         test_step.dependOn(&run_rtp_tests.step);
         test_step.dependOn(&run_sdp_tests.step);
         test_step.dependOn(&run_rtsp_tests.step);
+        test_step.dependOn(&run_stun_tests.step);
     }
 
     {
