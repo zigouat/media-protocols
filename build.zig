@@ -37,12 +37,14 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    _ = b.addModule("protocols", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .imports = &.{
             .{ .name = "rtp", .module = rtp },
             .{ .name = "sdp", .module = sdp },
             .{ .name = "rtsp", .module = rtsp },
+            .{ .name = "stun", .module = stun },
         },
     });
 
