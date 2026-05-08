@@ -31,6 +31,12 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    const stun = b.addModule("stun", .{
+        .root_source_file = b.path("src/stun/stun.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     _ = b.addModule("protocols", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
@@ -38,6 +44,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "rtp", .module = rtp },
             .{ .name = "sdp", .module = sdp },
             .{ .name = "rtsp", .module = rtsp },
+            .{ .name = "stun", .module = stun },
         },
     });
 
@@ -61,10 +68,17 @@ pub fn build(b: *std.Build) void {
         });
         const run_rtsp_tests = b.addRunArtifact(rtsp_tests);
 
+        const stun_tests = b.addTest(.{
+            .root_module = stun,
+            .filters = test_filters,
+        });
+        const run_stun_tests = b.addRunArtifact(stun_tests);
+
         const test_step = b.step("test", "Run tests");
         test_step.dependOn(&run_rtp_tests.step);
         test_step.dependOn(&run_sdp_tests.step);
         test_step.dependOn(&run_rtsp_tests.step);
+        test_step.dependOn(&run_stun_tests.step);
     }
 
     {
@@ -73,6 +87,7 @@ pub fn build(b: *std.Build) void {
         const benches = .{
             .{ .name = "rtp_packet", .src = "bench/rtp/packet.zig" },
             .{ .name = "sdp_session", .src = "bench/sdp/session.zig" },
+            .{ .name = "stun_message", .src = "bench/stun/message.zig" },
         };
 
         inline for (benches) |bench| {
@@ -86,6 +101,7 @@ pub fn build(b: *std.Build) void {
                         .{ .name = "zbench", .module = zbench.module("zbench") },
                         .{ .name = "rtp", .module = rtp },
                         .{ .name = "sdp", .module = sdp },
+                        .{ .name = "stun", .module = stun },
                     },
                 }),
             });
