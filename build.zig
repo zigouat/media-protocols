@@ -87,6 +87,7 @@ pub fn build(b: *std.Build) void {
         const benches = .{
             .{ .name = "rtp_packet", .src = "bench/rtp/packet.zig" },
             .{ .name = "sdp_session", .src = "bench/sdp/session.zig" },
+            .{ .name = "stun_message", .src = "bench/stun/message.zig" },
         };
 
         inline for (benches) |bench| {
@@ -100,6 +101,7 @@ pub fn build(b: *std.Build) void {
                         .{ .name = "zbench", .module = zbench.module("zbench") },
                         .{ .name = "rtp", .module = rtp },
                         .{ .name = "sdp", .module = sdp },
+                        .{ .name = "stun", .module = stun },
                     },
                 }),
             });
