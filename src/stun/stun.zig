@@ -55,9 +55,17 @@ pub const Header = packed struct {
     _pad: u2 = 0,
 };
 
+/// Describes a Stun message.
 pub const Message = struct {
     header: Header,
     bytes: []const u8,
+
+    pub const Error = error{
+        /// Magic cookie in the header doesn't match the Stun defined one.
+        WrongMagicCookie,
+        /// The length reported in the header is not equal to the body of the stun message.
+        InvalidLength,
+    };
 
     pub fn iterateAttributes(message: *const Message, passwd: []const u8) AttributeIterator {
         var reader = std.Io.Reader.fixed(message.bytes);
@@ -65,13 +73,17 @@ pub const Message = struct {
         return .{ .reader = reader, .password = passwd };
     }
 
-    pub fn parse(msg: []const u8) !Message {
+    pub fn parse(msg: []const u8) Error!Message {
         std.debug.assert(msg.len >= header_size);
 
         const header_int = std.mem.readInt(@typeInfo(Header).@"struct".backing_integer.?, msg[0..header_size], .big);
         const header: Header = @bitCast(header_int);
         if (header.magic_cookie != magic_cookie) {
             return error.WrongMagicCookie;
+        }
+
+        if (header.message_length != msg.len - header_size) {
+            return error.InvalidLength;
         }
 
         return .{
@@ -86,11 +98,13 @@ pub const AttributeType = enum(u16) {
     username = 0x0006,
     message_integrity = 0x0008,
     xor_mapped_address = 0x0020,
+    use_candidate = 0x0025,
     userhash = 0x001E,
     priority = 0x0024,
     software = 0x8022,
     fingerprint = 0x8028,
     ice_controlled = 0x8029,
+    ice_controlling = 0x802A,
     unknown = 0xFFFF,
     _,
 };
@@ -100,11 +114,13 @@ pub const Attribute = union(AttributeType) {
     username: []const u8,
     message_integrity: []const u8,
     xor_mapped_address: Io.net.IpAddress,
+    use_candidate: void,
     userhash: []const u8,
     priority: u32,
     software: []const u8,
     fingerprint: u32,
     ice_controlled: u64,
+    ice_controlling: u64,
     unknown: struct { AttributeType, []const u8 },
 };
 
@@ -143,9 +159,14 @@ pub const AttributeIterator = struct {
                 if (attr_len != 4) return error.InvalidAttribute;
                 break :blk .{ .priority = std.mem.readInt(u32, attr_value[0..4], .big) };
             },
-            .ice_controlled => blk: {
+            .ice_controlled, .ice_controlling => blk: {
                 if (attr_len != 8) return error.InvalidAttribute;
-                break :blk .{ .ice_controlled = std.mem.readInt(u64, attr_value[0..8], .big) };
+                const tie_breaker = std.mem.readInt(u64, attr_value[0..8], .big);
+                break :blk if (attr_type == .ice_controlled) .{ .ice_controlled = tie_breaker } else .{ .ice_controlling = tie_breaker };
+            },
+            .use_candidate => blk: {
+                if (attr_value.len != 0) return error.InvalidAttribute;
+                break :blk .use_candidate;
             },
             .message_integrity => blk: {
                 if (attr_len != 20) break :blk error.InvalidAttribute;
