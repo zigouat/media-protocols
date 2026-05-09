@@ -93,10 +93,16 @@ pub const Message = struct {
     }
 };
 
+pub const StunError = struct {
+    code: u16,
+    reason: []const u8,
+};
+
 pub const AttributeType = enum(u16) {
     mapped_address = 0x0001,
     username = 0x0006,
     message_integrity = 0x0008,
+    error_code = 0x0009,
     xor_mapped_address = 0x0020,
     use_candidate = 0x0025,
     userhash = 0x001E,
@@ -113,6 +119,7 @@ pub const Attribute = union(AttributeType) {
     mapped_address: Io.net.IpAddress,
     username: []const u8,
     message_integrity: []const u8,
+    error_code: StunError,
     xor_mapped_address: Io.net.IpAddress,
     use_candidate: void,
     userhash: []const u8,
@@ -151,6 +158,15 @@ pub const AttributeIterator = struct {
             .xor_mapped_address => try parseXorMappedAddress(attr_value, it.reader.buffer[8..20]),
             .username => .{ .username = attr_value[0..attr_len] },
             .software => .{ .software = attr_value[0..attr_len] },
+            .error_code => blk: {
+                if (attr_value.len < 4) return error.InvalidAttribute;
+                const class = attr_value[2] & 0x07;
+                if (class < 3 or class > 6 or attr_value[3] > 99) return error.InvalidAttribute;
+                break :blk .{ .error_code = .{
+                    .code = (@as(u16, class) << 8) | attr_value[3],
+                    .reason = attr_value[4..attr_len],
+                } };
+            },
             .userhash => blk: {
                 if (attr_len != 32) break :blk error.InvalidAttribute;
                 break :blk .{ .userhash = attr_value[0..attr_len] };
