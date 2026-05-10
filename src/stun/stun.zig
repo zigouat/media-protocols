@@ -321,13 +321,13 @@ pub const Writer = struct {
         try msg_writer.writer.writeStruct(header, .big);
     }
 
-    pub fn writeRaw(msg_writer: *Writer, attr_type: AttributeType, content: []const []const u8) !void {
+    pub fn writeRaw(msg_writer: *Writer, attr_type: AttributeType, content: [][]const u8) !void {
         var w = &msg_writer.writer;
 
         try w.writeInt(u16, @intFromEnum(attr_type), .big);
         const length = try w.writableArray(2);
         const pos = w.end;
-        try msg_writer.writer.writeVecAll(@constCast(content));
+        try msg_writer.writer.writeVecAll(content);
 
         const attr_size: u16 = @intCast(w.end - pos);
         const padding = switch (@rem(attr_size, 4)) {
@@ -640,7 +640,8 @@ test "Writer: write rfc message" {
     try out.writeAttribute(.{ .software = "STUN test client" });
     try out.writeAttribute(.{ .priority = 0x6E0001FF });
     try out.writeAttribute(.{ .ice_controlled = 0x932FF9B151263B36 });
-    try out.writeRaw(.username, &[_][]const u8{"evtj:h6vY"});
+    var username = [_][]const u8{ "evtj", ":", "h6vY" };
+    try out.writeRaw(.username, &username);
     try out.writeAttribute(.{ .message_integrity = &.{} });
     try out.writeAttribute(.fingerprint);
 
