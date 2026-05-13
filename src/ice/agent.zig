@@ -116,7 +116,7 @@ pub fn addRemoteCandidate(agent: *Agent, remote_candidate: Candidate) !void {
 pub fn gatherCandidates(agent: *Agent) !void {
     try agent.gatherHostCandidates();
     try agent.initSockets();
-    try agent.group.concurrent(agent.io, listenForMessages, .{agent});
+    try agent.group.concurrent(agent.io, listenForConnectivityChecks, .{agent});
 }
 
 /// Poll for events
@@ -384,7 +384,7 @@ fn buildBindingRequest(agent: *Agent, tx_id: u96, buffer: *[max_message_size]u8)
 
     var username = [_][]const u8{ agent.remote_credentials.?.username, ":", agent.credentials.username };
     try w.writeRaw(.username, &username);
-    try w.writeAttribute(.{ .priority = 10 });
+    try w.writeAttribute(.{ .priority = ice.CandidateType.peer_reflexive.priority() });
     const role_attribute: stun.Attribute = switch (agent.role) {
         .controlled => .{ .ice_controlled = agent.tie_breaker },
         .controlling => .{ .ice_controlling = agent.tie_breaker },
@@ -426,12 +426,12 @@ fn buildSuccessResponse(
     return w.final();
 }
 
-fn findSocket(sockets: []Io.net.Socket, addr: *const Io.net.IpAddress) *Io.net.Socket {
+fn findSocket(sockets: []Io.net.Socket, addr: *const IpAddress) *Io.net.Socket {
     for (sockets) |*socket| if (socket.address.eql(addr)) return socket;
     unreachable;
 }
 
-fn findCandidatePair(agent: *Agent, local: *const Io.net.IpAddress, remote: *const Io.net.IpAddress) ?*CandidatePair {
+fn findCandidatePair(agent: *Agent, local: *const IpAddress, remote: *const IpAddress) ?*CandidatePair {
     for (agent.pairs.items) |*candidate| {
         if (candidate.local.address.eql(local) and candidate.remote.address.eql(remote))
             return candidate;
@@ -520,13 +520,6 @@ fn doListen(agent: *Agent) !void {
     };
 }
 
-fn listenForMessages(agent: *Agent) !void {
-    agent.doListenForMessages() catch |err| switch (err) {
-        error.Canceled => return error.Canceled,
-        else => {},
-    };
-}
-
 fn startConnectivityChecks(agent: *Agent) !void {
     while (true) {
         agent.queue.putOne(agent.io, .check_connectivity) catch |err| switch (err) {
@@ -537,7 +530,14 @@ fn startConnectivityChecks(agent: *Agent) !void {
     }
 }
 
-fn doListenForMessages(agent: *Agent) !void {
+fn listenForConnectivityChecks(agent: *Agent) !void {
+    agent.doListenForConnectivityChecks() catch |err| switch (err) {
+        error.Canceled => return error.Canceled,
+        else => {},
+    };
+}
+
+fn doListenForConnectivityChecks(agent: *Agent) !void {
     const IncomingMessageSelect = Io.Select(Receive);
 
     var queue: [4]Receive = undefined;
@@ -565,38 +565,12 @@ fn doListenForMessages(agent: *Agent) !void {
     }
 }
 
-fn doStartChecks(agent: *Agent) !void {
-    while (true) {
-        const buffer = try agent.buffer_pool.create(agent.allocator);
-        defer agent.buffer_pool.destroy(buffer);
+fn receive(agent: *Agent, socket: *Socket, index: usize) !struct { usize, Io.net.IncomingMessage } {
+    const buffer = try agent.buffer_pool.create(agent.allocator);
+    errdefer agent.buffer_pool.destroy(buffer);
 
-        try agent.mutex.lock(agent.io);
-        for (agent.pairs.items) |*pair| switch (pair.state.status) {
-            .waiting, .in_progress => {
-                pair.conn_check_count += 1;
-                if (pair.conn_check_count > max_binding_requests) {
-                    pair.state.status = .failed;
-                    continue;
-                }
-
-                const transaction_id = generateTrasactionId(agent.io);
-                const msg = try agent.buildBindingRequest(transaction_id, buffer);
-
-                try agent.pending_requests.append(agent.allocator, .{
-                    .transaction_id = transaction_id,
-                    .source = pair.local.base,
-                    .target = pair.remote.address,
-                });
-
-                const socket = findSocket(agent.sockets, &pair.local.base);
-                try socket.send(agent.io, &pair.remote.address, msg);
-            },
-            else => {},
-        };
-        agent.mutex.unlock(agent.io);
-
-        try agent.io.sleep(.fromMilliseconds(200), .awake);
-    }
+    const incoming_message = try socket.receive(agent.io, &(buffer.*));
+    return .{ index, incoming_message };
 }
 
 fn batchSendConnectivityCheck(agent: *Agent) !void {
@@ -625,12 +599,4 @@ fn batchSendConnectivityCheck(agent: *Agent) !void {
         },
         else => {},
     };
-}
-
-fn receive(agent: *Agent, socket: *Socket, index: usize) !struct { usize, Io.net.IncomingMessage } {
-    const buffer = try agent.buffer_pool.create(agent.allocator);
-    errdefer agent.buffer_pool.destroy(buffer);
-
-    const incoming_message = try socket.receive(agent.io, &(buffer.*));
-    return .{ index, incoming_message };
 }
