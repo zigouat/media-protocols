@@ -1,10 +1,15 @@
 const std = @import("std");
-
 const Io = std.Io;
 
 pub const magic_cookie: u32 = 0x2112A442;
 pub const header_size = 20;
+
 const fingerprint_xor: u32 = 0x5354554e;
+
+/// Returns `true` if it's stun message.
+pub fn isMessage(msg: []const u8) bool {
+    return msg.len >= header_size and std.mem.readInt(u32, msg[4..8], .big) == magic_cookie;
+}
 
 pub const Class = enum(u2) {
     request,
