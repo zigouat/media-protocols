@@ -19,7 +19,7 @@ const keep_alive_interval: std.Io.Duration = .fromMilliseconds(200);
 io: Io,
 allocator: std.mem.Allocator,
 buffer_pool: std.heap.MemoryPool([max_message_size]u8),
-state: State = .new,
+connection_state: ice.ConnectionState = .new,
 
 // Stun related fields
 role: Role,
@@ -39,7 +39,10 @@ group: Io.Group = .init,
 queue_buffer: [1]InternalEvent = undefined,
 queue: Io.Queue(InternalEvent) = undefined,
 
-pub const State = enum { new, checking, connected, disconnected, failed };
+pub const Event = union(enum) {
+    data: []const u8,
+    connection_state: ice.ConnectionState,
+};
 
 const Role = enum { controlling, controlled };
 
@@ -48,6 +51,7 @@ const InternalEvent = union(enum) {
     message: struct { IpAddress, Io.net.IncomingMessage },
     check_connectivity: void,
     data: []u8,
+    connection_state: ice.ConnectionState,
 };
 
 const StunRequest = struct {
@@ -95,10 +99,11 @@ pub fn deinit(agent: *Agent) void {
 }
 
 pub fn setRemoteCredentials(agent: *Agent, credentials: ice.Credentials) !void {
-    switch (agent.state) {
+    switch (agent.connection_state) {
         .new => {
             agent.remote_credentials = try credentials.dupe(agent.allocator);
-            agent.state = .checking;
+            agent.connection_state = .checking;
+            try agent.queue.putOne(agent.io, .{ .connection_state = agent.connection_state });
             try agent.group.concurrent(agent.io, startConnectivityChecks, .{agent});
         },
         else => return error.CredentialsAlreadySet,
@@ -106,7 +111,7 @@ pub fn setRemoteCredentials(agent: *Agent, credentials: ice.Credentials) !void {
 }
 
 pub fn addRemoteCandidate(agent: *Agent, remote_candidate: Candidate) !void {
-    switch (agent.state) {
+    switch (agent.connection_state) {
         .new => try agent.doAddRemoteCandidate(remote_candidate),
         .checking => try agent.queue.putOne(agent.io, .{ .add_candidate = remote_candidate }),
         else => {},
@@ -120,7 +125,7 @@ pub fn gatherCandidates(agent: *Agent) !void {
 }
 
 /// Poll for events
-pub fn poll(agent: *Agent) !?[]u8 {
+pub fn poll(agent: *Agent) !Event {
     const io = agent.io;
 
     while (agent.queue.getOne(io)) |event| switch (event) {
@@ -134,40 +139,51 @@ pub fn poll(agent: *Agent) !?[]u8 {
                 }
             } else {
                 for (agent.pairs.items) |*candidate_pair| if (candidate_pair.remote.address.eql(&s.@"1".from)) {
-                    return s.@"1".data;
+                    return .{ .data = s.@"1".data };
                 };
+
+                std.log.warn("Drop non stun message from unknown remote candidate: {f}", .{s.@"1".from});
                 continue;
             }
 
-            try agent.maybeSetNominatedCandidate();
+            if (try agent.maybeSetNominatedCandidate()) {
+                return .{ .connection_state = agent.connection_state };
+            }
         },
         .check_connectivity => try agent.batchSendConnectivityCheck(),
-        .data => |data| return data,
+        .data => |data| return .{ .data = data },
+        .connection_state => |state| return .{ .connection_state = state },
     } else |err| switch (err) {
         error.Canceled => return error.Canceled,
-        else => {},
+        else => unreachable,
     }
+}
 
-    return null;
+pub fn destroyPacket(agent: *Agent, data: []const u8) void {
+    agent.buffer_pool.destroy(@ptrCast(@alignCast(@constCast(data))));
 }
 
 fn initSockets(agent: *Agent) !void {
-    agent.sockets = try agent.allocator.alloc(Io.net.Socket, agent.candidates.items.len);
-    var initialized: usize = 0;
-    errdefer {
-        for (0..initialized) |idx| agent.sockets[idx].close(agent.io);
-        agent.allocator.free(agent.sockets);
+    var sockets: std.ArrayList(Io.net.Socket) = try .initCapacity(agent.allocator, agent.candidates.items.len);
+    errdefer sockets.deinit(agent.allocator);
+
+    const candidates = agent.candidates.items;
+    var index: usize = 0;
+
+    while (true) {
+        if (index >= candidates.len) break;
+        const socket = candidates[index].address.bind(agent.io, .{ .mode = .dgram, .protocol = .udp }) catch {
+            _ = agent.candidates.swapRemove(index);
+            continue;
+        };
+
+        sockets.appendAssumeCapacity(socket);
+        candidates[index].base = socket.address;
+        candidates[index].address = socket.address;
+        index += 1;
     }
 
-    for (agent.candidates.items) |*candidate| {
-        agent.sockets[initialized] = try candidate.address.bind(
-            agent.io,
-            .{ .mode = .dgram, .protocol = .udp },
-        );
-        candidate.base = agent.sockets[initialized].address;
-        candidate.address = agent.sockets[initialized].address;
-        initialized += 1;
-    }
+    agent.sockets = try sockets.toOwnedSlice(agent.allocator);
 }
 
 fn calculatePairPriority(l: u32, r: u32, role: Role) u64 {
@@ -218,7 +234,7 @@ fn gatherHostCandidates(agent: *Agent) !void {
     };
 }
 
-fn doAddRemoteCandidate(agent: *Agent, remote_candidate: Candidate) !void {
+fn doAddRemoteCandidate(agent: *Agent, remote_candidate: Candidate) std.mem.Allocator.Error!void {
     for (agent.candidates.items) |candidate| {
         for (agent.pairs.items) |*pair|
             if (pair.local.base.eql(&candidate.base) and pair.remote.address.eql(&remote_candidate.address))
@@ -440,12 +456,12 @@ fn findCandidatePair(agent: *Agent, local: *const IpAddress, remote: *const IpAd
     return null;
 }
 
-fn maybeSetNominatedCandidate(agent: *Agent) !void {
-    if (agent.role == .controlling or agent.nominated_pair != null) return;
+fn maybeSetNominatedCandidate(agent: *Agent) !bool {
+    if (agent.role == .controlling or agent.nominated_pair != null) return false;
 
     for (agent.pairs.items) |candidate_pair| if (candidate_pair.state.nominated) {
         agent.nominated_pair = candidate_pair;
-        agent.state = .connected;
+        agent.connection_state = .connected;
         agent.group.cancel(agent.io);
 
         // Clean up and listen on socket
@@ -455,8 +471,10 @@ fn maybeSetNominatedCandidate(agent: *Agent) !void {
         agent.pairs.items[0] = candidate_pair;
 
         try agent.group.concurrent(agent.io, listen, .{agent});
-        break;
+        return true;
     };
+
+    return false;
 }
 
 // ============== Io related function ======================
@@ -465,7 +483,7 @@ const Receive = union(enum) {
 };
 
 const ListenEvent = union(enum) {
-    message: Io.net.Socket.ReceiveTimeoutError!Io.net.IncomingMessage,
+    message: Socket.ReceiveTimeoutError!Io.net.IncomingMessage,
     keep_alive: Io.Cancelable!void,
 };
 
@@ -499,9 +517,9 @@ fn doListen(agent: *Agent) !void {
             const msg = maybe_msg catch |err| switch (err) {
                 error.Canceled => return error.Canceled,
                 error.Timeout => {
-                    if (agent.state != .disconnected) {
-                        Logger.warn("Agent state transitioned to disconnected", .{});
-                        agent.state = .disconnected;
+                    if (agent.connection_state != .disconnected) {
+                        agent.connection_state = .disconnected;
+                        try agent.queue.putOne(agent.io, .{ .connection_state = .disconnected });
                     }
                     continue;
                 },

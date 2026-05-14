@@ -285,6 +285,8 @@ pub const CandidatePair = struct {
     }
 };
 
+pub const ConnectionState = enum { new, checking, connected, completed, disconnected, failed };
+
 test {
     std.testing.refAllDecls(@This());
 
