@@ -17,6 +17,7 @@ const max_binding_requests: usize = 7;
 const connectivity_check_interval: std.Io.Duration = .fromMilliseconds(200);
 const keep_alive_interval: std.Io.Duration = .fromMilliseconds(200);
 const disconnect_timeout: Io.Clock.Duration = .{ .clock = .awake, .raw = .fromSeconds(5) };
+const failing_timeout: Io.Clock.Duration = .{ .clock = .awake, .raw = .fromSeconds(25) };
 
 pub const AgentConfig = struct {
     onConnectionState: *const fn (*Agent, ice.ConnectionState) void,
@@ -524,9 +525,17 @@ fn innerEventHandler(agent: *Agent) !void {
         .send_message => |result| result catch |err| std.log.err("failed to send response: {}", .{err}),
         .data_message => |result| {
             const message = result catch |err| switch (err) {
-                error.Timeout => {
-                    if (agent.connection_state != .disconnected) agent.setConnectionState(.disconnected);
-                    continue;
+                error.Timeout => switch (agent.connection_state) {
+                    .connected, .completed => {
+                        agent.setConnectionState(.disconnected);
+                        select.async(.data_message, receiveTimeout, .{ agent, &nominated_socket, .{ .duration = failing_timeout } });
+                        continue;
+                    },
+                    .disconnected => {
+                        agent.setConnectionState(.failed);
+                        return;
+                    },
+                    else => unreachable,
                 },
                 else => |e| return e,
             };
@@ -547,13 +556,7 @@ fn innerEventHandler(agent: *Agent) !void {
         },
         .complete => |result| {
             try result;
-            for (agent.sockets) |*socket| if (!socket.address.eql(&nominated_socket.address)) socket.close(io);
-            agent.sockets = try agent.allocator.realloc(agent.sockets, 1);
-            agent.sockets[0] = nominated_socket;
-
-            agent.pairs.clearAndFree(agent.allocator);
-            agent.pending_requests.clearAndFree(agent.allocator);
-            agent.setConnectionState(.completed);
+            try agent.markConnectionCompleted(nominated_socket);
         },
     };
 }
@@ -597,4 +600,14 @@ fn batchSendConnectivityCheck(agent: *Agent) !void {
         },
         else => {},
     };
+}
+
+fn markConnectionCompleted(agent: *Agent, nominated_socket: Socket) !void {
+    for (agent.sockets) |*socket| if (!socket.address.eql(&nominated_socket.address)) socket.close(agent.io);
+    agent.sockets = try agent.allocator.realloc(agent.sockets, 1);
+    agent.sockets[0] = nominated_socket;
+
+    agent.pairs.clearAndFree(agent.allocator);
+    agent.pending_requests.clearAndFree(agent.allocator);
+    agent.setConnectionState(.completed);
 }
