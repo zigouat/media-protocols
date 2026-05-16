@@ -11,6 +11,7 @@ const Candidate = ice.Candidate;
 const CandidatePair = ice.CandidatePair;
 const Agent = @This();
 const Logger = std.log.scoped(.ice);
+const linux = std.os.linux;
 
 const max_message_size = 1500;
 const max_binding_requests: usize = 7;
@@ -148,11 +149,14 @@ pub fn destroyPacket(agent: *Agent, data: []const u8) void {
 }
 
 fn initSockets(agent: *Agent) !void {
-    var sockets: std.ArrayList(Io.net.Socket) = try .initCapacity(agent.allocator, agent.candidates.items.len);
-    errdefer sockets.deinit(agent.allocator);
-
     const candidates = agent.candidates.items;
     var index: usize = 0;
+
+    var sockets: std.ArrayList(Io.net.Socket) = try .initCapacity(agent.allocator, agent.candidates.items.len);
+    errdefer {
+        for (0..index) |idx| sockets.items[idx].close(agent.io);
+        sockets.deinit(agent.allocator);
+    }
 
     while (true) {
         if (index >= candidates.len) break;
@@ -207,17 +211,16 @@ fn linuxGatherHostCandidates(agent: *Agent) !void {
 
     var it = interfaces;
     while (it) |p_ifa| : (it = p_ifa.*.ifa_next) if (p_ifa.*.ifa_addr) |addr| {
-        switch (addr.*.sa_family) {
-            c.AF_INET => {
+        const sockaddr: linux.sockaddr = @bitCast(addr.*);
+
+        switch (sockaddr.family) {
+            linux.AF.INET => {
                 const c_flags: u16 = @truncate(p_ifa.*.ifa_flags);
-                const flags: std.os.linux.IFF = @bitCast(c_flags);
+                const flags: linux.IFF = @bitCast(c_flags);
                 if (flags.LOOPBACK) continue;
 
-                const sin: *const c.sockaddr_in = @ptrCast(@alignCast(addr));
-
-                const ip_addr: Io.net.IpAddress = .{
-                    .ip4 = .{ .bytes = std.mem.toBytes(sin.sin_addr.s_addr), .port = 0 },
-                };
+                const in: linux.sockaddr.in = @bitCast(sockaddr);
+                const ip_addr: Io.net.IpAddress = .{ .ip4 = .{ .bytes = std.mem.toBytes(in.addr), .port = 0 } };
                 try agent.candidates.append(agent.allocator, .initHost(ip_addr));
             },
             else => {},
@@ -447,23 +450,12 @@ fn findCandidatePair(agent: *Agent, local: *const IpAddress, remote: *const IpAd
     return null;
 }
 
-fn maybeSetNominatedCandidate(agent: *Agent) !bool {
-    if (agent.role == .controlling or agent.nominated_pair != null) return false;
-
-    for (agent.pairs.items) |candidate_pair| if (candidate_pair.state.nominated) {
-        agent.nominated_pair = candidate_pair;
-        return true;
-    };
-
-    return false;
-}
-
 fn setConnectionState(agent: *Agent, new_state: ice.ConnectionState) void {
     agent.connection_state = new_state;
     agent.config.onConnectionState(agent, new_state);
 }
 
-// ============== Io related function ======================
+// ============== Io related functions ======================
 const MessageError = (Allocator.Error || Socket.ReceiveTimeoutError);
 
 const Message = struct {
@@ -474,7 +466,6 @@ const Message = struct {
 const InnerEvent = union(enum) {
     message: MessageError!Message,
     connectivity_check: Io.Cancelable!void,
-    send_message: (Allocator.Error || Socket.SendError)!void,
     complete: Io.Cancelable!void,
     // message received from the nominated peer
     data_message: MessageError!Message,
@@ -496,10 +487,9 @@ fn innerEventHandler(agent: *Agent) !void {
     var select = Select.init(agent.io, &queue);
     defer select.cancelDiscard();
 
-    for (agent.sockets) |*socket| {
-        select.async(.message, receiveTimeout, .{ agent, socket, .none });
-    }
     select.async(.connectivity_check, Io.sleep, .{ io, connectivity_check_interval, .awake });
+    for (agent.sockets) |*socket|
+        select.async(.message, receiveTimeout, .{ agent, socket, .none });
 
     var nominated_socket: Socket = undefined;
 
@@ -509,8 +499,8 @@ fn innerEventHandler(agent: *Agent) !void {
             switch (agent.connection_state) {
                 .completed, .failed => {},
                 else => {
-                    try agent.batchSendConnectivityCheck();
                     select.async(.connectivity_check, Io.sleep, .{ io, connectivity_check_interval, .awake });
+                    agent.batchSendConnectivityCheck() catch |err| std.log.err("connectivity check failed due to {}", .{err});
                 },
             }
         },
@@ -522,8 +512,10 @@ fn innerEventHandler(agent: *Agent) !void {
 
             if (stun.isMessage(data)) {
                 defer agent.destroyPacket(data);
-                if (try agent.handleReceivedMessage(message.socket.address, message.incoming_message)) |response|
-                    select.async(.send_message, send, .{ agent, message.socket, &sender, response });
+                if (try agent.handleReceivedMessage(message.socket.address, message.incoming_message)) |response| {
+                    defer agent.destroyPacket(response);
+                    try message.socket.send(io, &sender, response);
+                }
 
                 const candidate_pair: ?CandidatePair = blk: {
                     if (agent.role == .controlling or agent.nominated_pair != null) break :blk null;
@@ -555,13 +547,12 @@ fn innerEventHandler(agent: *Agent) !void {
 
             select.async(.message, receiveTimeout, .{ agent, message.socket, .none });
         },
-        .send_message => |result| result catch |err| std.log.err("failed to send response: {}", .{err}),
         .data_message => |result| {
             const message = result catch |err| switch (err) {
                 error.Timeout => switch (agent.connection_state) {
                     .connected, .completed => {
-                        agent.setConnectionState(.disconnected);
                         select.async(.data_message, receiveTimeout, .{ agent, &nominated_socket, .{ .duration = failing_timeout } });
+                        agent.setConnectionState(.disconnected);
                         continue;
                     },
                     .disconnected => {
@@ -573,12 +564,12 @@ fn innerEventHandler(agent: *Agent) !void {
                 else => |e| return e,
             };
 
+            select.async(.data_message, receiveTimeout, .{ agent, message.socket, .{ .duration = disconnect_timeout } });
+
             if (stun.isMessage(message.incoming_message.data))
-                agent.buffer_pool.destroy(@ptrCast(@alignCast(message.incoming_message.data.ptr)))
+                agent.destroyPacket(message.incoming_message.data)
             else
                 agent.config.onData(agent, message.incoming_message.data);
-
-            select.async(.data_message, receiveTimeout, .{ agent, message.socket, .{ .duration = disconnect_timeout } });
         },
         .keep_alive => |timeout| {
             try timeout;
@@ -589,7 +580,7 @@ fn innerEventHandler(agent: *Agent) !void {
         },
         .complete => |result| {
             try result;
-            try agent.markConnectionCompleted();
+            agent.markConnectionCompleted();
         },
     };
 }
@@ -635,7 +626,7 @@ fn batchSendConnectivityCheck(agent: *Agent) !void {
     };
 }
 
-fn markConnectionCompleted(agent: *Agent) !void {
+fn markConnectionCompleted(agent: *Agent) void {
     const addr = agent.nominated_pair.?.socket.address;
     for (agent.sockets) |*socket| if (!socket.address.eql(&addr)) socket.close(agent.io);
 
