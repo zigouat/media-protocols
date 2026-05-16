@@ -351,6 +351,7 @@ pub const Writer = struct {
         switch (attribute) {
             .priority => |p| try out.writeInt(u32, p, .big),
             .ice_controlled, .ice_controlling => |tie_breaker| try out.writeInt(u64, tie_breaker, .big),
+            .use_candidate => {},
             .message_integrity => try msg_writer.writeMessageIntegrity(),
             .fingerprint => try writeFingerprint(&msg_writer.writer),
             .software, .username, .userhash => |slice| try out.writeAll(slice),

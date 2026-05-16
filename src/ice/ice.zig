@@ -247,6 +247,39 @@ pub const Credentials = struct {
         allocator.free(credens.username);
         allocator.free(credens.password);
     }
+
+    pub fn generate(io: std.Io, allocator: std.mem.Allocator) !Credentials {
+        var encoder = std.base64.standard.Encoder;
+
+        var user_bytes: [6]u8 = undefined;
+        io.random(&user_bytes);
+        const username = try allocator.alloc(u8, encoder.calcSize(user_bytes.len));
+        errdefer allocator.free(username);
+        _ = encoder.encode(username, &user_bytes);
+
+        var password_bytes: [12]u8 = undefined;
+        try io.randomSecure(&password_bytes);
+        const password = try allocator.alloc(u8, encoder.calcSize(password_bytes.len));
+        _ = encoder.encode(password, &password_bytes);
+
+        return .{
+            .username = username,
+            .password = password,
+        };
+    }
+
+    test "credentials: generate" {
+        var creds = try Credentials.generate(std.testing.io, std.testing.allocator);
+        defer creds.deinit(std.testing.allocator);
+
+        try std.testing.expect(creds.username.len >= 8);
+        try std.testing.expect(creds.password.len >= 16);
+    }
+
+    test "credentials: clean up on failure" {
+        var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 1 });
+        try std.testing.expectError(error.OutOfMemory, Credentials.generate(std.testing.io, failing_allocator.allocator()));
+    }
 };
 
 pub const CandidatePair = struct {

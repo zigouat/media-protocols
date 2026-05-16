@@ -21,15 +21,22 @@ const disconnect_timeout: Io.Clock.Duration = .{ .clock = .awake, .raw = .fromSe
 const failing_timeout: Io.Clock.Duration = .{ .clock = .awake, .raw = .fromSeconds(25) };
 
 pub const AgentConfig = struct {
-    onConnectionState: *const fn (*Agent, ice.ConnectionState) void,
-    onData: *const fn (*Agent, []const u8) void,
+    on_connection_state_change: *const fn (*Agent, ice.ConnectionState) void,
+    on_data: *const fn (*Agent, []const u8) void,
+    /// Local credentials of the agent (ufrag and password)
+    ///
+    /// Generated automatically if not provided
+    credentials: ?ice.Credentials = null,
 };
 
 io: Io,
 allocator: Allocator,
 buffer_pool: std.heap.MemoryPool([max_message_size]u8),
-config: AgentConfig,
 connection_state: ice.ConnectionState = .new,
+
+// callbacks
+on_connection_state_change: *const fn (*Agent, ice.ConnectionState) void,
+on_data: *const fn (*Agent, []const u8) void,
 
 // Stun related fields
 role: Role,
@@ -73,19 +80,26 @@ const StunRequest = struct {
 
 const PendingRequest = struct {
     transaction_id: u96,
-    source: Io.net.IpAddress,
-    target: Io.net.IpAddress,
+    source: IpAddress,
+    target: IpAddress,
 };
 
 pub fn init(io: Io, allocator: Allocator, config: AgentConfig) !Agent {
+    const credens =
+        try if (config.credentials) |credens|
+            credens.dupe(allocator)
+        else
+            ice.Credentials.generate(io, allocator);
+
     return .{
         .io = io,
         .allocator = allocator,
         .buffer_pool = .empty,
         .role = .controlled,
-        .credentials = try (ice.Credentials{ .username = "test", .password = "test" }).dupe(allocator),
         .tie_breaker = generateTieBeaker(io),
-        .config = config,
+        .credentials = credens,
+        .on_connection_state_change = config.on_connection_state_change,
+        .on_data = config.on_data,
     };
 }
 
@@ -220,7 +234,7 @@ fn linuxGatherHostCandidates(agent: *Agent) !void {
                 if (flags.LOOPBACK) continue;
 
                 const in: linux.sockaddr.in = @bitCast(sockaddr);
-                const ip_addr: Io.net.IpAddress = .{ .ip4 = .{ .bytes = std.mem.toBytes(in.addr), .port = 0 } };
+                const ip_addr: IpAddress = .{ .ip4 = .{ .bytes = std.mem.toBytes(in.addr), .port = 0 } };
                 try agent.candidates.append(agent.allocator, .initHost(ip_addr));
             },
             else => {},
@@ -242,73 +256,24 @@ fn doAddRemoteCandidate(agent: *Agent, remote_candidate: Candidate) Allocator.Er
     }
 }
 
-fn handleReceivedMessage(agent: *Agent, base_addr: Io.net.IpAddress, incoming_message: Io.net.IncomingMessage) !?[]const u8 {
+fn handleReceivedMessage(agent: *Agent, base_addr: IpAddress, incoming_message: Io.net.IncomingMessage) !?[]const u8 {
     const msg = try stun.Message.parse(incoming_message.data);
-    switch (msg.header.message_type.class()) {
-        .request => return try agent.handleRequest(&msg, base_addr, incoming_message.from),
-        .success_response => {
-            Logger.debug("Handle success response on {f} from {f}", .{ base_addr, incoming_message.from });
-
-            const pending_request = blk: {
-                const tx_id = msg.header.transaction_id;
-                for (agent.pending_requests.items, 0..) |pr, i| {
-                    if (pr.transaction_id == tx_id) {
-                        const pending_request = agent.pending_requests.swapRemove(i);
-                        break :blk pending_request;
-                    }
-                }
-
-                return null;
-            };
-
-            if (!pending_request.source.eql(&base_addr) or !pending_request.target.eql(&incoming_message.from)) return null;
-
-            if (agent.findCandidatePair(&base_addr, &incoming_message.from)) |candidate_pair| {
-                const mapped_address = blk: {
-                    var it = msg.iterateAttributes(&.{});
-                    while (try it.next()) |attribute| switch (attribute) {
-                        .xor_mapped_address => |addr| break :blk addr,
-                        else => {},
-                    };
-
-                    return null;
-                };
-
-                if (mapped_address.eql(&base_addr)) {
-                    candidate_pair.state.status = .succeeded;
-                    if (agent.role == .controlled and candidate_pair.state.nominateOnBinding) {
-                        candidate_pair.state.nominateOnBinding = false;
-                        candidate_pair.state.nominated = true;
-                    }
-                    return null;
-                }
-                candidate_pair.state.status = .failed;
-
-                if (agent.findCandidatePair(&mapped_address, &incoming_message.from)) |existing_candidate_pair| {
-                    existing_candidate_pair.state.status = .succeeded;
-                    return null;
-                }
-
-                const reflexive_candidate: Candidate = .initPeerReflexive(base_addr, mapped_address);
-                try agent.pairs.append(agent.allocator, .{
-                    .local = reflexive_candidate,
-                    .remote = candidate_pair.remote,
-                    .priority = calculatePairPriority(reflexive_candidate.priority, candidate_pair.remote.priority, agent.role),
-                    .state = .{ .status = .succeeded },
-                });
-
-                return null;
-            }
-        },
-        else => {},
-    }
-
-    return null;
+    return switch (msg.header.message_type.class()) {
+        .request => try agent.handleRequest(&msg, base_addr, incoming_message.from),
+        .success_response => try agent.handleSuccessResponse(&msg, base_addr, incoming_message.from),
+        else => null,
+    };
 }
 
 fn handleRequest(agent: *Agent, msg: *const stun.Message, base_addr: IpAddress, from: IpAddress) ![]const u8 {
     Logger.debug("Handle request on {f} from {f}", .{ base_addr, from });
-    const stun_req = try agent.parseAndValidateStunRequest(msg);
+    const buffer = try agent.buffer_pool.create(agent.allocator);
+    errdefer agent.buffer_pool.destroy(buffer);
+
+    const stun_req = agent.parseAndValidateStunRequest(msg) catch |err| switch (err) {
+        error.RoleConflict => return try agent.buildRoleConflictErrorMessage(msg.header.transaction_id, buffer),
+        else => |e| return e,
+    };
 
     if (agent.findCandidatePair(&base_addr, &from)) |candidate_pair| {
         switch (candidate_pair.state.status) {
@@ -335,8 +300,53 @@ fn handleRequest(agent: *Agent, msg: *const stun.Message, base_addr: IpAddress, 
         });
     }
 
-    const buffer = try agent.buffer_pool.create(agent.allocator);
     return try agent.buildSuccessResponse(msg, from, buffer);
+}
+
+fn handleSuccessResponse(agent: *Agent, msg: *const stun.Message, base_addr: IpAddress, from: IpAddress) !?[]const u8 {
+    Logger.debug("Handle success response on {f} from {f}", .{ base_addr, from });
+
+    const pending_request = blk: {
+        const tx_id = msg.header.transaction_id;
+        for (agent.pending_requests.items, 0..) |pr, i| {
+            if (pr.transaction_id == tx_id) {
+                const pending_request = agent.pending_requests.swapRemove(i);
+                break :blk pending_request;
+            }
+        }
+
+        return null;
+    };
+
+    if (!pending_request.source.eql(&base_addr) or !pending_request.target.eql(&from)) return null;
+
+    if (agent.findCandidatePair(&base_addr, &from)) |candidate_pair| {
+        const mapped_address = try agent.parseAndValidateStunResponse(msg);
+
+        if (mapped_address.eql(&base_addr)) {
+            candidate_pair.state.status = .succeeded;
+            if (candidate_pair.state.nominateOnBinding) {
+                candidate_pair.state.nominateOnBinding = false;
+                candidate_pair.state.nominated = true;
+            }
+            return null;
+        }
+        candidate_pair.state.status = .failed;
+
+        if (agent.findCandidatePair(&mapped_address, &from)) |existing_candidate_pair| {
+            existing_candidate_pair.state.status = .succeeded;
+            return null;
+        }
+
+        const reflexive_candidate: Candidate = .initPeerReflexive(base_addr, mapped_address);
+        try agent.pairs.append(agent.allocator, .{
+            .local = reflexive_candidate,
+            .remote = candidate_pair.remote,
+            .priority = calculatePairPriority(reflexive_candidate.priority, candidate_pair.remote.priority, agent.role),
+            .state = .{ .status = .succeeded },
+        });
+    }
+    return null;
 }
 
 fn parseAndValidateStunRequest(agent: *Agent, msg: *const stun.Message) !StunRequest {
@@ -384,6 +394,23 @@ fn parseAndValidateStunRequest(agent: *Agent, msg: *const stun.Message) !StunReq
     return stun_request;
 }
 
+fn parseAndValidateStunResponse(agent: *Agent, msg: *const stun.Message) !IpAddress {
+    var it = msg.iterateAttributes(agent.remote_credentials.?.password);
+    var has_fingerprint: bool = false;
+    var has_message_integrity = false;
+    var maybe_addr: ?IpAddress = null;
+
+    while (try it.next()) |attribute| switch (attribute) {
+        .xor_mapped_address => |value| maybe_addr = value,
+        .fingerprint => has_fingerprint = true,
+        .message_integrity => has_message_integrity = true,
+        else => {},
+    };
+
+    if (!has_fingerprint or !has_message_integrity) return error.InvalidStunMessage;
+    return if (maybe_addr) |addr| addr else error.MissingMappedAddress;
+}
+
 fn buildBindingRequest(agent: *Agent, tx_id: u96, buffer: *[max_message_size]u8) ![]const u8 {
     var w = stun.Writer.init(&(buffer.*), .{ .password = agent.remote_credentials.?.password });
     try w.writeHeader(.{
@@ -421,7 +448,7 @@ fn buildIndicationRequest(buffer: []u8) ![]const u8 {
 fn buildSuccessResponse(
     agent: *const Agent,
     msg: *const stun.Message,
-    from: Io.net.IpAddress,
+    from: IpAddress,
     buffer: *[max_message_size]u8,
 ) ![]const u8 {
     var w = stun.Writer.init(&(buffer.*), .{ .password = agent.credentials.password });
@@ -431,6 +458,22 @@ fn buildSuccessResponse(
         .message_length = 0,
     });
     try w.writeAttribute(.{ .xor_mapped_address = from });
+    try w.writeAttribute(.{ .message_integrity = &.{} });
+    try w.writeAttribute(.fingerprint);
+    return w.final();
+}
+
+fn buildRoleConflictErrorMessage(agent: *const Agent, transaction_id: u96, buffer: *[max_message_size]u8) ![]const u8 {
+    var w = stun.Writer.init(&(buffer.*), .{ .password = agent.credentials.password });
+    try w.writeHeader(.{
+        .message_type = .fromClassAndMethod(.error_response, .binding),
+        .transaction_id = transaction_id,
+        .message_length = 0,
+    });
+    try w.writeAttribute(.{ .error_code = .{
+        .code = 487,
+        .reason = "Role conflict",
+    } });
     try w.writeAttribute(.{ .message_integrity = &.{} });
     try w.writeAttribute(.fingerprint);
     return w.final();
@@ -452,7 +495,7 @@ fn findCandidatePair(agent: *Agent, local: *const IpAddress, remote: *const IpAd
 
 fn setConnectionState(agent: *Agent, new_state: ice.ConnectionState) void {
     agent.connection_state = new_state;
-    agent.config.onConnectionState(agent, new_state);
+    agent.on_connection_state_change(agent, new_state);
 }
 
 // ============== Io related functions ======================
@@ -538,7 +581,7 @@ fn innerEventHandler(agent: *Agent) !void {
                 }
             } else {
                 for (agent.pairs.items) |*candidate_pair| if (candidate_pair.remote.address.eql(&sender)) {
-                    agent.config.onData(agent, data);
+                    agent.on_data(agent, data);
                 } else {
                     std.log.warn("Drop non stun message from unknown remote candidate: {f}", .{sender});
                     agent.destroyPacket(data);
@@ -569,7 +612,7 @@ fn innerEventHandler(agent: *Agent) !void {
             if (stun.isMessage(message.incoming_message.data))
                 agent.destroyPacket(message.incoming_message.data)
             else
-                agent.config.onData(agent, message.incoming_message.data);
+                agent.on_data(agent, message.incoming_message.data);
         },
         .keep_alive => |timeout| {
             try timeout;
@@ -636,4 +679,135 @@ fn markConnectionCompleted(agent: *Agent) void {
     agent.pairs.clearAndFree(agent.allocator);
     agent.pending_requests.clearAndFree(agent.allocator);
     agent.setConnectionState(.completed);
+}
+
+const testing = std.testing;
+
+fn testNewAgent() !Agent {
+    return try .init(testing.io, testing.allocator, .{
+        .on_connection_state_change = undefined,
+        .on_data = undefined,
+    });
+}
+
+fn testBuildRequest(req: StunRequest, peer_password: []const u8, buffer: []u8) !stun.Message {
+    var w = stun.Writer.init(buffer, .{ .password = peer_password });
+    try w.writeHeader(.{
+        .message_type = .fromClassAndMethod(.request, .binding),
+        .transaction_id = generateTrasactionId(testing.io),
+        .message_length = 0,
+    });
+    try w.writeAttribute(.{ .username = req.username });
+    try w.writeAttribute(.{ .priority = req.priority });
+    if (req.ice_controlled != null) try w.writeAttribute(.{ .ice_controlled = req.ice_controlled.? });
+    if (req.ice_controlling != null) try w.writeAttribute(.{ .ice_controlling = req.ice_controlling.? });
+    if (req.use_candidate) try w.writeAttribute(.use_candidate);
+    try w.writeAttribute(.{ .message_integrity = &.{} });
+    try w.writeAttribute(.fingerprint);
+
+    return try stun.Message.parse(w.final());
+}
+
+test "init agent" {
+    var agent: Agent = try .init(testing.io, testing.allocator, .{
+        .on_connection_state_change = undefined,
+        .on_data = undefined,
+    });
+    defer agent.deinit();
+}
+
+test "handle request: generate success response" {
+    var agent: Agent = try testNewAgent();
+    defer agent.deinit();
+
+    var buffer: [1024]u8 = undefined;
+
+    const base_addr = try IpAddress.parse("192.168.1.100", 1000);
+    const from = try IpAddress.parse("192.168.1.120", 2000);
+
+    const msg = try testBuildRequest(.{
+        .ice_controlling = 0x10000,
+        .priority = 0x9090,
+        .username = agent.credentials.username,
+    }, agent.credentials.password, &buffer);
+
+    const resp = try agent.handleRequest(&msg, base_addr, from);
+    const resp_msg = try stun.Message.parse(resp);
+
+    try testing.expectEqual(.success_response, resp_msg.header.message_type.class());
+    try testing.expectEqual(.binding, resp_msg.header.message_type.method());
+    try testing.expectEqual(msg.header.transaction_id, resp_msg.header.transaction_id);
+
+    var it = resp_msg.iterateAttributes(agent.credentials.password);
+    var attr = try it.next() orelse return error.ExpectedAttribute;
+    try testing.expect(attr.xor_mapped_address.eql(&from));
+
+    attr = try it.next() orelse return error.ExpectedAttribute;
+    try testing.expectEqual(.message_integrity, @as(stun.AttributeType, attr));
+
+    attr = try it.next() orelse return error.ExpectedAttribute;
+    try testing.expectEqual(.fingerprint, @as(stun.AttributeType, attr));
+    try testing.expectEqual(null, try it.next());
+}
+
+test "handle request: create peer reflexive candidate" {
+    var agent: Agent = try testNewAgent();
+    defer agent.deinit();
+
+    var buffer: [1024]u8 = undefined;
+
+    const base_addr = try IpAddress.parse("192.168.1.100", 1000);
+    const from = try IpAddress.parse("192.168.1.120", 2000);
+
+    const msg = try testBuildRequest(.{
+        .ice_controlling = 0x10000,
+        .priority = 0x9090,
+        .username = agent.credentials.username,
+    }, agent.credentials.password, &buffer);
+
+    _ = try agent.handleRequest(&msg, base_addr, from);
+
+    try testing.expectEqual(1, agent.pairs.items.len);
+
+    const candidate_pair = agent.pairs.items[0];
+    try testing.expect(candidate_pair.remote.address.eql(&from));
+    try testing.expectEqual(candidate_pair.remote.priority, 0x9090);
+
+    // Send request again
+    _ = try agent.handleRequest(&msg, base_addr, from);
+    try testing.expectEqual(1, agent.pairs.items.len); // no new peer is created
+}
+
+test "handle request: nominate peer" {
+    var agent: Agent = try testNewAgent();
+    defer agent.deinit();
+
+    var buffer: [1024]u8 = undefined;
+
+    const base_addr = try IpAddress.parse("192.168.1.100", 1000);
+    const from = try IpAddress.parse("192.168.1.120", 2000);
+
+    try agent.pairs.append(testing.allocator, .{
+        .local = .initHost(base_addr),
+        .remote = .initHost(from),
+        .state = .{ .status = .in_progress },
+        .priority = 0,
+    });
+
+    const msg = try testBuildRequest(.{
+        .ice_controlling = 0x10000,
+        .priority = 0x9090,
+        .username = agent.credentials.username,
+        .use_candidate = true,
+    }, agent.credentials.password, &buffer);
+
+    _ = try agent.handleRequest(&msg, base_addr, from);
+
+    const candidate_pair = &agent.pairs.items[0];
+    try testing.expectEqual(true, candidate_pair.state.nominateOnBinding);
+    try testing.expectEqual(false, candidate_pair.state.nominated);
+
+    candidate_pair.state.status = .succeeded;
+    _ = try agent.handleRequest(&msg, base_addr, from);
+    try testing.expectEqual(true, candidate_pair.state.nominated);
 }
