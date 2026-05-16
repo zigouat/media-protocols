@@ -16,6 +16,12 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    const rtcp = b.addModule("rtcp", .{
+        .root_source_file = b.path("src/rtcp/rtcp.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     const sdp = b.addModule("sdp", .{
         .root_source_file = b.path("src/sdp/sdp.zig"),
         .target = target,
@@ -42,6 +48,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .imports = &.{
             .{ .name = "rtp", .module = rtp },
+            .{ .name = "rtcp", .module = rtp },
             .{ .name = "sdp", .module = sdp },
             .{ .name = "rtsp", .module = rtsp },
             .{ .name = "stun", .module = stun },
@@ -50,35 +57,18 @@ pub fn build(b: *std.Build) void {
 
     {
         const test_filters = b.option([]const []const u8, "test-filter", "Skip tests that do not match any filter") orelse &[0][]const u8{};
-        const rtp_tests = b.addTest(.{
-            .root_module = rtp,
-            .filters = test_filters,
-        });
-        const run_rtp_tests = b.addRunArtifact(rtp_tests);
-
-        const sdp_tests = b.addTest(.{
-            .root_module = sdp,
-            .filters = test_filters,
-        });
-        const run_sdp_tests = b.addRunArtifact(sdp_tests);
-
-        const rtsp_tests = b.addTest(.{
-            .root_module = rtsp,
-            .filters = test_filters,
-        });
-        const run_rtsp_tests = b.addRunArtifact(rtsp_tests);
-
-        const stun_tests = b.addTest(.{
-            .root_module = stun,
-            .filters = test_filters,
-        });
-        const run_stun_tests = b.addRunArtifact(stun_tests);
-
+        const modules = [_]*std.Build.Module{ rtp, rtcp, sdp, rtsp, stun };
         const test_step = b.step("test", "Run tests");
-        test_step.dependOn(&run_rtp_tests.step);
-        test_step.dependOn(&run_sdp_tests.step);
-        test_step.dependOn(&run_rtsp_tests.step);
-        test_step.dependOn(&run_stun_tests.step);
+
+        inline for (modules) |sub_module| {
+            const mod_tests = b.addTest(.{
+                .root_module = sub_module,
+                .filters = test_filters,
+            });
+
+            const run_mod_tests = b.addRunArtifact(mod_tests);
+            test_step.dependOn(&run_mod_tests.step);
+        }
     }
 
     {
