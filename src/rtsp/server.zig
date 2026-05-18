@@ -21,7 +21,7 @@ pub const Request = struct {
         cseq: u32,
         session: ?[]const u8,
         authenticate: ?[]const u8,
-        transport: ?rtsp.TransportHeader,
+        transport: ?rtsp.Header.Transport,
         content_length: u32,
 
         pub const Error = error{
@@ -31,7 +31,7 @@ pub const Request = struct {
             MissingSequenceHeader,
             /// A request body is not expected for this METHOD.
             BodyUnexpected,
-        } || rtsp.TransportHeader.TransportError;
+        } || rtsp.Header.Transport.Error;
 
         pub fn parse(buffer: []const u8) !Head {
             var it = std.mem.splitSequence(u8, buffer, "\r\n");
