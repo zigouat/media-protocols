@@ -149,6 +149,11 @@ pub const Header = struct {
 
             if (self.server_port) |server_port|
                 try writer.print(";server_port={}-{}", .{ server_port.@"0", server_port.@"1" });
+
+            switch (self.mode) {
+                .RECORD => try writer.writeAll(";mode=record"),
+                else => {},
+            }
         }
 
         fn parseRange(T: type, value: []const u8) !struct { T, T } {
@@ -227,6 +232,28 @@ pub const Header = struct {
             try std.testing.expectEqual(.{ 35000, 35001 }, transport.server_port);
             try std.testing.expectEqual(.PLAY, transport.mode);
         }
+    }
+
+    test "Transport: write" {
+        var buffer: [1024]u8 = undefined;
+        var w = std.Io.Writer.fixed(&buffer);
+
+        var t = Header.Transport{
+            .proto = .udp,
+            .client_port = .{ 23900, 23901 },
+        };
+        try t.write(&w);
+        try std.testing.expectEqualStrings("RTP/AVP;unicast;client_port=23900-23901", w.buffered());
+
+        _ = w.consumeAll();
+        t = .{ .proto = .tcp, .interleaved = .{ 0, 1 }, .mode = .RECORD };
+        try t.write(&w);
+        try std.testing.expectEqualStrings("RTP/AVP/TCP;unicast;interleaved=0-1;mode=record", w.buffered());
+
+        _ = w.consumeAll();
+        t = .{ .proto = .udp, .server_port = .{ 10000, 10001 } };
+        try t.write(&w);
+        try std.testing.expectEqualStrings("RTP/AVP;unicast;server_port=10000-10001", w.buffered());
     }
 };
 
