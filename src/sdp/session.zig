@@ -23,7 +23,7 @@ const State = enum { V, O, S, I, U, E, P, C, B, K, A, T, R, Z, M };
 pub const Origin = struct {
     username: []const u8,
     session_id: u64,
-    session_version: []const u8,
+    session_version: u64,
     nettype: Connection.NetType,
     addrtype: Connection.AddrType,
     unicast_address: []const u8,
@@ -346,7 +346,8 @@ fn parseOrigin(line: []const u8) !Origin {
     const username = parts.next() orelse return Error.InvalidOrigin;
     const session_id_str = parts.next() orelse return Error.InvalidOrigin;
     const session_id = try std.fmt.parseInt(u64, session_id_str, 10);
-    const session_version = parts.next() orelse return Error.InvalidOrigin;
+    const session_version_str = parts.next() orelse return Error.InvalidOrigin;
+    const session_version = try std.fmt.parseInt(u64, session_version_str, 10);
 
     const nettype_str = parts.next() orelse return Error.InvalidOrigin;
     const nettype = try Connection.parseNetType(nettype_str);
@@ -398,8 +399,8 @@ test "parse minimal SDP" {
 
     const origin = sdp.origin;
     try std.testing.expectEqualStrings(origin.username, "jdoe");
-    try std.testing.expect(origin.session_id == 3724394400);
-    try std.testing.expectEqualStrings(origin.session_version, "3724394405");
+    try std.testing.expectEqual(3724394400, origin.session_id);
+    try std.testing.expectEqual(3724394405, origin.session_version);
     try std.testing.expect(origin.nettype == Connection.NetType.in);
     try std.testing.expect(origin.addrtype == Connection.AddrType.ip4);
     try std.testing.expectEqualStrings(origin.unicast_address, "198.51.100.1");
