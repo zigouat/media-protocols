@@ -1,10 +1,57 @@
 const std = @import("std");
 const Reader = std.Io.Reader;
 
-const Self = @This();
+const Attribute = @This();
+
+const attribute_types_map: std.StaticStringMap(AttributeType) = .initComptime(&.{
+    .{ "fingerprint", .fingerprint },
+    .{ "rtpmap", .rtpmap },
+    .{ "fmtp", .fmtp },
+    .{ "group", .group },
+    .{ "ice-ufrag", .ice_ufrag },
+    .{ "ice-pwd", .ice_pwd },
+    .{ "sendrecv", .direction },
+    .{ "sendonly", .direction },
+    .{ "recvonly", .direction },
+    .{ "inactive", .direction },
+    .{ "mid", .mid },
+});
+
+pub const AttributeType = enum { rtpmap, fmtp, fingerprint, group, ice_ufrag, ice_pwd, direction, mid, unknown };
+
+pub const ParsedAttribute = union(AttributeType) {
+    rtpmap: RtpMap,
+    fmtp: Fmtp,
+    fingerprint: Fingerprint,
+    group: []const u8,
+    ice_ufrag: []const u8,
+    ice_pwd: []const u8,
+    direction: []const u8,
+    mid: []const u8,
+    unknown,
+};
 
 key: []const u8,
 value: ?[]const u8,
+
+pub inline fn getType(attr: *const Attribute) AttributeType {
+    return attribute_types_map.get(attr.key) orelse .unknown;
+}
+
+pub fn parse(attr: *const Attribute) !ParsedAttribute {
+    const value = attr.value orelse "";
+    return switch (attr.getType()) {
+        .fingerprint => .{ .fingerprint = try Fingerprint.parse(attr.*) },
+        .rtpmap => .{ .rtpmap = try RtpMap.parse(value) },
+        .group => .{ .group = value },
+        .ice_ufrag => .{ .ice_ufrag = value },
+        .ice_pwd => .{ .ice_pwd = value },
+        .direction => .{ .direction = attr.key },
+        .mid => .{ .mid = value },
+        .fmtp => .{ .fmtp = try Fmtp.parse(value) },
+        else => .unknown,
+    };
+}
 
 /// An iterator over the attributes in an SDP message or media description.
 /// Each attribute is represented as a key-value pair, where the key is the attribute name and
@@ -12,7 +59,7 @@ value: ?[]const u8,
 pub const AttributeIterator = struct {
     reader: Reader,
 
-    pub fn next(self: *AttributeIterator) !?Self {
+    pub fn next(self: *AttributeIterator) !?Attribute {
         const line = self.reader.takeDelimiterInclusive('\n') catch |err| switch (err) {
             error.EndOfStream => return null,
             else => return error.InvalidAttribute,
@@ -20,15 +67,9 @@ pub const AttributeIterator = struct {
 
         const trimmed_line = std.mem.trimEnd(u8, line, "\r\n")[2..]; // skip "a="
         if (std.mem.indexOfScalar(u8, trimmed_line, ':')) |idx| {
-            return Self{
-                .key = trimmed_line[0..idx],
-                .value = trimmed_line[idx + 1 ..],
-            };
+            return .{ .key = trimmed_line[0..idx], .value = trimmed_line[idx + 1 ..] };
         } else {
-            return Self{
-                .key = trimmed_line,
-                .value = null,
-            };
+            return .{ .key = trimmed_line, .value = null };
         }
     }
 };
@@ -105,15 +146,29 @@ pub const Fmtp = struct {
     }
 };
 
-/// Check if this attribute is an "rtpmap" attribute.
-pub fn isRtpMap(self: *const Self) bool {
-    return std.mem.eql(u8, self.key, "rtpmap");
-}
+pub const Fingerprint = union(enum) {
+    sha_256: [32]u8,
+    unknown,
 
-/// Check if this attribute is an "fmtp" attribute.
-pub fn isFmtp(self: *const Self) bool {
-    return std.mem.eql(u8, self.key, "fmtp");
-}
+    pub fn parse(attr: Attribute) !Fingerprint {
+        if (attr.value == null) return error.InvalidAttribute;
+        if (std.mem.cutScalar(u8, attr.value.?, ' ')) |fingerprint| {
+            const hash_fn, const hash = fingerprint;
+            if (!std.mem.eql(u8, hash_fn, "sha-256")) return .unknown;
+
+            var res: [32]u8 = @splat(0);
+            var it = std.mem.splitScalar(u8, hash, ':');
+            for (&res) |*b| {
+                b.* = try std.fmt.parseInt(u8, it.next() orelse return error.InvalidAttribute, 16);
+            }
+
+            if (it.next() != null) return error.InvalidAttribute;
+            return .{ .sha_256 = res };
+        }
+
+        return error.InvalidAttribute;
+    }
+};
 
 test "attribute parsing" {
     const input =
@@ -144,7 +199,7 @@ test "attribute parsing" {
 }
 
 test "parse RtmMap" {
-    const attribute = Self{
+    const attribute = Attribute{
         .key = "rtpmap",
         .value = "96 opus/48000/2",
     };
@@ -158,7 +213,7 @@ test "parse RtmMap" {
 }
 
 test "parse invalid RtmMap" {
-    const attribute = Self{
+    const attribute = Attribute{
         .key = "rtpmap",
         .value = "97 opus/4800q/2",
     };
@@ -167,7 +222,7 @@ test "parse invalid RtmMap" {
 }
 
 test "parse Fmtp" {
-    const attribute = Self{
+    const attribute = Attribute{
         .key = "fmtp",
         .value = "96 packetization-mode=1; profile-level-id=458723; level-asymmetry-allowed=1",
     };
@@ -180,4 +235,79 @@ test "parse Fmtp" {
 
     try std.testing.expect(fmtp.packetization_mode != null);
     try std.testing.expect(fmtp.packetization_mode.? == 1);
+}
+
+test "parse attribute" {
+    {
+        const rtpmap = try (Attribute{ .key = "rtpmap", .value = "96 opus/48000/2" }).parse();
+        try std.testing.expect(rtpmap == .rtpmap);
+        try std.testing.expect(rtpmap.rtpmap.payload_type == 96);
+        try std.testing.expectEqualStrings("opus", rtpmap.rtpmap.encoding);
+        try std.testing.expect(rtpmap.rtpmap.clock_rate == 48000);
+        try std.testing.expectEqualStrings("2", rtpmap.rtpmap.params.?);
+    }
+
+    {
+        const fmtp = try (Attribute{
+            .key = "fmtp",
+            .value = "96 packetization-mode=1; profile-level-id=458723",
+        }).parse();
+        try std.testing.expect(fmtp == .fmtp);
+        try std.testing.expect(fmtp.fmtp.payload_type == 96);
+        try std.testing.expect(fmtp.fmtp.packetization_mode.? == 1);
+        try std.testing.expectEqualStrings("458723", fmtp.fmtp.profile_level_id.?);
+    }
+
+    {
+        const fingerprint = try (Attribute{
+            .key = "fingerprint",
+            .value = "sha-256 00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF",
+        }).parse();
+        try std.testing.expect(fingerprint == .fingerprint);
+        try std.testing.expect(fingerprint.fingerprint == .sha_256);
+        const expected_fingerprint: [32]u8 = .{
+            0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
+            0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF,
+            0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
+            0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF,
+        };
+        try std.testing.expectEqualSlices(u8, &expected_fingerprint, &fingerprint.fingerprint.sha_256);
+    }
+
+    {
+        const group = try (Attribute{ .key = "group", .value = "BUNDLE 0 1" }).parse();
+        try std.testing.expect(group == .group);
+        try std.testing.expectEqualStrings("BUNDLE 0 1", group.group);
+    }
+
+    {
+        const ice_ufrag = try (Attribute{ .key = "ice-ufrag", .value = "F7gI" }).parse();
+        try std.testing.expect(ice_ufrag == .ice_ufrag);
+        try std.testing.expectEqualStrings("F7gI", ice_ufrag.ice_ufrag);
+    }
+
+    {
+        const ice_pwd = try (Attribute{ .key = "ice-pwd", .value = "x9cml/YzichV2+XlhiMu8g" }).parse();
+        try std.testing.expect(ice_pwd == .ice_pwd);
+        try std.testing.expectEqualStrings("x9cml/YzichV2+XlhiMu8g", ice_pwd.ice_pwd);
+    }
+
+    {
+        inline for (.{ "sendrecv", "sendonly", "recvonly", "inactive" }) |dir| {
+            const direction = try (Attribute{ .key = dir, .value = null }).parse();
+            try std.testing.expect(direction == .direction);
+            try std.testing.expectEqualStrings(dir, direction.direction);
+        }
+    }
+
+    {
+        const mid = try (Attribute{ .key = "mid", .value = "audio" }).parse();
+        try std.testing.expect(mid == .mid);
+        try std.testing.expectEqualStrings("audio", mid.mid);
+    }
+
+    {
+        const unknown = try (Attribute{ .key = "some-unknown-key", .value = "some-value" }).parse();
+        try std.testing.expect(unknown == .unknown);
+    }
 }
