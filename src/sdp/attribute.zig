@@ -10,15 +10,36 @@ const attribute_types_map: std.StaticStringMap(AttributeType) = .initComptime(&.
     .{ "group", .group },
     .{ "ice-ufrag", .ice_ufrag },
     .{ "ice-pwd", .ice_pwd },
+    .{ "candidate", .candidate },
     .{ "sendrecv", .direction },
     .{ "sendonly", .direction },
     .{ "recvonly", .direction },
     .{ "inactive", .direction },
     .{ "mid", .mid },
     .{ "setup", .setup },
+    .{ "rtcp-mux", .rtcp_mux },
+    .{ "rtcp-mux-only", .rtcp_mux_only },
+    .{ "rtcp-rsize", .rtcp_rsize },
+    .{ "msid", .msid },
 });
 
-pub const AttributeType = enum { rtpmap, fmtp, fingerprint, group, ice_ufrag, ice_pwd, direction, mid, setup, unknown };
+pub const AttributeType = enum {
+    rtpmap,
+    fmtp,
+    fingerprint,
+    group,
+    ice_ufrag,
+    ice_pwd,
+    candidate,
+    direction,
+    mid,
+    msid,
+    setup,
+    rtcp_mux,
+    rtcp_mux_only,
+    rtcp_rsize,
+    unknown,
+};
 
 pub const Setup = enum { actpass, active, passive, holdconn };
 
@@ -29,9 +50,14 @@ pub const ParsedAttribute = union(AttributeType) {
     group: []const u8,
     ice_ufrag: []const u8,
     ice_pwd: []const u8,
+    candidate: []const u8,
     direction: []const u8,
     mid: []const u8,
+    msid: Msid,
     setup: Setup,
+    rtcp_mux: void,
+    rtcp_mux_only: void,
+    rtcp_rsize: void,
     unknown,
 };
 
@@ -44,16 +70,22 @@ pub inline fn getType(attr: *const Attribute) AttributeType {
 
 pub fn parse(attr: *const Attribute) !ParsedAttribute {
     const value = attr.value orelse "";
+
     return switch (attr.getType()) {
         .fingerprint => .{ .fingerprint = try Fingerprint.parse(attr.*) },
         .rtpmap => .{ .rtpmap = try RtpMap.parse(value) },
         .group => .{ .group = value },
         .ice_ufrag => .{ .ice_ufrag = value },
         .ice_pwd => .{ .ice_pwd = value },
+        .candidate => .{ .candidate = value },
         .direction => .{ .direction = attr.key },
         .mid => .{ .mid = value },
+        .msid => .{ .msid = Msid.fromSlice(value) },
         .fmtp => .{ .fmtp = value },
         .setup => if (std.meta.stringToEnum(Setup, value)) |setup| .{ .setup = setup } else error.InvalidAttribute,
+        .rtcp_mux => .rtcp_mux,
+        .rtcp_mux_only => .rtcp_mux_only,
+        .rtcp_rsize => .rtcp_rsize,
         else => .unknown,
     };
 }
@@ -221,6 +253,18 @@ pub const Fingerprint = union(enum) {
         }
 
         return error.InvalidAttribute;
+    }
+};
+
+pub const Msid = struct {
+    id: []const u8,
+    app_data: ?[]const u8 = null,
+
+    fn fromSlice(value: []const u8) Msid {
+        return if (std.mem.indexOfScalar(u8, value, ' ')) |space_idx|
+            .{ .id = value[0..space_idx], .app_data = value[space_idx + 1 ..] }
+        else
+            .{ .id = value };
     }
 };
 
