@@ -15,19 +15,23 @@ const attribute_types_map: std.StaticStringMap(AttributeType) = .initComptime(&.
     .{ "recvonly", .direction },
     .{ "inactive", .direction },
     .{ "mid", .mid },
+    .{ "setup", .setup },
 });
 
-pub const AttributeType = enum { rtpmap, fmtp, fingerprint, group, ice_ufrag, ice_pwd, direction, mid, unknown };
+pub const AttributeType = enum { rtpmap, fmtp, fingerprint, group, ice_ufrag, ice_pwd, direction, mid, setup, unknown };
+
+pub const Setup = enum { actpass, active, passive, holdconn };
 
 pub const ParsedAttribute = union(AttributeType) {
     rtpmap: RtpMap,
-    fmtp: Fmtp,
+    fmtp: []const u8,
     fingerprint: Fingerprint,
     group: []const u8,
     ice_ufrag: []const u8,
     ice_pwd: []const u8,
     direction: []const u8,
     mid: []const u8,
+    setup: Setup,
     unknown,
 };
 
@@ -48,7 +52,8 @@ pub fn parse(attr: *const Attribute) !ParsedAttribute {
         .ice_pwd => .{ .ice_pwd = value },
         .direction => .{ .direction = attr.key },
         .mid => .{ .mid = value },
-        .fmtp => .{ .fmtp = try Fmtp.parse(value) },
+        .fmtp => .{ .fmtp = value },
+        .setup => if (std.meta.stringToEnum(Setup, value)) |setup| .{ .setup = setup } else error.InvalidAttribute,
         else => .unknown,
     };
 }
@@ -103,43 +108,92 @@ pub const RtpMap = struct {
 /// Format parameters.
 pub const Fmtp = struct {
     payload_type: u8,
-    packetization_mode: ?u8 = null,
-    profile_level_id: ?[]const u8 = null,
-    sprop_parameter_sets: ?struct { sps: []const u8, pps: []const u8 } = null,
+    params: Params,
 
-    pub fn parse(data: []const u8) !Fmtp {
+    pub const Params = union(enum) {
+        h264: struct {
+            packetization_mode: u8 = 0,
+            level_asymmetry_allowed: bool = false,
+            profile_level_id: u24 = 0x42000A,
+            sprop_parameter_sets: ?struct { sps: []const u8, pps: []const u8 } = null,
+        },
+        rtx: struct {
+            apt: u8,
+            rtx_time: ?u32 = null,
+        },
+        unknown: []const u8,
+
+        fn parse(params: []const u8, mime: []const u8) !Params {
+            return if (std.ascii.eqlIgnoreCase(mime, "h264"))
+                try parseH264Params(params)
+            else if (std.ascii.eqlIgnoreCase(mime, "rtx"))
+                try parseRtxParams(params)
+            else
+                .{ .unknown = params };
+        }
+
+        fn parseH264Params(params: []const u8) !Params {
+            var iterator = std.mem.splitScalar(u8, params, ';');
+            var result: Params = .{ .h264 = .{} };
+            while (iterator.next()) |param| if (std.mem.cutScalar(u8, param, '=')) |key_value| {
+                var key, const value = key_value;
+                key = std.mem.trim(u8, key, " ");
+
+                if (std.mem.eql(u8, key, "profile-level-id")) {
+                    result.h264.profile_level_id = std.fmt.parseInt(u24, value, 16) catch return error.InvalidFmtp;
+                } else if (std.mem.eql(u8, key, "sprop-parameter-sets")) {
+                    if (std.mem.indexOfScalar(u8, value, ',')) |idx2| {
+                        result.h264.sprop_parameter_sets = .{
+                            .sps = value[0..idx2],
+                            .pps = value[idx2 + 1 ..],
+                        };
+                    } else {
+                        return error.InvalidSpropParameterSets;
+                    }
+                } else if (std.mem.eql(u8, key, "packetization-mode")) {
+                    result.h264.packetization_mode = std.fmt.parseInt(u8, value, 10) catch return error.InvalidFmtp;
+                } else if (std.mem.eql(u8, key, "level-asymmetry-allowed")) {
+                    result.h264.level_asymmetry_allowed = (std.fmt.parseInt(u1, value, 10) catch return error.InvalidFmtp) == 1;
+                }
+            };
+
+            return result;
+        }
+
+        fn parseRtxParams(params: []const u8) !Params {
+            var iterator = std.mem.splitScalar(u8, params, ';');
+            var apt: ?u8 = null;
+            var rtx_time: ?u32 = null;
+
+            while (iterator.next()) |param| if (std.mem.cutScalar(u8, param, '=')) |key_value| {
+                var key, const value = key_value;
+                key = std.mem.trim(u8, key, " ");
+
+                if (std.mem.eql(u8, key, "apt")) {
+                    apt = std.fmt.parseInt(u8, value, 10) catch return error.InvalidFmtp;
+                } else if (std.mem.eql(u8, key, "rtx-time")) {
+                    rtx_time = std.fmt.parseInt(u32, value, 10) catch return error.InvalidFmtp;
+                }
+            };
+
+            if (apt == null) return error.InvalidFmtp;
+
+            return .{ .rtx = .{ .apt = apt.?, .rtx_time = rtx_time } };
+        }
+    };
+
+    /// Parse the fmtp data.
+    ///
+    /// mime represents the codec type in rtpmap
+    pub fn parse(data: []const u8, mime: []const u8) !Fmtp {
         if (std.mem.indexOfScalar(u8, data, ' ')) |idx| {
             const payload_type = std.fmt.parseInt(u8, data[0..idx], 10) catch return error.InvalidFmtp;
             const params = data[idx + 1 ..];
 
-            var result = Fmtp{
+            return .{
                 .payload_type = payload_type,
+                .params = try Params.parse(params, mime),
             };
-
-            var iterator = std.mem.splitScalar(u8, params, ';');
-            while (iterator.next()) |key_value| {
-                if (std.mem.indexOfScalar(u8, key_value, '=')) |param_idx| {
-                    const key = std.mem.trimStart(u8, key_value[0..param_idx], " ");
-                    const value = key_value[param_idx + 1 ..];
-
-                    if (std.mem.eql(u8, key, "profile-level-id")) {
-                        result.profile_level_id = value;
-                    } else if (std.mem.eql(u8, key, "sprop-parameter-sets")) {
-                        if (std.mem.indexOfScalar(u8, value, ',')) |idx2| {
-                            result.sprop_parameter_sets = .{
-                                .sps = value[0..idx2],
-                                .pps = value[idx2 + 1 ..],
-                            };
-                        } else {
-                            return error.InvalidSpropParameterSets;
-                        }
-                    } else if (std.mem.eql(u8, key, "packetization-mode")) {
-                        result.packetization_mode = std.fmt.parseInt(u8, value, 10) catch return error.InvalidFmtp;
-                    }
-                }
-            }
-
-            return result;
         }
 
         return error.InvalidFmtp;
@@ -222,19 +276,61 @@ test "parse invalid RtmMap" {
 }
 
 test "parse Fmtp" {
-    const attribute = Attribute{
-        .key = "fmtp",
-        .value = "96 packetization-mode=1; profile-level-id=458723; level-asymmetry-allowed=1",
-    };
+    {
+        const fmtp = try Fmtp.parse(
+            "96 packetization-mode=1; profile-level-id=458723; level-asymmetry-allowed=1",
+            "H264",
+        );
+        try std.testing.expectEqual(96, fmtp.payload_type);
+        try std.testing.expectEqual(0x458723, fmtp.params.h264.profile_level_id);
+        try std.testing.expectEqual(1, fmtp.params.h264.packetization_mode);
+        try std.testing.expectEqual(true, fmtp.params.h264.level_asymmetry_allowed);
+        try std.testing.expect(fmtp.params.h264.sprop_parameter_sets == null);
+    }
 
-    const fmtp = try Fmtp.parse(attribute.value.?);
-    try std.testing.expect(fmtp.payload_type == 96);
+    {
+        const fmtp = try Fmtp.parse(
+            "97 profile-level-id=42E01F;sprop-parameter-sets=Z0LAH9oBQBboQAAAAwBAAAAMHixWoA==,aM48gA==",
+            "h264",
+        );
+        try std.testing.expectEqual(97, fmtp.payload_type);
+        try std.testing.expectEqual(0x42E01F, fmtp.params.h264.profile_level_id);
+        try std.testing.expectEqual(0, fmtp.params.h264.packetization_mode);
+        try std.testing.expectEqual(false, fmtp.params.h264.level_asymmetry_allowed);
+        try std.testing.expect(fmtp.params.h264.sprop_parameter_sets != null);
+        try std.testing.expectEqualStrings(
+            "Z0LAH9oBQBboQAAAAwBAAAAMHixWoA==",
+            fmtp.params.h264.sprop_parameter_sets.?.sps,
+        );
+        try std.testing.expectEqualStrings("aM48gA==", fmtp.params.h264.sprop_parameter_sets.?.pps);
+    }
 
-    try std.testing.expect(fmtp.profile_level_id != null);
-    try std.testing.expectEqualStrings("458723", fmtp.profile_level_id.?);
+    try std.testing.expectError(error.InvalidFmtp, Fmtp.parse("96", "H264"));
 
-    try std.testing.expect(fmtp.packetization_mode != null);
-    try std.testing.expect(fmtp.packetization_mode.? == 1);
+    {
+        const fmtp = try Fmtp.parse("98 apt=96;rtx-time=3000", "rtx");
+        try std.testing.expectEqual(98, fmtp.payload_type);
+        try std.testing.expectEqual(96, fmtp.params.rtx.apt);
+        try std.testing.expectEqual(3000, fmtp.params.rtx.rtx_time.?);
+    }
+
+    {
+        const fmtp = try Fmtp.parse("99 apt=100", "RTX");
+        try std.testing.expectEqual(99, fmtp.payload_type);
+        try std.testing.expectEqual(100, fmtp.params.rtx.apt);
+        try std.testing.expect(fmtp.params.rtx.rtx_time == null);
+    }
+
+    try std.testing.expectError(error.InvalidFmtp, Fmtp.parse("101 rtx-time=3000", "rtx"));
+
+    {
+        const fmtp = try Fmtp.parse("111 minptime=10;useinbandfec=1", "opus");
+        try std.testing.expectEqual(111, fmtp.payload_type);
+        try std.testing.expectEqualStrings("minptime=10;useinbandfec=1", fmtp.params.unknown);
+    }
+
+    try std.testing.expectError(error.InvalidFmtp, Fmtp.parse("notanumber foo=bar", "opus"));
+    try std.testing.expectError(error.InvalidFmtp, Fmtp.parse("96", "opus"));
 }
 
 test "parse attribute" {
@@ -248,14 +344,15 @@ test "parse attribute" {
     }
 
     {
-        const fmtp = try (Attribute{
+        const attr = try (Attribute{
             .key = "fmtp",
             .value = "96 packetization-mode=1; profile-level-id=458723",
         }).parse();
-        try std.testing.expect(fmtp == .fmtp);
-        try std.testing.expect(fmtp.fmtp.payload_type == 96);
-        try std.testing.expect(fmtp.fmtp.packetization_mode.? == 1);
-        try std.testing.expectEqualStrings("458723", fmtp.fmtp.profile_level_id.?);
+        try std.testing.expect(attr == .fmtp);
+        const fmtp = try Fmtp.parse(attr.fmtp, "H264");
+        try std.testing.expectEqual(96, fmtp.payload_type);
+        try std.testing.expectEqual(1, fmtp.params.h264.packetization_mode);
+        try std.testing.expectEqual(0x458723, fmtp.params.h264.profile_level_id);
     }
 
     {
@@ -304,6 +401,12 @@ test "parse attribute" {
         const mid = try (Attribute{ .key = "mid", .value = "audio" }).parse();
         try std.testing.expect(mid == .mid);
         try std.testing.expectEqualStrings("audio", mid.mid);
+    }
+
+    {
+        const attr = try (Attribute{ .key = "setup", .value = "actpass" }).parse();
+        try std.testing.expectEqual(.setup, @as(AttributeType, attr));
+        try std.testing.expectEqual(attr.setup, Setup.actpass);
     }
 
     {
