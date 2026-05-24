@@ -156,7 +156,7 @@ pub fn addRemoteCandidate(agent: *Agent, remote_candidate: Candidate) !void {
 /// This function should be called first after initializing the agent.
 pub fn gatherCandidates(agent: *Agent) !void {
     try agent.gatherHostCandidates();
-    try agent.initSockets();
+    agent.sockets = try initSockets(agent.io, agent.allocator, &agent.candidates);
     try agent.group.concurrent(agent.io, innerEventHandlerWrapper, .{agent});
 }
 
@@ -172,30 +172,29 @@ pub fn destroyPacket(agent: *Agent, data: []const u8) void {
     agent.buffer_pool.destroy(@ptrCast(@alignCast(@constCast(data))));
 }
 
-fn initSockets(agent: *Agent) !void {
-    const candidates = agent.candidates.items;
+fn initSockets(io: Io, allocator: std.mem.Allocator, candidates: *std.ArrayList(Candidate)) ![]Socket {
     var index: usize = 0;
 
-    var sockets: std.ArrayList(Io.net.Socket) = try .initCapacity(agent.allocator, agent.candidates.items.len);
+    var sockets: std.ArrayList(Io.net.Socket) = try .initCapacity(allocator, candidates.items.len);
     errdefer {
-        for (0..index) |idx| sockets.items[idx].close(agent.io);
-        sockets.deinit(agent.allocator);
+        for (0..index) |idx| sockets.items[idx].close(io);
+        sockets.deinit(allocator);
     }
 
     while (true) {
-        if (index >= candidates.len) break;
-        const socket = candidates[index].address.bind(agent.io, .{ .mode = .dgram, .protocol = .udp }) catch {
-            _ = agent.candidates.swapRemove(index);
+        if (index >= candidates.items.len) break;
+        const socket = candidates.items[index].address.bind(io, .{ .mode = .dgram }) catch {
+            _ = candidates.swapRemove(index);
             continue;
         };
 
         sockets.appendAssumeCapacity(socket);
-        candidates[index].base = socket.address;
-        candidates[index].address = socket.address;
+        candidates.items[index].base = socket.address;
+        candidates.items[index].address = socket.address;
         index += 1;
     }
 
-    agent.sockets = try sockets.toOwnedSlice(agent.allocator);
+    return try sockets.toOwnedSlice(allocator);
 }
 
 fn calculatePairPriority(l: u32, r: u32, role: ice.Role) u64 {
@@ -222,10 +221,10 @@ fn gatherHostCandidates(agent: *Agent) !void {
 }
 
 fn doAddRemoteCandidate(agent: *Agent, remote_candidate: Candidate) Allocator.Error!void {
-    for (agent.candidates.items) |candidate| {
+    outer_loop: for (agent.candidates.items) |candidate| {
         for (agent.pairs.items) |*pair|
             if (pair.local.base.eql(&candidate.base) and pair.remote.address.eql(&remote_candidate.address))
-                continue;
+                continue :outer_loop;
 
         try agent.pairs.append(agent.allocator, .{
             .local = candidate,
@@ -247,8 +246,8 @@ fn handleRequest(agent: *Agent, msg: *const stun.Message, base_addr: IpAddress, 
 
     if (agent.findCandidatePair(&base_addr, &from)) |candidate_pair| {
         switch (candidate_pair.state.status) {
-            .succeeded => candidate_pair.state.nominated = stun_req.use_candidate,
-            else => candidate_pair.state.nominateOnBinding = stun_req.use_candidate,
+            .succeeded => candidate_pair.state.nominated |= stun_req.use_candidate,
+            else => candidate_pair.state.nominateOnBinding |= stun_req.use_candidate,
         }
     } else {
         const local: Candidate = .initHost(base_addr);
@@ -549,6 +548,14 @@ fn innerEventHandler(agent: *Agent) !void {
             const data = message.incoming_message.data;
             const sender = message.incoming_message.from;
 
+            switch (agent.connection_state) {
+                .completed => {
+                    agent.destroyPacket(data);
+                    continue;
+                },
+                else => {},
+            }
+
             if (stun.isMessage(data)) {
                 defer agent.destroyPacket(data);
                 const msg = try stun.Message.parse(data);
@@ -576,7 +583,7 @@ fn innerEventHandler(agent: *Agent) !void {
                     else => {},
                 }
 
-                if (agent.nominated_pair != null) {
+                if (agent.nominated_pair != null and agent.connection_state != .connected) {
                     nominated_socket = agent.nominated_pair.?.socket;
                     agent.setConnectionState(.connected);
 
@@ -586,13 +593,15 @@ fn innerEventHandler(agent: *Agent) !void {
                     continue;
                 }
             } else {
-                for (agent.pairs.items) |*candidate_pair| if (candidate_pair.remote.address.eql(&sender)) {
-                    agent.on_data(agent, data);
-                    break;
+                for (agent.pairs.items) |*candidate_pair| {
+                    if (candidate_pair.remote.address.eql(&sender)) {
+                        agent.on_data(agent, data);
+                        break;
+                    }
                 } else {
                     std.log.warn("Drop non stun message from unknown remote candidate: {f}", .{sender});
                     agent.destroyPacket(data);
-                };
+                }
             }
 
             select.async(.message, receiveTimeout, .{ agent, message.socket, .none });
@@ -860,4 +869,31 @@ test "randomNumber" {
     try testing.expect(a != b);
     try testing.expect(b != c);
     try testing.expect(a != c);
+}
+
+test "initSockets" {
+    var candidates: std.ArrayList(Candidate) = .empty;
+    defer candidates.deinit(testing.allocator);
+
+    const addrs = [_]IpAddress{
+        .{ .ip4 = .loopback(0) },
+        .{ .ip4 = .{ .port = 0, .bytes = [_]u8{ 192, 192, 192, 192 } } },
+        .{ .ip4 = .loopback(0) },
+        .{ .ip4 = .loopback(0) },
+    };
+
+    for (addrs) |addr| try candidates.append(testing.allocator, .initHost(addr));
+
+    const sockets = try initSockets(testing.io, testing.allocator, &candidates);
+    defer testing.allocator.free(sockets);
+
+    try testing.expectEqual(3, sockets.len);
+    try testing.expectEqual(3, candidates.items.len);
+
+    for (candidates.items) |candidate| {
+        try testing.expectEqualSlices(u8, &[_]u8{ 127, 0, 0, 1 }, &candidate.base.ip4.bytes);
+        try testing.expect(candidate.base.getPort() != 0);
+        try testing.expectEqualSlices(u8, &[_]u8{ 127, 0, 0, 1 }, &candidate.address.ip4.bytes);
+        try testing.expect(candidate.address.getPort() != 0);
+    }
 }
