@@ -11,6 +11,7 @@ const attribute_types_map: std.StaticStringMap(AttributeType) = .initComptime(&.
     .{ "ice-ufrag", .ice_ufrag },
     .{ "ice-pwd", .ice_pwd },
     .{ "candidate", .candidate },
+    .{ "end-of-candidates", .end_of_candidates },
     .{ "sendrecv", .direction },
     .{ "sendonly", .direction },
     .{ "recvonly", .direction },
@@ -31,6 +32,7 @@ pub const AttributeType = enum {
     ice_ufrag,
     ice_pwd,
     candidate,
+    end_of_candidates,
     direction,
     mid,
     msid,
@@ -38,6 +40,7 @@ pub const AttributeType = enum {
     rtcp_mux,
     rtcp_mux_only,
     rtcp_rsize,
+    control,
     unknown,
 };
 
@@ -51,6 +54,7 @@ pub const ParsedAttribute = union(AttributeType) {
     ice_ufrag: []const u8,
     ice_pwd: []const u8,
     candidate: []const u8,
+    end_of_candidates: void,
     direction: []const u8,
     mid: []const u8,
     msid: Msid,
@@ -58,6 +62,7 @@ pub const ParsedAttribute = union(AttributeType) {
     rtcp_mux: void,
     rtcp_mux_only: void,
     rtcp_rsize: void,
+    control: []const u8,
     unknown,
 };
 
@@ -79,6 +84,7 @@ pub fn parse(attr: *const Attribute) !ParsedAttribute {
         .ice_pwd => .{ .ice_pwd = value },
         .candidate => .{ .candidate = value },
         .direction => .{ .direction = attr.key },
+        .end_of_candidates => .end_of_candidates,
         .mid => .{ .mid = value },
         .msid => .{ .msid = Msid.fromSlice(value) },
         .fmtp => .{ .fmtp = value },
@@ -86,6 +92,7 @@ pub fn parse(attr: *const Attribute) !ParsedAttribute {
         .rtcp_mux => .rtcp_mux,
         .rtcp_mux_only => .rtcp_mux_only,
         .rtcp_rsize => .rtcp_rsize,
+        .control => .{ .control = value },
         else => .unknown,
     };
 }
