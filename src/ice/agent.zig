@@ -2,6 +2,7 @@ const std = @import("std");
 const c = @import("c");
 const stun = @import("stun");
 const ice = @import("ice.zig");
+const IfIterator = @import("if_iterator.zig");
 
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
@@ -27,6 +28,7 @@ pub const AgentConfig = struct {
     ///
     /// Generated automatically if not provided
     credentials: ?ice.Credentials = null,
+    role: ice.Role = .controlling,
 };
 
 io: Io,
@@ -39,7 +41,7 @@ on_connection_state_change: *const fn (*Agent, ice.ConnectionState) void,
 on_data: *const fn (*Agent, []const u8) void,
 
 // Stun related fields
-role: Role,
+role: ice.Role,
 credentials: ice.Credentials,
 remote_credentials: ?ice.Credentials = null,
 tie_breaker: u64,
@@ -49,6 +51,10 @@ sockets: []Io.net.Socket = &.{},
 candidates: std.ArrayList(Candidate) = .empty,
 pairs: std.ArrayList(CandidatePair) = .empty,
 pending_requests: std.ArrayList(PendingRequest) = .empty,
+// This is a peer for which a use-candidate request is sent, but we didn't
+// receive response yet.
+selected_pair: ?SelectedPair = null,
+// This the final pair selected by this agent or the remote one.
 nominated_pair: ?SelectedPair = null,
 
 // Io handling
@@ -67,8 +73,6 @@ const SelectedPair = struct {
         try self.socket.send(io, &self.pair.remote.address, data);
     }
 };
-
-const Role = enum { controlling, controlled };
 
 const StunRequest = struct {
     username: []const u8 = &.{},
@@ -95,7 +99,7 @@ pub fn init(io: Io, allocator: Allocator, config: AgentConfig) !Agent {
         .io = io,
         .allocator = allocator,
         .buffer_pool = .empty,
-        .role = .controlled,
+        .role = config.role,
         .tie_breaker = generateTieBeaker(io),
         .credentials = credens,
         .on_connection_state_change = config.on_connection_state_change,
@@ -118,6 +122,16 @@ pub fn deinit(agent: *Agent) void {
     if (agent.remote_credentials) |*credens| credens.deinit(allocator);
 
     agent.buffer_pool.deinit(allocator);
+}
+
+/// Start the event loop that'll handle internal events.
+///
+/// This function should be run concurrently (e.g. in a `Io.Group`).
+pub fn startEventLoop(agent: *Agent) void {
+    agent.innerEventHandler() catch |err| switch (err) {
+        error.Canceled => return error.Canceled,
+        else => |e| std.log.err("Error occurred in event handler: {}", .{e}),
+    };
 }
 
 /// Set remote credentials
@@ -188,7 +202,7 @@ fn initSockets(agent: *Agent) !void {
     agent.sockets = try sockets.toOwnedSlice(agent.allocator);
 }
 
-fn calculatePairPriority(l: u32, r: u32, role: Role) u64 {
+fn calculatePairPriority(l: u32, r: u32, role: ice.Role) u64 {
     var g = l;
     var d = r;
     if (role == .controlled) g, d = .{ d, g };
@@ -210,36 +224,11 @@ fn generateTrasactionId(io: Io) u96 {
 }
 
 fn gatherHostCandidates(agent: *Agent) !void {
-    switch (@import("builtin").os.tag) {
-        .linux => try agent.linuxGatherHostCandidates(),
-        else => {},
-    }
-}
+    var it: IfIterator = undefined;
+    try it.init();
+    defer it.deinit();
 
-fn linuxGatherHostCandidates(agent: *Agent) !void {
-    var interfaces: [*c]c.ifaddrs = undefined;
-    if (c.getifaddrs(&interfaces) != 0) {
-        return error.GetIfAddrsFailed;
-    }
-    defer c.ifaddrs.freeifaddrs(interfaces);
-
-    var it = interfaces;
-    while (it) |p_ifa| : (it = p_ifa.*.ifa_next) if (p_ifa.*.ifa_addr) |addr| {
-        const sockaddr: linux.sockaddr = @bitCast(addr.*);
-
-        switch (sockaddr.family) {
-            linux.AF.INET => {
-                const c_flags: u16 = @truncate(p_ifa.*.ifa_flags);
-                const flags: linux.IFF = @bitCast(c_flags);
-                if (flags.LOOPBACK) continue;
-
-                const in: linux.sockaddr.in = @bitCast(sockaddr);
-                const ip_addr: IpAddress = .{ .ip4 = .{ .bytes = std.mem.toBytes(in.addr), .port = 0 } };
-                try agent.candidates.append(agent.allocator, .initHost(ip_addr));
-            },
-            else => {},
-        }
-    };
+    while (it.next()) |addr| try agent.candidates.append(agent.allocator, .initHost(addr));
 }
 
 fn doAddRemoteCandidate(agent: *Agent, remote_candidate: Candidate) Allocator.Error!void {
@@ -254,15 +243,6 @@ fn doAddRemoteCandidate(agent: *Agent, remote_candidate: Candidate) Allocator.Er
             .priority = calculatePairPriority(candidate.priority, remote_candidate.priority, agent.role),
         });
     }
-}
-
-fn handleReceivedMessage(agent: *Agent, base_addr: IpAddress, incoming_message: Io.net.IncomingMessage) !?[]const u8 {
-    const msg = try stun.Message.parse(incoming_message.data);
-    return switch (msg.header.message_type.class()) {
-        .request => try agent.handleRequest(&msg, base_addr, incoming_message.from),
-        .success_response => try agent.handleSuccessResponse(&msg, base_addr, incoming_message.from),
-        else => null,
-    };
 }
 
 fn handleRequest(agent: *Agent, msg: *const stun.Message, base_addr: IpAddress, from: IpAddress) ![]const u8 {
@@ -303,7 +283,7 @@ fn handleRequest(agent: *Agent, msg: *const stun.Message, base_addr: IpAddress, 
     return try agent.buildSuccessResponse(msg, from, buffer);
 }
 
-fn handleSuccessResponse(agent: *Agent, msg: *const stun.Message, base_addr: IpAddress, from: IpAddress) !?[]const u8 {
+fn handleSuccessResponse(agent: *Agent, msg: *const stun.Message, base_addr: IpAddress, from: IpAddress) !void {
     Logger.debug("Handle success response on {f} from {f}", .{ base_addr, from });
 
     const pending_request = blk: {
@@ -315,31 +295,25 @@ fn handleSuccessResponse(agent: *Agent, msg: *const stun.Message, base_addr: IpA
             }
         }
 
-        return null;
+        return;
     };
 
-    if (!pending_request.source.eql(&base_addr) or !pending_request.target.eql(&from)) return null;
+    if (!pending_request.source.eql(&base_addr) or !pending_request.target.eql(&from)) return;
 
     if (agent.findCandidatePair(&base_addr, &from)) |candidate_pair| {
         const mapped_address = try agent.parseAndValidateStunResponse(msg);
 
         if (mapped_address.eql(&base_addr)) {
             candidate_pair.state.status = .succeeded;
-            if (candidate_pair.state.nominateOnBinding) {
-                candidate_pair.state.nominateOnBinding = false;
-                candidate_pair.state.nominated = true;
-            }
-            return null;
+            agent.maybeSetNominatedField(candidate_pair);
+            return;
         }
         candidate_pair.state.status = .failed;
 
         if (agent.findCandidatePair(&mapped_address, &from)) |existing_candidate_pair| {
             existing_candidate_pair.state.status = .succeeded;
-            if (candidate_pair.state.nominateOnBinding) {
-                candidate_pair.state.nominateOnBinding = false;
-                candidate_pair.state.nominated = true;
-            }
-            return null;
+            agent.maybeSetNominatedField(existing_candidate_pair);
+            return;
         }
 
         const reflexive_candidate: Candidate = .initPeerReflexive(base_addr, mapped_address);
@@ -350,7 +324,17 @@ fn handleSuccessResponse(agent: *Agent, msg: *const stun.Message, base_addr: IpA
             .state = .{ .status = .succeeded },
         });
     }
-    return null;
+}
+
+fn maybeSetNominatedField(agent: *Agent, candidate_pair: *CandidatePair) void {
+    if (candidate_pair.state.nominateOnBinding) {
+        candidate_pair.state.nominateOnBinding = false;
+        candidate_pair.state.nominated = true;
+    } else if (agent.selected_pair != null and agent.selected_pair.?.pair.eql(candidate_pair)) {
+        agent.nominated_pair = agent.selected_pair;
+        agent.nominated_pair.?.pair.state.nominated = true;
+        agent.selected_pair = null;
+    }
 }
 
 fn parseAndValidateStunRequest(agent: *Agent, msg: *const stun.Message) !StunRequest {
@@ -415,7 +399,7 @@ fn parseAndValidateStunResponse(agent: *Agent, msg: *const stun.Message) !IpAddr
     return if (maybe_addr) |addr| addr else error.MissingMappedAddress;
 }
 
-fn buildBindingRequest(agent: *Agent, tx_id: u96, buffer: *[max_message_size]u8) ![]const u8 {
+fn buildBindingRequest(agent: *Agent, tx_id: u96, use_candidate: bool, buffer: *[max_message_size]u8) ![]const u8 {
     var w = stun.Writer.init(&(buffer.*), .{ .password = agent.remote_credentials.?.password });
     try w.writeHeader(.{
         .message_type = .fromClassAndMethod(.request, .binding),
@@ -430,6 +414,7 @@ fn buildBindingRequest(agent: *Agent, tx_id: u96, buffer: *[max_message_size]u8)
         .controlled => .{ .ice_controlled = agent.tie_breaker },
         .controlling => .{ .ice_controlling = agent.tie_breaker },
     };
+    if (use_candidate) try w.writeAttribute(.use_candidate);
     try w.writeAttribute(role_attribute);
     try w.writeAttribute(.{ .message_integrity = &.{} });
     try w.writeAttribute(.fingerprint);
@@ -534,7 +519,7 @@ fn innerEventHandler(agent: *Agent) !void {
     const io = agent.io;
     const Select = Io.Select(InnerEvent);
 
-    var queue: [1]InnerEvent = undefined;
+    var queue: [5]InnerEvent = undefined;
     var select = Select.init(agent.io, &queue);
     defer select.cancelDiscard();
 
@@ -544,7 +529,7 @@ fn innerEventHandler(agent: *Agent) !void {
 
     var nominated_socket: Socket = undefined;
 
-    while (true) switch (try select.await()) {
+    while (select.await()) |event| switch (event) {
         .connectivity_check => |timeout| {
             try timeout;
             switch (agent.connection_state) {
@@ -563,22 +548,32 @@ fn innerEventHandler(agent: *Agent) !void {
 
             if (stun.isMessage(data)) {
                 defer agent.destroyPacket(data);
-                if (try agent.handleReceivedMessage(message.socket.address, message.incoming_message)) |response| {
-                    defer agent.destroyPacket(response);
-                    try message.socket.send(io, &sender, response);
+                const msg = try stun.Message.parse(data);
+
+                switch (msg.header.message_type.class()) {
+                    .request => {
+                        const resp = try agent.handleRequest(&msg, message.socket.address, sender);
+                        defer agent.destroyPacket(resp);
+                        try message.socket.send(io, &sender, resp);
+
+                        const candidate_pair: ?CandidatePair = blk: {
+                            if (agent.role == .controlling or agent.nominated_pair != null) break :blk null;
+                            for (agent.pairs.items) |candidate_pair| if (candidate_pair.state.nominated) break :blk candidate_pair;
+                            break :blk null;
+                        };
+
+                        if (candidate_pair != null) {
+                            agent.nominated_pair = .{
+                                .pair = candidate_pair.?,
+                                .socket = message.socket.*,
+                            };
+                        }
+                    },
+                    .success_response => try agent.handleSuccessResponse(&msg, message.socket.address, sender),
+                    else => {},
                 }
 
-                const candidate_pair: ?CandidatePair = blk: {
-                    if (agent.role == .controlling or agent.nominated_pair != null) break :blk null;
-                    for (agent.pairs.items) |candidate_pair| if (candidate_pair.state.nominated) break :blk candidate_pair;
-                    break :blk null;
-                };
-
-                if (candidate_pair != null) {
-                    agent.nominated_pair = .{
-                        .pair = candidate_pair.?,
-                        .socket = message.socket.*,
-                    };
+                if (agent.nominated_pair != null) {
                     nominated_socket = agent.nominated_pair.?.socket;
                     agent.setConnectionState(.connected);
 
@@ -634,7 +629,7 @@ fn innerEventHandler(agent: *Agent) !void {
             try result;
             agent.markConnectionCompleted();
         },
-    };
+    } else |err| return err;
 }
 
 fn receiveTimeout(agent: *Agent, socket: *const Socket, timeout: Io.Timeout) !Message {
@@ -650,9 +645,41 @@ fn send(agent: *Agent, socket: *const Socket, address: *const IpAddress, buffer:
     try socket.send(agent.io, address, buffer);
 }
 
+fn selectBestPair(agent: *Agent) ?SelectedPair {
+    var selected_pair: ?CandidatePair = null;
+    for (agent.pairs.items) |candidate_pair| if (candidate_pair.state.status == .succeeded) {
+        if (selected_pair == null or candidate_pair.priority > selected_pair.?.priority) {
+            selected_pair = candidate_pair;
+        }
+    };
+
+    return if (selected_pair) |pair|
+        .{ .pair = pair, .socket = findSocket(agent.sockets, &pair.local.base).* }
+    else
+        null;
+}
+
 fn batchSendConnectivityCheck(agent: *Agent) !void {
     const buffer = try agent.buffer_pool.create(agent.allocator);
     defer agent.buffer_pool.destroy(buffer);
+
+    if (agent.nominated_pair != null) return;
+
+    if (agent.selected_pair == null) if (agent.selectBestPair()) |selected_pair| {
+        std.log.debug("Send binding request with use candidate on pair: {f}", .{selected_pair.pair});
+
+        const transaction_id = generateTrasactionId(agent.io);
+        const msg = try agent.buildBindingRequest(transaction_id, true, buffer);
+
+        try agent.pending_requests.append(agent.allocator, .{
+            .transaction_id = transaction_id,
+            .source = selected_pair.pair.local.base,
+            .target = selected_pair.pair.remote.address,
+        });
+
+        try selected_pair.sendData(agent.io, msg);
+        agent.selected_pair = selected_pair;
+    };
 
     for (agent.pairs.items) |*candidate_pair| switch (candidate_pair.state.status) {
         .waiting, .in_progress => {
@@ -663,7 +690,7 @@ fn batchSendConnectivityCheck(agent: *Agent) !void {
             }
 
             const transaction_id = generateTrasactionId(agent.io);
-            const msg = try agent.buildBindingRequest(transaction_id, buffer);
+            const msg = try agent.buildBindingRequest(transaction_id, false, buffer);
 
             try agent.pending_requests.append(agent.allocator, .{
                 .transaction_id = transaction_id,
@@ -696,6 +723,7 @@ fn testNewAgent() !Agent {
     return try .init(testing.io, testing.allocator, .{
         .on_connection_state_change = undefined,
         .on_data = undefined,
+        .role = .controlled,
     });
 }
 
