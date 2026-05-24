@@ -1,5 +1,4 @@
 const std = @import("std");
-const c = @import("c");
 const stun = @import("stun");
 const ice = @import("ice.zig");
 const IfIterator = @import("if_iterator.zig");
@@ -100,7 +99,7 @@ pub fn init(io: Io, allocator: Allocator, config: AgentConfig) !Agent {
         .allocator = allocator,
         .buffer_pool = .empty,
         .role = config.role,
-        .tie_breaker = generateTieBeaker(io),
+        .tie_breaker = randomNumber(u64, io),
         .credentials = credens,
         .on_connection_state_change = config.on_connection_state_change,
         .on_data = config.on_data,
@@ -127,11 +126,8 @@ pub fn deinit(agent: *Agent) void {
 /// Start the event loop that'll handle internal events.
 ///
 /// This function should be run concurrently (e.g. in a `Io.Group`).
-pub fn startEventLoop(agent: *Agent) void {
-    agent.innerEventHandler() catch |err| switch (err) {
-        error.Canceled => return error.Canceled,
-        else => |e| std.log.err("Error occurred in event handler: {}", .{e}),
-    };
+pub inline fn startEventLoop(agent: *Agent) !void {
+    return agent.innerEventHandler();
 }
 
 /// Set remote credentials
@@ -211,16 +207,10 @@ fn calculatePairPriority(l: u32, r: u32, role: ice.Role) u64 {
     return (@as(u64, 1) << 32) * @min(g, d) + 2 * @max(g, d) + last_part;
 }
 
-fn generateTieBeaker(io: Io) u64 {
-    var bytes: [8]u8 = undefined;
+fn randomNumber(T: type, io: Io) T {
+    var bytes: [@typeInfo(T).int.bits / 8]u8 = undefined;
     io.random(&bytes);
     return @bitCast(bytes);
-}
-
-fn generateTrasactionId(io: Io) u96 {
-    var bytes: [12]u8 = undefined;
-    io.random(&bytes);
-    return std.mem.readInt(u96, &bytes, .big);
 }
 
 fn gatherHostCandidates(agent: *Agent) !void {
@@ -304,23 +294,28 @@ fn handleSuccessResponse(agent: *Agent, msg: *const stun.Message, base_addr: IpA
         const mapped_address = try agent.parseAndValidateStunResponse(msg);
 
         if (mapped_address.eql(&base_addr)) {
-            candidate_pair.state.status = .succeeded;
+            candidate_pair.setStatus(.succeeded);
             agent.maybeSetNominatedField(candidate_pair);
             return;
         }
-        candidate_pair.state.status = .failed;
+        candidate_pair.setStatus(.failed);
 
-        if (agent.findCandidatePair(&mapped_address, &from)) |existing_candidate_pair| {
-            existing_candidate_pair.state.status = .succeeded;
+        const local_candidate = agent.findLocalCandidate(&base_addr, &mapped_address) orelse blk: {
+            const prflx_candidate: Candidate = .initPeerReflexive(base_addr, mapped_address);
+            try agent.candidates.append(agent.allocator, prflx_candidate);
+            break :blk prflx_candidate;
+        };
+
+        if (agent.findCandidatePairByLocalAndRemote(&local_candidate, &from)) |existing_candidate_pair| {
+            existing_candidate_pair.setStatus(.succeeded);
             agent.maybeSetNominatedField(existing_candidate_pair);
             return;
         }
 
-        const reflexive_candidate: Candidate = .initPeerReflexive(base_addr, mapped_address);
         try agent.pairs.append(agent.allocator, .{
-            .local = reflexive_candidate,
+            .local = local_candidate,
             .remote = candidate_pair.remote,
-            .priority = calculatePairPriority(reflexive_candidate.priority, candidate_pair.remote.priority, agent.role),
+            .priority = calculatePairPriority(local_candidate.priority, candidate_pair.remote.priority, agent.role),
             .state = .{ .status = .succeeded },
         });
     }
@@ -428,7 +423,7 @@ fn buildIndicationRequest(buffer: []u8) ![]const u8 {
     try w.writeHeader(.{
         .message_type = .fromClassAndMethod(.indication, .binding),
         .message_length = 0,
-        .transaction_id = 0x0010,
+        .transaction_id = 0x1010101010,
     });
 
     return w.final();
@@ -473,17 +468,25 @@ fn findSocket(sockets: []Io.net.Socket, addr: *const IpAddress) *Io.net.Socket {
     unreachable;
 }
 
+fn findLocalCandidate(agent: *Agent, base: *const IpAddress, addr: *const IpAddress) ?Candidate {
+    for (agent.candidates.items) |candidate| if (candidate.base.eql(base) and candidate.address.eql(addr)) return candidate;
+    return null;
+}
+
 fn findCandidatePair(agent: *Agent, local: *const IpAddress, remote: *const IpAddress) ?*CandidatePair {
     var pair: ?*CandidatePair = null;
 
     for (agent.pairs.items) |*candidate| if (candidate.local.base.eql(local) and candidate.remote.address.eql(remote)) {
-        if (pair) |found_pair| {
-            if (candidate.state.status != .failed and found_pair.state.status == .failed)
-                pair = candidate;
-        } else pair = candidate;
+        if (pair == null or candidate.state.status != .failed and pair.?.state.status == .failed) pair = candidate;
     };
 
     return pair;
+}
+
+fn findCandidatePairByLocalAndRemote(agent: *Agent, local: *const Candidate, remote: *const IpAddress) ?*CandidatePair {
+    for (agent.pairs.items) |*candidate| if (candidate.local.eql(local) and candidate.remote.address.eql(remote))
+        return candidate;
+    return null;
 }
 
 fn setConnectionState(agent: *Agent, new_state: ice.ConnectionState) void {
@@ -668,7 +671,7 @@ fn batchSendConnectivityCheck(agent: *Agent) !void {
     if (agent.selected_pair == null) if (agent.selectBestPair()) |selected_pair| {
         std.log.debug("Send binding request with use candidate on pair: {f}", .{selected_pair.pair});
 
-        const transaction_id = generateTrasactionId(agent.io);
+        const transaction_id = randomNumber(u96, agent.io);
         const msg = try agent.buildBindingRequest(transaction_id, true, buffer);
 
         try agent.pending_requests.append(agent.allocator, .{
@@ -689,7 +692,7 @@ fn batchSendConnectivityCheck(agent: *Agent) !void {
                 continue;
             }
 
-            const transaction_id = generateTrasactionId(agent.io);
+            const transaction_id = randomNumber(u96, agent.io);
             const msg = try agent.buildBindingRequest(transaction_id, false, buffer);
 
             try agent.pending_requests.append(agent.allocator, .{
@@ -731,7 +734,7 @@ fn testBuildRequest(req: StunRequest, peer_password: []const u8, buffer: []u8) !
     var w = stun.Writer.init(buffer, .{ .password = peer_password });
     try w.writeHeader(.{
         .message_type = .fromClassAndMethod(.request, .binding),
-        .transaction_id = generateTrasactionId(testing.io),
+        .transaction_id = randomNumber(u96, testing.io),
         .message_length = 0,
     });
     try w.writeAttribute(.{ .username = req.username });
@@ -847,4 +850,14 @@ test "handle request: nominate peer" {
     candidate_pair.state.status = .succeeded;
     _ = try agent.handleRequest(&msg, base_addr, from);
     try testing.expectEqual(true, candidate_pair.state.nominated);
+}
+
+test "randomNumber" {
+    const a = randomNumber(u64, testing.io);
+    const b = randomNumber(u64, testing.io);
+    const c = randomNumber(u64, testing.io);
+
+    try testing.expect(a != b);
+    try testing.expect(b != c);
+    try testing.expect(a != c);
 }

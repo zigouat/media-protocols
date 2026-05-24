@@ -122,6 +122,10 @@ pub const Candidate = struct {
         }
     }
 
+    pub fn eql(a: *const Candidate, b: *const Candidate) bool {
+        return a.base.eql(&b.base) and a.address.eql(&b.address);
+    }
+
     fn calculateFoundation(self: *Candidate) void {
         var hasher = std.hash.Crc32.init();
         hasher.update(@tagName(self.candidate_type));
@@ -267,6 +271,10 @@ pub const CandidatePair = struct {
         nominateOnBinding: bool = false,
         _pad: u4 = 0,
     };
+
+    pub inline fn setStatus(pair: *CandidatePair, new_status: Status) void {
+        pair.state.status = new_status;
+    }
 
     pub fn compare(_: void, lhs: CandidatePair, rhs: CandidatePair) bool {
         return lhs.priority > rhs.priority;
