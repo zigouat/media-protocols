@@ -285,7 +285,7 @@ fn handleRequest(agent: *Agent, msg: *const stun.Message, base_addr: IpAddress, 
         const remote: Candidate = .{
             .base = from,
             .address = from,
-            .candidate_type = .peer_reflexive,
+            .candidate_type = .prflx,
             .priority = stun_req.priority,
         };
 
@@ -335,6 +335,10 @@ fn handleSuccessResponse(agent: *Agent, msg: *const stun.Message, base_addr: IpA
 
         if (agent.findCandidatePair(&mapped_address, &from)) |existing_candidate_pair| {
             existing_candidate_pair.state.status = .succeeded;
+            if (candidate_pair.state.nominateOnBinding) {
+                candidate_pair.state.nominateOnBinding = false;
+                candidate_pair.state.nominated = true;
+            }
             return null;
         }
 
@@ -421,7 +425,7 @@ fn buildBindingRequest(agent: *Agent, tx_id: u96, buffer: *[max_message_size]u8)
 
     var username = [_][]const u8{ agent.remote_credentials.?.username, ":", agent.credentials.username };
     try w.writeRaw(.username, &username);
-    try w.writeAttribute(.{ .priority = ice.CandidateType.peer_reflexive.priority() });
+    try w.writeAttribute(.{ .priority = ice.CandidateType.prflx.priority() });
     const role_attribute: stun.Attribute = switch (agent.role) {
         .controlled => .{ .ice_controlled = agent.tie_breaker },
         .controlling => .{ .ice_controlling = agent.tie_breaker },
@@ -485,12 +489,16 @@ fn findSocket(sockets: []Io.net.Socket, addr: *const IpAddress) *Io.net.Socket {
 }
 
 fn findCandidatePair(agent: *Agent, local: *const IpAddress, remote: *const IpAddress) ?*CandidatePair {
-    for (agent.pairs.items) |*candidate| {
-        if (candidate.local.address.eql(local) and candidate.remote.address.eql(remote))
-            return candidate;
-    }
+    var pair: ?*CandidatePair = null;
 
-    return null;
+    for (agent.pairs.items) |*candidate| if (candidate.local.base.eql(local) and candidate.remote.address.eql(remote)) {
+        if (pair) |found_pair| {
+            if (candidate.state.status != .failed and found_pair.state.status == .failed)
+                pair = candidate;
+        } else pair = candidate;
+    };
+
+    return pair;
 }
 
 fn setConnectionState(agent: *Agent, new_state: ice.ConnectionState) void {
@@ -582,6 +590,7 @@ fn innerEventHandler(agent: *Agent) !void {
             } else {
                 for (agent.pairs.items) |*candidate_pair| if (candidate_pair.remote.address.eql(&sender)) {
                     agent.on_data(agent, data);
+                    break;
                 } else {
                     std.log.warn("Drop non stun message from unknown remote candidate: {f}", .{sender});
                     agent.destroyPacket(data);
