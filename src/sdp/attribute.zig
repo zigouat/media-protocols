@@ -92,7 +92,7 @@ pub fn parse(attr: *const Attribute) !ParsedAttribute {
         .rtcp_mux => .rtcp_mux,
         .rtcp_mux_only => .rtcp_mux_only,
         .rtcp_rsize => .rtcp_rsize,
-        .control => |v| .{ .control = v },
+        .control => .{ .control = value },
         else => .unknown,
     };
 }
