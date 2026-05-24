@@ -34,16 +34,16 @@ pub const Request = struct {
         } || rtsp.Header.Transport.Error;
 
         pub fn parse(buffer: []const u8) !Head {
-            var it = std.mem.splitSequence(u8, buffer, "\r\n");
+            var it = std.mem.splitSequence(u8, buffer, "\n");
 
             const first_line = it.next().?;
-            var it2 = std.mem.splitScalar(u8, first_line, ' ');
+            var it2 = std.mem.tokenizeScalar(u8, first_line, ' ');
 
             const method_str = it2.next() orelse return error.RtspHeadersInvalid;
             const method = std.meta.stringToEnum(rtsp.Method, method_str) orelse return error.UnknownRtspMethod;
 
             const uri = it2.next() orelse return error.RtspHeadersInvalid;
-            const version = std.mem.trim(u8, it2.rest(), " \t");
+            const version = std.mem.trim(u8, it2.rest(), " \t\r");
 
             if (!std.ascii.eqlIgnoreCase(version, "rtsp/1.0")) return error.RtspVersionInvalid;
 
@@ -58,7 +58,9 @@ pub const Request = struct {
             };
 
             // Parse headers
-            while (it.next()) |line| {
+            while (it.next()) |next_line| {
+                const line = std.mem.trimEnd(u8, next_line, " \t\r");
+
                 if (line.len == 0) {
                     if (head.cseq == std.math.maxInt(u32)) return error.MissingSequenceHeader;
                     return head;
@@ -72,11 +74,11 @@ pub const Request = struct {
                 if (std.ascii.eqlIgnoreCase(header_name, "cseq")) {
                     head.cseq = std.fmt.parseInt(u32, header_value, 10) catch return error.RtspHeadersInvalid;
                 } else if (std.ascii.eqlIgnoreCase(header_name, "session")) {
-                    head.session = header_name;
+                    head.session = header_value;
                 } else if (std.ascii.eqlIgnoreCase(header_name, "www-authenticate")) {
-                    head.authenticate = header_name;
+                    head.authenticate = header_value;
                 } else if (std.ascii.eqlIgnoreCase(header_name, "content-length")) {
-                    head.content_length = std.fmt.parseInt(u32, header_name, 10) catch return error.RtspHeadersInvalid;
+                    head.content_length = std.fmt.parseInt(u32, header_value, 10) catch return error.RtspHeadersInvalid;
                     if (head.content_length > 0 and !head.method.expectBody()) {
                         return error.ContentLengthUnexpected;
                     }
@@ -105,7 +107,7 @@ pub const Request = struct {
             try std.testing.expectEqual(null, head.transport);
             try std.testing.expectEqual(null, head.authenticate);
             try std.testing.expectEqualStrings("rtsp://localhost/ISAPI/Streaming/Channels/101", head.uri);
-            try std.testing.expectEqualStrings("34F454A", head.session.?);
+            try std.testing.expectEqualStrings("34F4545A", head.session.?);
         }
     };
 
@@ -194,4 +196,8 @@ fn receiveHeadFromReader(r: *Reader) ![]const u8 {
             return result;
         }
     }
+}
+
+test {
+    std.testing.refAllDecls(@This());
 }
