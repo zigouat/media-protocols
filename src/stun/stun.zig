@@ -1,10 +1,15 @@
 const std = @import("std");
-
 const Io = std.Io;
 
 pub const magic_cookie: u32 = 0x2112A442;
 pub const header_size = 20;
+
 const fingerprint_xor: u32 = 0x5354554e;
+
+/// Returns `true` if it's stun message.
+pub fn isMessage(msg: []const u8) bool {
+    return msg.len >= header_size and std.mem.readInt(u32, msg[4..8], .big) == magic_cookie;
+}
 
 pub const Class = enum(u2) {
     request,
@@ -180,7 +185,7 @@ pub const AttributeIterator = struct {
                 const class = attr_value[2] & 0x07;
                 if (class < 3 or class > 6 or attr_value[3] > 99) return error.InvalidAttribute;
                 break :blk .{ .error_code = .{
-                    .code = (@as(u16, class) << 8) | attr_value[3],
+                    .code = @as(u16, class) * 100 + attr_value[3],
                     .reason = attr_value[4..attr_len],
                 } };
             },
@@ -346,13 +351,14 @@ pub const Writer = struct {
         switch (attribute) {
             .priority => |p| try out.writeInt(u32, p, .big),
             .ice_controlled, .ice_controlling => |tie_breaker| try out.writeInt(u64, tie_breaker, .big),
+            .use_candidate => {},
             .message_integrity => try msg_writer.writeMessageIntegrity(),
             .fingerprint => try writeFingerprint(&msg_writer.writer),
             .software, .username, .userhash => |slice| try out.writeAll(slice),
             .mapped_address => |addr| try msg_writer.writeIpAddress(addr, false),
             .xor_mapped_address => |addr| try msg_writer.writeIpAddress(addr, true),
             .error_code => |err| {
-                try msg_writer.writer.writeInt(u32, @as(u24, err.code / 100) << 16 | (err.code % 100), .big);
+                try msg_writer.writer.writeInt(u32, @as(u32, err.code / 100) << 8 | (err.code % 100), .big);
                 try msg_writer.writer.writeAll(err.reason);
             },
             else => return error.UnknownAttribute,

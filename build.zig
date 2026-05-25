@@ -43,6 +43,22 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    const translate_c = b.addTranslateC(.{
+        .root_source_file = b.path("src/ice/c.h"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const ice = b.addModule("ice", .{
+        .root_source_file = b.path("src/ice/ice.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "stun", .module = stun },
+            .{ .name = "c", .module = translate_c.createModule() },
+        },
+        .link_libc = true,
+    });
     _ = b.addModule("protocols", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
@@ -52,12 +68,13 @@ pub fn build(b: *std.Build) void {
             .{ .name = "sdp", .module = sdp },
             .{ .name = "rtsp", .module = rtsp },
             .{ .name = "stun", .module = stun },
+            .{ .name = "ice", .module = ice },
         },
     });
 
     {
         const test_filters = b.option([]const []const u8, "test-filter", "Skip tests that do not match any filter") orelse &[0][]const u8{};
-        const modules = [_]*std.Build.Module{ rtp, rtcp, sdp, rtsp, stun };
+        const modules = [_]*std.Build.Module{ rtp, rtcp, sdp, rtsp, stun, ice };
         const test_step = b.step("test", "Run tests");
 
         inline for (modules) |sub_module| {
