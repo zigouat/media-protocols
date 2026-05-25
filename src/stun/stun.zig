@@ -185,7 +185,7 @@ pub const AttributeIterator = struct {
                 const class = attr_value[2] & 0x07;
                 if (class < 3 or class > 6 or attr_value[3] > 99) return error.InvalidAttribute;
                 break :blk .{ .error_code = .{
-                    .code = (@as(u16, class) << 8) | attr_value[3],
+                    .code = @as(u16, class) * 100 + attr_value[3],
                     .reason = attr_value[4..attr_len],
                 } };
             },
@@ -358,7 +358,7 @@ pub const Writer = struct {
             .mapped_address => |addr| try msg_writer.writeIpAddress(addr, false),
             .xor_mapped_address => |addr| try msg_writer.writeIpAddress(addr, true),
             .error_code => |err| {
-                try msg_writer.writer.writeInt(u32, @as(u24, err.code / 100) << 16 | (err.code % 100), .big);
+                try msg_writer.writer.writeInt(u32, @as(u32, err.code / 100) << 8 | (err.code % 100), .big);
                 try msg_writer.writer.writeAll(err.reason);
             },
             else => return error.UnknownAttribute,

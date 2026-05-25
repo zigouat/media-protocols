@@ -126,7 +126,7 @@ pub fn deinit(agent: *Agent) void {
 /// Start the event loop that'll handle internal events.
 ///
 /// This function should be run concurrently (e.g. in a `Io.Group`).
-pub inline fn startEventLoop(agent: *Agent) !void {
+pub fn startEventLoop(agent: *Agent) !void {
     return agent.innerEventHandler();
 }
 
@@ -167,7 +167,7 @@ pub fn sendData(agent: *const Agent, data: []const u8) Socket.SendError!void {
     }
 }
 
-/// Free the buffer and return to the pool.
+/// Free the buffer and return it to the pool.
 pub fn destroyPacket(agent: *Agent, data: []const u8) void {
     agent.buffer_pool.destroy(@ptrCast(@alignCast(@constCast(data))));
 }
@@ -859,6 +859,47 @@ test "handle request: nominate peer" {
     candidate_pair.state.status = .succeeded;
     _ = try agent.handleRequest(&msg, base_addr, from);
     try testing.expectEqual(true, candidate_pair.state.nominated);
+}
+
+test "handle request: role conflict" {
+    var agent: Agent = try testNewAgent();
+    defer agent.deinit();
+
+    var buffer: [1024]u8 = undefined;
+
+    const base_addr = try IpAddress.parse("192.168.1.100", 1000);
+    const from = try IpAddress.parse("192.168.1.120", 2000);
+
+    {
+        const msg = try testBuildRequest(.{
+            .ice_controlled = std.math.maxInt(u64),
+            .priority = 0x9090,
+            .username = agent.credentials.username,
+        }, agent.credentials.password, &buffer);
+
+        const resp = try agent.handleRequest(&msg, base_addr, from);
+        const resp_msg = try stun.Message.parse(resp);
+
+        try testing.expectEqual(.error_response, resp_msg.header.message_type.class());
+        try testing.expectEqual(.binding, resp_msg.header.message_type.method());
+        try testing.expectEqual(msg.header.transaction_id, resp_msg.header.transaction_id);
+
+        var it = resp_msg.iterateAttributes(agent.credentials.password);
+        const attr = (try it.next()).?;
+        try testing.expectEqual(.error_code, @as(stun.AttributeType, attr));
+        try testing.expectEqual(487, attr.error_code.code);
+        try testing.expectEqualStrings("Role conflict", attr.error_code.reason);
+    }
+
+    {
+        const msg = try testBuildRequest(.{
+            .ice_controlled = 0,
+            .priority = 0x9090,
+            .username = agent.credentials.username,
+        }, agent.credentials.password, &buffer);
+
+        try testing.expectError(error.SwitchRole, agent.handleRequest(&msg, base_addr, from));
+    }
 }
 
 test "randomNumber" {
