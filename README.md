@@ -8,3 +8,4 @@ The projects is structured into modules, each module is a separate library that 
 * `sdp` - [SDP (Session Description Protocol)](https://datatracker.ietf.org/doc/html/rfc4566) implementation for describing multimedia sessions based on RFC 4566.
 * `rtsp` - [RTSP (Real Time Streaming Protocol)](https://datatracker.ietf.org/doc/html/rfc2326) implementation for controlling streaming media servers based on RFC 2326.
 * `stun` - [STUN (Session Traversal Utilities for NAT)](https://datatracker.ietf.org/doc/html/rfc8489) implementation for NAT traversal based on RFC 8489.
+* `ice` - [ICE (Interactive Connectivity Establishment)](https://datatracker.ietf.org/doc/html/rfc8445) implementation for NAT traversal based on RFC 8445.
