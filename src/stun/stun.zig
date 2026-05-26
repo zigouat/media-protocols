@@ -430,7 +430,7 @@ pub const Writer = struct {
                     const slice = try out.writableSlice(ipv6.bytes.len);
                     const txid = out.buffer[8..20];
 
-                    for (slice, 0..) |*b, idx| b.* = cookie[idx] ^ ipv6.bytes[idx];
+                    for (slice[0..4], 0..) |*b, idx| b.* = cookie[idx] ^ ipv6.bytes[idx];
                     for (slice[4..], 0..) |*b, idx| b.* = txid[idx] ^ ipv6.bytes[idx];
                 } else {
                     try out.writeInt(u16, ipv6.port, .big);
