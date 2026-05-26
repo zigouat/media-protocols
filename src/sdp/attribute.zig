@@ -10,6 +10,7 @@ const attribute_types_map: std.StaticStringMap(AttributeType) = .initComptime(&.
     .{ "group", .group },
     .{ "ice-ufrag", .ice_ufrag },
     .{ "ice-pwd", .ice_pwd },
+    .{ "ice-lite", .ice_lite },
     .{ "candidate", .candidate },
     .{ "end-of-candidates", .end_of_candidates },
     .{ "sendrecv", .direction },
@@ -31,6 +32,7 @@ pub const AttributeType = enum {
     group,
     ice_ufrag,
     ice_pwd,
+    ice_lite,
     candidate,
     end_of_candidates,
     direction,
@@ -50,9 +52,10 @@ pub const ParsedAttribute = union(AttributeType) {
     rtpmap: RtpMap,
     fmtp: []const u8,
     fingerprint: Fingerprint,
-    group: []const u8,
+    group: Group,
     ice_ufrag: []const u8,
     ice_pwd: []const u8,
+    ice_lite: void,
     candidate: []const u8,
     end_of_candidates: void,
     direction: []const u8,
@@ -79,9 +82,10 @@ pub fn parse(attr: *const Attribute) !ParsedAttribute {
     return switch (attr.getType()) {
         .fingerprint => .{ .fingerprint = try Fingerprint.parse(attr.*) },
         .rtpmap => .{ .rtpmap = try RtpMap.parse(value) },
-        .group => .{ .group = value },
+        .group => .{ .group = try Group.parse(value) },
         .ice_ufrag => .{ .ice_ufrag = value },
         .ice_pwd => .{ .ice_pwd = value },
+        .ice_lite => .ice_lite,
         .candidate => .{ .candidate = value },
         .direction => .{ .direction = attr.key },
         .end_of_candidates => .end_of_candidates,
@@ -275,6 +279,22 @@ pub const Msid = struct {
     }
 };
 
+pub const GroupSemantics = enum { LS, FID, FEC, BUNDLE, UNKNOWN };
+
+pub const Group = struct {
+    semantics: GroupSemantics,
+    mids: []const u8 = &.{},
+
+    fn parse(attr_value: []const u8) !Group {
+        if (attr_value.len == 0) return error.InvalidAttribute;
+        const sp_idx = std.mem.indexOfScalar(u8, attr_value, ' ') orelse attr_value.len;
+        return .{
+            .semantics = std.meta.stringToEnum(GroupSemantics, attr_value[0..sp_idx]) orelse .UNKNOWN,
+            .mids = if (sp_idx == attr_value.len) &.{} else attr_value[sp_idx + 1 ..],
+        };
+    }
+};
+
 test "attribute parsing" {
     const input =
         \\a=rtpmap:96 opus/48000/2
@@ -425,7 +445,57 @@ test "parse attribute" {
     {
         const group = try (Attribute{ .key = "group", .value = "BUNDLE 0 1" }).parse();
         try std.testing.expect(group == .group);
-        try std.testing.expectEqualStrings("BUNDLE 0 1", group.group);
+        try std.testing.expectEqual(GroupSemantics.BUNDLE, group.group.semantics);
+        try std.testing.expectEqualStrings("0 1", group.group.mids);
+    }
+
+    {
+        const candidate = try (Attribute{
+            .key = "candidate",
+            .value = "1 1 UDP 2130706431 192.168.1.1 54321 typ host",
+        }).parse();
+        try std.testing.expect(candidate == .candidate);
+        try std.testing.expectEqualStrings(
+            "1 1 UDP 2130706431 192.168.1.1 54321 typ host",
+            candidate.candidate,
+        );
+    }
+
+    {
+        const eoc = try (Attribute{ .key = "end-of-candidates", .value = null }).parse();
+        try std.testing.expect(eoc == .end_of_candidates);
+    }
+
+    {
+        const msid = try (Attribute{
+            .key = "msid",
+            .value = "stream-id track-id",
+        }).parse();
+        try std.testing.expect(msid == .msid);
+        try std.testing.expectEqualStrings("stream-id", msid.msid.id);
+        try std.testing.expectEqualStrings("track-id", msid.msid.app_data.?);
+    }
+
+    {
+        const msid = try (Attribute{ .key = "msid", .value = "stream-id" }).parse();
+        try std.testing.expect(msid == .msid);
+        try std.testing.expectEqualStrings("stream-id", msid.msid.id);
+        try std.testing.expect(msid.msid.app_data == null);
+    }
+
+    {
+        const attr = try (Attribute{ .key = "rtcp-mux", .value = null }).parse();
+        try std.testing.expect(attr == .rtcp_mux);
+    }
+
+    {
+        const attr = try (Attribute{ .key = "rtcp-mux-only", .value = null }).parse();
+        try std.testing.expect(attr == .rtcp_mux_only);
+    }
+
+    {
+        const attr = try (Attribute{ .key = "rtcp-rsize", .value = null }).parse();
+        try std.testing.expect(attr == .rtcp_rsize);
     }
 
     {
