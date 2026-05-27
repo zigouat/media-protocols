@@ -521,9 +521,17 @@ fn innerEventHandler(agent: *Agent) !void {
     const io = agent.io;
     const Select = Io.Select(InnerEvent);
 
-    var queue: [5]InnerEvent = undefined;
+    var queue: [10]InnerEvent = undefined;
     var select = Select.init(agent.io, &queue);
-    defer select.cancelDiscard();
+    defer {
+        while (select.cancel()) |event| switch (event) {
+            .message, .data_message => |result| {
+                const message = result catch continue;
+                agent.destroyPacket(message.incoming_message.data);
+            },
+            else => {},
+        };
+    }
 
     select.async(.connectivity_check, Io.sleep, .{ io, connectivity_check_interval, .awake });
     for (agent.sockets) |*socket|

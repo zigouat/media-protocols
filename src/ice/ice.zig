@@ -4,6 +4,8 @@ const std = @import("std");
 
 const Io = std.Io;
 
+pub const ConnectionState = enum { new, checking, connected, completed, disconnected, failed, closed };
+
 pub const Role = enum { controlling, controlled };
 
 pub const CandidateType = enum {
@@ -295,10 +297,7 @@ pub const CandidatePair = struct {
     }
 };
 
-pub const ConnectionState = enum { new, checking, connected, completed, disconnected, failed };
-
 test {
     std.testing.refAllDecls(@This());
-
     _ = @import("agent.zig");
 }
