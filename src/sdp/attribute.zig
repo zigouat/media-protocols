@@ -50,7 +50,7 @@ pub const Setup = enum { actpass, active, passive, holdconn };
 
 pub const ParsedAttribute = union(AttributeType) {
     rtpmap: RtpMap,
-    fmtp: []const u8,
+    fmtp: struct { u8, []const u8 },
     fingerprint: Fingerprint,
     group: Group,
     ice_ufrag: []const u8,
@@ -67,6 +67,29 @@ pub const ParsedAttribute = union(AttributeType) {
     rtcp_rsize: void,
     control: []const u8,
     unknown,
+
+    pub fn write(attr: ParsedAttribute, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        switch (attr) {
+            .ice_ufrag => |v| try w.print("a=ice-ufrag:{s}\r\n", .{v}),
+            .ice_pwd => |v| try w.print("a=ice-pwd:{s}\r\n", .{v}),
+            .ice_lite => try w.writeAll("a=ice-lite\r\n"),
+            .end_of_candidates => try w.writeAll("a=end-of-candidates\r\n"),
+            .direction => |v| try w.print("a={s}\r\n", .{v}),
+            .mid => |v| try w.print("a=mid:{s}\r\n", .{v}),
+            .setup => |v| try w.print("a=setup:{s}\r\n", .{@tagName(v)}),
+            .rtpmap => |rtpmap| try w.print("a={f}\r\n", .{rtpmap}),
+            .rtcp_mux => try w.writeAll("a=rtcp-mux\r\n"),
+            .rtcp_mux_only => try w.writeAll("a=rtcp-mux-only\r\n"),
+            .rtcp_rsize => try w.writeAll("a=rtcp-rsize\r\n"),
+            .fingerprint => |fingerprint| {
+                try w.writeAll("a=fingerprint:");
+                try fingerprint.write(w);
+                try w.writeAll("\r\n");
+            },
+            .control => |url| try w.print("a=control:{s}\r\n", .{url}),
+            else => {},
+        }
+    }
 };
 
 key: []const u8,
@@ -91,7 +114,14 @@ pub fn parse(attr: *const Attribute) !ParsedAttribute {
         .end_of_candidates => .end_of_candidates,
         .mid => .{ .mid = value },
         .msid => .{ .msid = Msid.fromSlice(value) },
-        .fmtp => .{ .fmtp = value },
+        .fmtp => blk: {
+            if (std.mem.cutScalar(u8, value, ' ')) |cut| {
+                const pt, const params = cut;
+                const payload_type = std.fmt.parseInt(u8, pt, 10) catch break :blk error.InvalidAttribute;
+                break :blk .{ .fmtp = .{ payload_type, params } };
+            }
+            break :blk error.InvalidAttribute;
+        },
         .setup => if (std.meta.stringToEnum(Setup, value)) |setup| .{ .setup = setup } else error.InvalidAttribute,
         .rtcp_mux => .rtcp_mux,
         .rtcp_mux_only => .rtcp_mux_only,
@@ -127,7 +157,7 @@ pub const RtpMap = struct {
     payload_type: u8,
     encoding: []const u8,
     clock_rate: u32,
-    params: ?[]const u8,
+    channels: ?u8 = null,
 
     pub fn parse(value: []const u8) !RtpMap {
         const space = std.mem.indexOfScalar(u8, value, ' ') orelse return error.InvalidRtpMap;
@@ -143,8 +173,13 @@ pub const RtpMap = struct {
             .payload_type = payload_type,
             .encoding = encoding,
             .clock_rate = clock_rate,
-            .params = it.next(),
+            .channels = std.fmt.parseInt(u8, it.rest(), 10) catch null,
         };
+    }
+
+    pub fn format(self: @This(), writer: *std.Io.Writer) std.Io.Writer.Error!void {
+        try writer.print("rtpmap:{} {s}/{}", .{ self.payload_type, self.encoding, self.clock_rate });
+        if (self.channels) |channels| try writer.print("/{}", .{channels});
     }
 };
 
@@ -166,13 +201,41 @@ pub const Fmtp = struct {
         },
         unknown: []const u8,
 
-        fn parse(params: []const u8, mime: []const u8) !Params {
+        pub fn parse(params: []const u8, mime: []const u8) !Params {
             return if (std.ascii.eqlIgnoreCase(mime, "h264"))
                 try parseH264Params(params)
             else if (std.ascii.eqlIgnoreCase(mime, "rtx"))
                 try parseRtxParams(params)
             else
                 .{ .unknown = params };
+        }
+
+        pub fn format(self: @This(), writer: *std.Io.Writer) std.Io.Writer.Error!void {
+            switch (self) {
+                .h264 => |params| {
+                    try writer.print("packetization-mode={};level-asymmetry-allowed={};profile-level-id={x}", .{
+                        params.packetization_mode,
+                        @intFromBool(params.level_asymmetry_allowed),
+                        params.profile_level_id,
+                    });
+                },
+                .rtx => |params| {
+                    try writer.print("apt={}", .{params.apt});
+                    if (params.rtx_time) |rtx_time| try writer.print(";rtx-time={}", .{rtx_time});
+                },
+                .unknown => |params| try writer.writeAll(params),
+            }
+        }
+
+        pub fn eql(a: *const Params, b: *const Params) bool {
+            if (std.meta.activeTag(a.*) != std.meta.activeTag(b.*)) return false;
+            return switch (a.*) {
+                .h264 => |v| v.packetization_mode == b.h264.packetization_mode and
+                    v.level_asymmetry_allowed == b.h264.level_asymmetry_allowed and
+                    v.profile_level_id == b.h264.profile_level_id,
+                .rtx => true,
+                .unknown => |v| std.mem.eql(u8, v, b.unknown),
+            };
         }
 
         fn parseH264Params(params: []const u8) !Params {
@@ -229,9 +292,9 @@ pub const Fmtp = struct {
     ///
     /// mime represents the codec type in rtpmap
     pub fn parse(data: []const u8, mime: []const u8) !Fmtp {
-        if (std.mem.indexOfScalar(u8, data, ' ')) |idx| {
-            const payload_type = std.fmt.parseInt(u8, data[0..idx], 10) catch return error.InvalidFmtp;
-            const params = data[idx + 1 ..];
+        if (std.mem.cutScalar(u8, data, ' ')) |cut| {
+            const pt, const params = cut;
+            const payload_type = std.fmt.parseInt(u8, pt, 10) catch return error.InvalidFmtp;
 
             return .{
                 .payload_type = payload_type,
@@ -264,6 +327,16 @@ pub const Fingerprint = union(enum) {
         }
 
         return error.InvalidAttribute;
+    }
+
+    pub fn write(fingeprint: *const Fingerprint, w: *std.Io.Writer) !void {
+        switch (fingeprint.*) {
+            .sha_256 => |hash| {
+                try w.print("sha-256 {X}", .{hash[0]});
+                for (hash[1..]) |b| try w.print(":{X}", .{b});
+            },
+            else => {},
+        }
     }
 };
 
@@ -333,8 +406,8 @@ test "parse RtmMap" {
     try std.testing.expect(rtpmap.payload_type == 96);
     try std.testing.expectEqualStrings("opus", rtpmap.encoding);
     try std.testing.expect(rtpmap.clock_rate == 48000);
-    try std.testing.expect(rtpmap.params != null);
-    try std.testing.expectEqualStrings("2", rtpmap.params.?);
+    try std.testing.expect(rtpmap.channels != null);
+    try std.testing.expectEqual(2, rtpmap.channels.?);
 }
 
 test "parse invalid RtmMap" {
@@ -411,7 +484,7 @@ test "parse attribute" {
         try std.testing.expect(rtpmap.rtpmap.payload_type == 96);
         try std.testing.expectEqualStrings("opus", rtpmap.rtpmap.encoding);
         try std.testing.expect(rtpmap.rtpmap.clock_rate == 48000);
-        try std.testing.expectEqualStrings("2", rtpmap.rtpmap.params.?);
+        try std.testing.expectEqual(2, rtpmap.rtpmap.channels.?);
     }
 
     {
@@ -420,10 +493,12 @@ test "parse attribute" {
             .value = "96 packetization-mode=1; profile-level-id=458723",
         }).parse();
         try std.testing.expect(attr == .fmtp);
-        const fmtp = try Fmtp.parse(attr.fmtp, "H264");
-        try std.testing.expectEqual(96, fmtp.payload_type);
-        try std.testing.expectEqual(1, fmtp.params.h264.packetization_mode);
-        try std.testing.expectEqual(0x458723, fmtp.params.h264.profile_level_id);
+        const payload_type, const params_text = attr.fmtp;
+        try std.testing.expectEqual(96, payload_type);
+
+        const fmtp_params = try Fmtp.Params.parse(params_text, "H264");
+        try std.testing.expectEqual(1, fmtp_params.h264.packetization_mode);
+        try std.testing.expectEqual(0x458723, fmtp_params.h264.profile_level_id);
     }
 
     {
@@ -534,4 +609,50 @@ test "parse attribute" {
         const unknown = try (Attribute{ .key = "some-unknown-key", .value = "some-value" }).parse();
         try std.testing.expect(unknown == .unknown);
     }
+}
+
+test "ParsedAttribute write" {
+    var buffer: [256]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buffer);
+
+    const expectWrite = struct {
+        fn f(writer: *std.Io.Writer, attr: ParsedAttribute, expected: []const u8) !void {
+            try attr.write(writer);
+            try std.testing.expectEqualStrings(expected, writer.buffered());
+            _ = writer.consumeAll();
+        }
+    }.f;
+
+    try expectWrite(&w, .{ .ice_ufrag = "F7gI" }, "a=ice-ufrag:F7gI\r\n");
+    try expectWrite(&w, .{ .ice_pwd = "x9cml/YzichV2+XlhiMu8g" }, "a=ice-pwd:x9cml/YzichV2+XlhiMu8g\r\n");
+    try expectWrite(&w, .{ .direction = "sendrecv" }, "a=sendrecv\r\n");
+    try expectWrite(&w, .{ .mid = "audio" }, "a=mid:audio\r\n");
+    try expectWrite(&w, .{ .setup = .actpass }, "a=setup:actpass\r\n");
+    try expectWrite(&w, .rtcp_mux, "a=rtcp-mux\r\n");
+    try expectWrite(&w, .rtcp_mux_only, "a=rtcp-mux-only\r\n");
+    try expectWrite(&w, .rtcp_rsize, "a=rtcp-rsize\r\n");
+
+    try expectWrite(
+        &w,
+        .{ .rtpmap = .{ .payload_type = 96, .encoding = "opus", .clock_rate = 48000, .channels = 2 } },
+        "a=rtpmap:96 opus/48000/2\r\n",
+    );
+    try expectWrite(
+        &w,
+        .{ .rtpmap = .{ .payload_type = 0, .encoding = "PCMU", .clock_rate = 8000 } },
+        "a=rtpmap:0 PCMU/8000\r\n",
+    );
+
+    const hash: [32]u8 = @splat(0xAB);
+    try expectWrite(&w, .{ .fingerprint = .{ .sha_256 = hash } }, "a=fingerprint:sha-256 AB" ++ (":AB" ** 31) ++ "\r\n");
+    try expectWrite(&w, .{ .fingerprint = .unknown }, "a=fingerprint:\r\n");
+
+    try expectWrite(&w, .ice_lite, "a=ice-lite\r\n");
+    try expectWrite(&w, .end_of_candidates, "a=end-of-candidates\r\n");
+    try expectWrite(&w, .{ .candidate = "1 1 UDP 2130706431 192.168.1.1 54321 typ host" }, "");
+    try expectWrite(&w, .{ .fmtp = .{ 96, "minptime=10" } }, "");
+    try expectWrite(&w, .{ .group = .{ .semantics = .BUNDLE, .mids = "0 1" } }, "");
+    try expectWrite(&w, .{ .msid = .{ .id = "stream-id" } }, "");
+    try expectWrite(&w, .{ .control = "trackID=0" }, "a=control:trackID=0\r\n");
+    try expectWrite(&w, .unknown, "");
 }
