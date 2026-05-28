@@ -1,30 +1,45 @@
 const std = @import("std");
 
-const Self = @This();
+const IpAddress = std.Io.net.IpAddress;
+const Connection = @This();
 
 pub const NetType = enum { in };
-pub const AddrType = enum { ip4, ip6 };
 
 net_type: NetType,
-addr_type: AddrType,
-address: []const u8,
+address: IpAddress,
 
 /// Parses a connection string in the format: "<net_type> <addr_type> <address>"
-pub fn parse(buffer: []const u8) !Self {
-    var parts = std.mem.splitAny(u8, buffer, " ");
+pub fn parse(buffer: []const u8) !Connection {
+    var parts = std.mem.tokenizeScalar(u8, buffer, ' ');
 
     const net_type_str = parts.next() orelse return error.InvalidConnection;
     const addr_type_str = parts.next() orelse return error.InvalidConnection;
     const address_str = parts.next() orelse return error.InvalidConnection;
 
     const net_type = try parseNetType(net_type_str);
-    const addr_type = try parseAddrType(addr_type_str);
 
-    return Self{
+    const address = if (std.ascii.eqlIgnoreCase(addr_type_str, "ip4"))
+        try IpAddress.parseIp4(address_str, 0)
+    else if (std.ascii.eqlIgnoreCase(addr_type_str, "ip6"))
+        try IpAddress.parseIp6(address_str, 0)
+    else
+        return error.InvalidConnection;
+
+    return Connection{
         .net_type = net_type,
-        .addr_type = addr_type,
-        .address = address_str,
+        .address = address,
     };
+}
+
+pub fn write(c: *const Connection, w: *std.Io.Writer) !void {
+    try w.writeAll("c=IN ");
+    switch (c.address) {
+        .ip4 => |addr| try w.print("IP4 {}.{}.{}.{}\r\n", .{ addr.bytes[0], addr.bytes[1], addr.bytes[2], addr.bytes[3] }),
+        .ip6 => |addr| {
+            const u: std.Io.net.Ip6Address.Unresolved = .{ .bytes = addr.bytes, .interface_name = null };
+            try w.print("IP6 {f}\r\n", .{u});
+        },
+    }
 }
 
 pub fn parseNetType(input: []const u8) !NetType {
@@ -32,16 +47,6 @@ pub fn parseNetType(input: []const u8) !NetType {
         return .in;
     } else {
         return error.InvalidNetType;
-    }
-}
-
-pub fn parseAddrType(input: []const u8) !AddrType {
-    if (std.mem.eql(u8, "IP4", input)) {
-        return .ip4;
-    } else if (std.mem.eql(u8, "IP6", input)) {
-        return .ip6;
-    } else {
-        return error.InvalidAddrType;
     }
 }
 
@@ -56,34 +61,18 @@ test "parseNetType: invalid returns error" {
     try std.testing.expectError(error.InvalidNetType, parseNetType("in"));
 }
 
-test "parseAddrType: valid IP4" {
-    const result = try parseAddrType("IP4");
-    try std.testing.expectEqual(AddrType.ip4, result);
-}
-
-test "parseAddrType: valid IP6" {
-    const result = try parseAddrType("IP6");
-    try std.testing.expectEqual(AddrType.ip6, result);
-}
-
-test "parseAddrType: invalid returns error" {
-    try std.testing.expectError(error.InvalidAddrType, parseAddrType("IP5"));
-    try std.testing.expectError(error.InvalidAddrType, parseAddrType(""));
-    try std.testing.expectError(error.InvalidAddrType, parseAddrType("ip4"));
-}
-
 test "parse: IPv4 connection" {
     const result = try parse("IN IP4 192.168.1.1");
     try std.testing.expectEqual(NetType.in, result.net_type);
-    try std.testing.expectEqual(AddrType.ip4, result.addr_type);
-    try std.testing.expectEqualStrings("192.168.1.1", result.address);
+    try std.testing.expect(result.address.eql(&.{ .ip4 = .{ .bytes = [_]u8{ 192, 168, 1, 1 }, .port = 0 } }));
 }
 
 test "parse: IPv6 connection" {
+    const expected_addr: IpAddress = .{ .ip6 = .loopback(0) };
+
     const result = try parse("IN IP6 ::1");
     try std.testing.expectEqual(NetType.in, result.net_type);
-    try std.testing.expectEqual(AddrType.ip6, result.addr_type);
-    try std.testing.expectEqualStrings("::1", result.address);
+    try std.testing.expect(result.address.eql(&expected_addr));
 }
 
 test "parse: missing fields returns error" {
@@ -97,5 +86,20 @@ test "parse: invalid net_type returns error" {
 }
 
 test "parse: invalid addr_type returns error" {
-    try std.testing.expectError(error.InvalidAddrType, parse("IN IP5 192.168.1.1"));
+    try std.testing.expectError(error.InvalidConnection, parse("IN IP5 192.168.1.1"));
+}
+
+test "write connection" {
+    var buf: [1024]u8 = @splat(0);
+    var w: std.Io.Writer = .fixed(&buf);
+
+    const ip4: Connection = .{ .net_type = .in, .address = .{ .ip4 = .loopback(0) } };
+    const ip6: Connection = .{ .net_type = .in, .address = try .parseIp6("2a01:4f8:2220:3128::2", 0) };
+
+    try ip4.write(&w);
+    try std.testing.expectEqualStrings("c=IN IP4 127.0.0.1\r\n", w.buffered());
+    _ = w.consumeAll();
+
+    try ip6.write(&w);
+    try std.testing.expectEqualStrings("c=IN IP6 2a01:4f8:2220:3128::2\r\n", w.buffered());
 }
