@@ -25,8 +25,7 @@ pub const Origin = struct {
     session_id: u64,
     session_version: u64,
     nettype: Connection.NetType,
-    addrtype: Connection.AddrType,
-    unicast_address: []const u8,
+    unicast_address: std.Io.net.IpAddress,
 };
 
 pub const MediaIterator = struct {
@@ -353,16 +352,20 @@ fn parseOrigin(line: []const u8) !Origin {
     const nettype = try Connection.parseNetType(nettype_str);
 
     const addrtype_str = parts.next() orelse return Error.InvalidOrigin;
-    const addr_type = try Connection.parseAddrType(addrtype_str);
+    const unicast_address_str = parts.next() orelse return Error.InvalidOrigin;
 
-    const unicast_address = parts.next() orelse return Error.InvalidOrigin;
+    const unicast_address = if (std.ascii.eqlIgnoreCase(addrtype_str, "ip4"))
+        try std.Io.net.IpAddress.parseIp4(unicast_address_str, 0)
+    else if (std.ascii.eqlIgnoreCase(addrtype_str, "ip6"))
+        try std.Io.net.IpAddress.parseIp6(unicast_address_str, 0)
+    else
+        return error.InvalidOrigin;
 
     return Origin{
         .username = username,
         .session_id = session_id,
         .session_version = session_version,
         .nettype = nettype,
-        .addrtype = addr_type,
         .unicast_address = unicast_address,
     };
 }
@@ -402,8 +405,9 @@ test "parse minimal SDP" {
     try std.testing.expectEqual(3724394400, origin.session_id);
     try std.testing.expectEqual(3724394405, origin.session_version);
     try std.testing.expect(origin.nettype == Connection.NetType.in);
-    try std.testing.expect(origin.addrtype == Connection.AddrType.ip4);
-    try std.testing.expectEqualStrings(origin.unicast_address, "198.51.100.1");
+
+    var expected_addr: std.Io.net.IpAddress = .{ .ip4 = .{ .bytes = [_]u8{ 198, 51, 100, 1 }, .port = 0 } };
+    try std.testing.expect(origin.unicast_address.eql(&expected_addr));
 
     try std.testing.expectEqualStrings(sdp.session_name, "Call to John Smith");
 
@@ -416,8 +420,9 @@ test "parse minimal SDP" {
     try std.testing.expect(sdp.connection != null);
     const conn = sdp.connection.?;
     try std.testing.expect(conn.net_type == Connection.NetType.in);
-    try std.testing.expect(conn.addr_type == Connection.AddrType.ip4);
-    try std.testing.expectEqualStrings("198.51.100.1", conn.address);
+
+    expected_addr = .{ .ip4 = .{ .bytes = [_]u8{ 198, 51, 100, 1 }, .port = 0 } };
+    try std.testing.expect(conn.address.eql(&expected_addr));
 
     // Session Attributes
     var attributes_iter = sdp.attributeIterator();
