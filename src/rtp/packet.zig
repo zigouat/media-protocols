@@ -68,7 +68,7 @@ pub fn parse(data: []const u8) ParseError!Self {
     if (packet.header.extension) packet.extension = try .parse(&reader);
 
     if (packet.header.padding) {
-        if (reader.seek >= data.len or data[data.len - 1] + reader.seek > data.len) {
+        if (reader.seek >= data.len or data[data.len - 1] != data.len - reader.seek) {
             @branchHint(.unlikely);
             return error.EndOfStream;
         }
@@ -117,6 +117,7 @@ pub fn format(self: Self, writer: *std.Io.Writer) !void {
 
 const header_size = @divExact(@bitSizeOf(Header), 8);
 
+// Size assumes a paddinng of 4 bytes at max.
 pub fn size(packet: *const Self) usize {
     const ext_size = if (packet.extension) |ext| ext.size() else 0;
     const padding_size = if (packet.header.padding) 4 - @rem(packet.payload.len + ext_size, 4) else 0;
@@ -199,14 +200,14 @@ test "packet with padding" {
         0xB8, 0x30, 0x73, 0xBD, 0xDE, 0x00, 0x03,
         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x05, 0x00, 0x00, 0x00, 0x00, 0x04,
+        0x00, 0x04,
     };
 
     const parsed_packet = try Self.parse(packet[0..]);
     try std.testing.expect(parsed_packet.header.padding);
     try std.testing.expect(parsed_packet.padding_size == 4);
 
-    try std.testing.expectEqual(48, parsed_packet.size());
+    try std.testing.expectEqual(44, parsed_packet.size());
 }
 
 test "write packet" {
