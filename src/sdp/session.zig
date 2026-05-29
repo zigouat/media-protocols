@@ -267,8 +267,8 @@ test "parse minimal SDP" {
         \\a=candidate:0 1 UDP 2113667327 203.0.113.1 54400 typ host
         \\a=recvonly
         \\m=audio 49170 RTP/AVP 0
-        \\m=audio 49180 RTP/AVP 0
-        \\m=video 51372 RTP/AVP 99
+        \\m=audio 49180 RTP/AVPF 0
+        \\m=video 51372 RTP/SAVP 99
         \\c=IN IP6 2001:db8::2
         \\a=rtpmap:99 h263-1998/90000
         \\
@@ -320,7 +320,7 @@ test "parse minimal SDP" {
     try std.testing.expect(media.media_type == .audio);
     try std.testing.expect(media.port_range.port == 49170);
     try std.testing.expect(media.port_range.count == 1);
-    try std.testing.expectEqualStrings(media.protocol, "RTP/AVP");
+    try std.testing.expectEqual(.RTP_AVP, media.proto);
     try std.testing.expectEqualStrings(media.formats, "0");
     try std.testing.expect(media.connection == null);
     try std.testing.expect(media.attributes == null);
@@ -329,7 +329,7 @@ test "parse minimal SDP" {
     try std.testing.expect(media.media_type == .audio);
     try std.testing.expect(media.port_range.port == 49180);
     try std.testing.expect(media.port_range.count == 1);
-    try std.testing.expectEqualStrings(media.protocol, "RTP/AVP");
+    try std.testing.expectEqual(.RTP_AVPF, media.proto);
     try std.testing.expectEqualStrings(media.formats, "0");
     try std.testing.expect(media.connection == null);
     try std.testing.expect(media.attributes == null);
@@ -338,7 +338,7 @@ test "parse minimal SDP" {
     try std.testing.expect(media.media_type == .video);
     try std.testing.expect(media.port_range.port == 51372);
     try std.testing.expect(media.port_range.count == 1);
-    try std.testing.expectEqualStrings(media.protocol, "RTP/AVP");
+    try std.testing.expectEqual(.RTP_SAVP, media.proto);
     try std.testing.expectEqualStrings(media.formats, "99");
     try std.testing.expect(media.connection != null);
     try std.testing.expect(media.attributes != null);

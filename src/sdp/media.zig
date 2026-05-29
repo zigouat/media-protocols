@@ -5,6 +5,26 @@ const Io = std.Io;
 
 const Media = @This();
 
+const proto_mapping: std.StaticStringMap(Proto) = .initComptime(&.{
+    .{ "RTP/AVP", .RTP_AVP },
+    .{ "RTP/AVPF", .RTP_AVPF },
+    .{ "RTP/SAVP", .RTP_SAVP },
+    .{ "RTP/SAVPF", .RTP_SAVPF },
+    .{ "TCP/DTLS/RTP/SAVP", .TCP_DTLS_RTP_SAVP },
+    .{ "TCP/DTLS/RTP/SAVPF", .TCP_DTLS_RTP_SAVPF },
+    .{ "TCP/DTLS/SCTP", .TCP_DTLS_SCTP },
+    .{ "TCP/RTP/AVP", .TCP_RTP_AVP },
+    .{ "TCP/RTP/AVPF", .TCP_RTP_AVPF },
+    .{ "TCP/RTP/SAVP", .TCP_RTP_SAVP },
+    .{ "TCP/RTP/SAVPF", .TCP_RTP_SAVPF },
+    .{ "TCP/TLS/RTP/AVP", .TCP_TLS_RTP_AVP },
+    .{ "TCP/TLS/RTP/AVPF", .TCP_TLS_RTP_AVPF },
+    .{ "UDP/FEC", .UDP_FEC },
+    .{ "UDP/DTLS/SCTP", .UDP_DTLS_SCTP },
+    .{ "UDP/TLS/RTP/SAVP", .UDP_TLS_RTP_SAVP },
+    .{ "UDP/TLS/RTP/SAVPF", .UDP_TLS_RTP_SAVPF },
+});
+
 pub const Error = error{InvalidMedia};
 
 pub const MediaType = enum {
@@ -12,6 +32,54 @@ pub const MediaType = enum {
     video,
     text,
     application,
+    message,
+    image,
+};
+
+pub const Proto = enum {
+    RTP_AVP,
+    RTP_AVPF,
+    RTP_SAVP,
+    RTP_SAVPF,
+    TCP_DTLS_RTP_SAVP,
+    TCP_DTLS_RTP_SAVPF,
+    TCP_DTLS_SCTP,
+    TCP_RTP_AVP,
+    TCP_RTP_AVPF,
+    TCP_RTP_SAVP,
+    TCP_RTP_SAVPF,
+    TCP_TLS_RTP_AVP,
+    TCP_TLS_RTP_AVPF,
+    UDP_FEC,
+    UDP_DTLS_SCTP,
+    UDP_TLS_RTP_SAVP,
+    UDP_TLS_RTP_SAVPF,
+
+    pub fn fromSlice(proto: []const u8) !Proto {
+        return proto_mapping.get(proto) orelse error.UnknownProto;
+    }
+
+    pub fn toSlice(proto: *const Proto) []const u8 {
+        return switch (proto.*) {
+            .RTP_AVP => "RTP/AVP",
+            .RTP_AVPF => "RTP/AVPF",
+            .RTP_SAVP => "RTP/SAVP",
+            .RTP_SAVPF => "RTP/SAVPF",
+            .TCP_DTLS_RTP_SAVP => "TCP/DTLS/RTP/SAVP",
+            .TCP_DTLS_RTP_SAVPF => "TCP/DTLS/RTP/SAVPF",
+            .TCP_DTLS_SCTP => "TCP/DTLS/SCTP",
+            .TCP_RTP_AVP => "TCP/RTP/AVP",
+            .TCP_RTP_AVPF => "TCP/RTP/AVPF",
+            .TCP_RTP_SAVP => "TCP/RTP/SAVP",
+            .TCP_RTP_SAVPF => "TCP/RTP/SAVPF",
+            .TCP_TLS_RTP_AVP => "TCP/TLS/RTP/AVP",
+            .TCP_TLS_RTP_AVPF => "TCP/TLS/RTP/AVPF",
+            .UDP_FEC => "UDP/FEC",
+            .UDP_DTLS_SCTP => "UDP/DTLS/SCTP",
+            .UDP_TLS_RTP_SAVP => "UDP/TLS/RTP/SAVP",
+            .UDP_TLS_RTP_SAVPF => "UDP/TLS/RTP/SAVPF",
+        };
+    }
 };
 
 pub const PortRange = struct {
@@ -21,7 +89,7 @@ pub const PortRange = struct {
 
 media_type: MediaType,
 port_range: PortRange,
-protocol: []const u8,
+proto: Proto,
 formats: []const u8,
 connection: ?Connection = null,
 attributes: ?[]const u8 = null,
@@ -109,7 +177,7 @@ pub const Iterator = struct {
 
         const media_str = parts.next() orelse return Error.InvalidMedia;
         const port_str = parts.next() orelse return Error.InvalidMedia;
-        const proto = parts.next() orelse return Error.InvalidMedia;
+        const proto = try Proto.fromSlice(parts.next() orelse return Error.InvalidMedia);
 
         var media_type: Media.MediaType = undefined;
         var port_range: Media.PortRange = undefined;
@@ -139,7 +207,7 @@ pub const Iterator = struct {
         return Media{
             .media_type = media_type,
             .port_range = port_range,
-            .protocol = proto,
+            .proto = proto,
             .formats = parts.rest(),
         };
     }
