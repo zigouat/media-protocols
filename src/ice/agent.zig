@@ -254,9 +254,9 @@ fn handleRequest(agent: *Agent, msg: *const stun.Message, base_addr: IpAddress, 
     };
 
     if (agent.findCandidatePair(&base_addr, &from)) |candidate_pair| {
-        switch (candidate_pair.state.status) {
-            .succeeded => candidate_pair.state.nominated |= stun_req.use_candidate,
-            else => candidate_pair.state.nominateOnBinding |= stun_req.use_candidate,
+        switch (candidate_pair.status) {
+            .succeeded => candidate_pair.nominated |= stun_req.use_candidate,
+            else => candidate_pair.nominate_on_binding |= stun_req.use_candidate,
         }
     } else {
         const local: Candidate = .initHost(base_addr);
@@ -271,10 +271,8 @@ fn handleRequest(agent: *Agent, msg: *const stun.Message, base_addr: IpAddress, 
             .local = local,
             .remote = remote,
             .priority = calculatePairPriority(local.priority, remote.priority, agent.role),
-            .state = .{
-                .status = .in_progress,
-                .nominateOnBinding = stun_req.use_candidate,
-            },
+            .status = .in_progress,
+            .nominate_on_binding = stun_req.use_candidate,
         });
     }
 
@@ -302,20 +300,22 @@ fn handleSuccessResponse(agent: *Agent, msg: *const stun.Message, base_addr: IpA
         const mapped_address = try agent.parseAndValidateStunResponse(msg);
 
         if (mapped_address.eql(&base_addr)) {
-            candidate_pair.setStatus(.succeeded);
+            candidate_pair.status = .succeeded;
             agent.maybeSetNominatedField(candidate_pair);
             return;
         }
-        candidate_pair.setStatus(.failed);
+        candidate_pair.status = .failed;
 
         const local_candidate = agent.findLocalCandidate(&base_addr, &mapped_address) orelse blk: {
             const prflx_candidate: Candidate = .initPeerReflexive(base_addr, mapped_address);
+            try agent.mutex.lock(agent.io);
+            defer agent.mutex.unlock(agent.io);
             try agent.candidates.append(agent.allocator, prflx_candidate);
             break :blk prflx_candidate;
         };
 
         if (agent.findCandidatePairByLocalAndRemote(&local_candidate, &from)) |existing_candidate_pair| {
-            existing_candidate_pair.setStatus(.succeeded);
+            existing_candidate_pair.status = .succeeded;
             agent.maybeSetNominatedField(existing_candidate_pair);
             return;
         }
@@ -324,18 +324,18 @@ fn handleSuccessResponse(agent: *Agent, msg: *const stun.Message, base_addr: IpA
             .local = local_candidate,
             .remote = candidate_pair.remote,
             .priority = calculatePairPriority(local_candidate.priority, candidate_pair.remote.priority, agent.role),
-            .state = .{ .status = .succeeded },
+            .status = .succeeded,
         });
     }
 }
 
 fn maybeSetNominatedField(agent: *Agent, candidate_pair: *CandidatePair) void {
-    if (candidate_pair.state.nominateOnBinding) {
-        candidate_pair.state.nominateOnBinding = false;
-        candidate_pair.state.nominated = true;
+    if (candidate_pair.nominate_on_binding) {
+        candidate_pair.nominate_on_binding = false;
+        candidate_pair.nominated = true;
     } else if (agent.selected_pair != null and agent.selected_pair.?.pair.eql(candidate_pair)) {
         agent.nominated_pair = agent.selected_pair;
-        agent.nominated_pair.?.pair.state.nominated = true;
+        agent.nominated_pair.?.pair.nominated = true;
         agent.selected_pair = null;
     }
 }
@@ -485,7 +485,7 @@ fn findCandidatePair(agent: *Agent, local: *const IpAddress, remote: *const IpAd
     var pair: ?*CandidatePair = null;
 
     for (agent.pairs.items) |*candidate| if (candidate.local.base.eql(local) and candidate.remote.address.eql(remote)) {
-        if (pair == null or candidate.state.status != .failed and pair.?.state.status == .failed) pair = candidate;
+        if (pair == null or candidate.status != .failed and pair.?.status == .failed) pair = candidate;
     };
 
     return pair;
@@ -584,7 +584,7 @@ fn innerEventHandler(agent: *Agent) !void {
 
                         const nominated_pair: ?CandidatePair = blk: {
                             if (agent.role == .controlling or agent.nominated_pair != null) break :blk null;
-                            for (agent.pairs.items) |candidate_pair| if (candidate_pair.state.nominated) break :blk candidate_pair;
+                            for (agent.pairs.items) |candidate_pair| if (candidate_pair.nominated) break :blk candidate_pair;
                             break :blk null;
                         };
 
@@ -675,7 +675,7 @@ fn send(agent: *Agent, socket: *const Socket, address: *const IpAddress, buffer:
 
 fn selectBestPair(agent: *Agent) ?SelectedPair {
     var selected_pair: ?CandidatePair = null;
-    for (agent.pairs.items) |candidate_pair| if (candidate_pair.state.status == .succeeded) {
+    for (agent.pairs.items) |candidate_pair| if (candidate_pair.status == .succeeded) {
         if (selected_pair == null or candidate_pair.priority > selected_pair.?.priority) {
             selected_pair = candidate_pair;
         }
@@ -709,11 +709,11 @@ fn batchSendConnectivityCheck(agent: *Agent) !void {
         agent.selected_pair = selected_pair;
     };
 
-    for (agent.pairs.items) |*candidate_pair| switch (candidate_pair.state.status) {
+    for (agent.pairs.items) |*candidate_pair| switch (candidate_pair.status) {
         .waiting, .in_progress => {
             candidate_pair.conn_check_count += 1;
             if (candidate_pair.conn_check_count > max_binding_requests) {
-                candidate_pair.state.status = .failed;
+                candidate_pair.status = .failed;
                 continue;
             }
 
@@ -857,7 +857,7 @@ test "handle request: nominate peer" {
     try agent.pairs.append(testing.allocator, .{
         .local = .initHost(base_addr),
         .remote = .initHost(from),
-        .state = .{ .status = .in_progress },
+        .status = .in_progress,
         .priority = 0,
     });
 
@@ -871,12 +871,12 @@ test "handle request: nominate peer" {
     _ = try agent.handleRequest(&msg, base_addr, from);
 
     const candidate_pair = &agent.pairs.items[0];
-    try testing.expectEqual(true, candidate_pair.state.nominateOnBinding);
-    try testing.expectEqual(false, candidate_pair.state.nominated);
+    try testing.expect(candidate_pair.nominate_on_binding);
+    try testing.expect(!candidate_pair.nominated);
 
-    candidate_pair.state.status = .succeeded;
+    candidate_pair.status = .succeeded;
     _ = try agent.handleRequest(&msg, base_addr, from);
-    try testing.expectEqual(true, candidate_pair.state.nominated);
+    try testing.expect(candidate_pair.nominated);
 }
 
 test "handle request: role conflict" {

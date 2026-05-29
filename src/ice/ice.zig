@@ -1,7 +1,6 @@
 pub const Agent = @import("agent.zig");
 
 const std = @import("std");
-
 const Io = std.Io;
 
 pub const ConnectionState = enum { new, checking, connected, completed, disconnected, failed, closed };
@@ -126,7 +125,10 @@ pub const Candidate = struct {
                 ip.bytes[3],
                 ip.port,
             }),
-            else => return error.WriteFailed,
+            .ip6 => |addr| {
+                const u: Io.net.Ip6Address.Unresolved = .{ .bytes = addr.bytes, .interface_name = null };
+                try writer.print("{f} {d} ", .{ u, addr.port });
+            },
         }
         try writer.print("typ {s}", .{@tagName(self.candidate_type)});
         switch (self.candidate_type) {
@@ -150,7 +152,7 @@ pub const Candidate = struct {
         self.foundation = hasher.final();
     }
 
-    inline fn nextToken(maybe_token: ?[]const u8) ![]const u8 {
+    fn nextToken(maybe_token: ?[]const u8) ![]const u8 {
         return if (maybe_token) |token| token else error.ParseError;
     }
 
@@ -215,7 +217,7 @@ pub const Candidate = struct {
 
     test "format" {
         const addr = Io.net.IpAddress{ .ip4 = .{ .bytes = [_]u8{ 10, 77, 0, 1 }, .port = 45909 } };
-        const candidate: Candidate = .{
+        var candidate: Candidate = .{
             .base = addr,
             .address = addr,
             .candidate_type = .prflx,
@@ -225,9 +227,18 @@ pub const Candidate = struct {
 
         var buffer: [128]u8 = undefined;
         var w = Io.Writer.fixed(&buffer);
-        try candidate.format(&w);
 
+        try candidate.format(&w);
         try std.testing.expectEqualStrings("1890 1 udp 998000 10.77.0.1 45909 typ prflx raddr 0.0.0.0 rport 0", w.buffered());
+        _ = w.consumeAll();
+
+        candidate.transport = .tcp;
+        candidate.component = 2;
+        candidate.candidate_type = .host;
+        candidate.address = .{ .ip6 = .loopback(56000) };
+
+        try candidate.format(&w);
+        try std.testing.expectEqualStrings("1890 2 tcp 998000 ::1 56000 typ host", w.buffered());
     }
 };
 
@@ -282,26 +293,17 @@ pub const Credentials = struct {
 };
 
 pub const CandidatePair = struct {
+    pub const Status = enum(u2) { waiting, in_progress, failed, succeeded };
+
     local: Candidate,
     remote: Candidate,
     priority: u64,
-    state: PairState = .{},
+    status: Status = .waiting,
+    nominated: bool = false,
+    nominate_on_binding: bool = false,
 
     /// private field: The number of connectivity checks sent so far.
     conn_check_count: u8 = 0,
-
-    pub const Status = enum(u2) { waiting, in_progress, failed, succeeded };
-
-    pub const PairState = packed struct(u8) {
-        status: Status = .waiting,
-        nominated: bool = false,
-        nominateOnBinding: bool = false,
-        _pad: u4 = 0,
-    };
-
-    pub inline fn setStatus(pair: *CandidatePair, new_status: Status) void {
-        pair.state.status = new_status;
-    }
 
     pub fn compare(_: void, lhs: CandidatePair, rhs: CandidatePair) bool {
         return lhs.priority > rhs.priority;
