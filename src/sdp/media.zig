@@ -84,7 +84,7 @@ pub const Proto = enum {
 
 pub const PortRange = struct {
     port: u16,
-    count: u16,
+    count: u16 = 1,
 };
 
 media_type: MediaType,
@@ -95,19 +95,20 @@ connection: ?Connection = null,
 attributes: []const u8 = &.{},
 
 pub const Iterator = struct {
-    const MediaState = enum { M, I, C, B, K, A };
+    const ParseState = enum { M, I, C, B, K, A };
 
     buffer: []const u8,
 
     pub fn next(self: *Iterator) !?Media {
         var reader = Io.Reader.fixed(self.buffer);
-        var state: MediaState = .M;
+        var state: ParseState = .M;
         var result: ?Media = null;
 
         return read: while (true) {
             const offset = reader.seek;
             const line = readLine(&reader) catch |err| switch (err) {
                 error.EndOfStream => {
+                    if (reader.bufferedLen() != 0) return error.InvalidMedia;
                     self.buffer = reader.buffered();
                     return result;
                 },
@@ -116,17 +117,16 @@ pub const Iterator = struct {
 
             _ = parse: switch (state) {
                 .M => {
+                    if (!std.mem.startsWith(u8, line, "m=")) return error.InvalidMedia;
                     result = try parseMediaLine(line[2..]);
                     state = .I;
                     continue :read;
                 },
                 .I => {
                     if (std.mem.startsWith(u8, line, "i=")) {
-                        // optional
                         state = .C;
                         continue :read;
                     }
-                    // else skip to C
                     continue :parse .C;
                 },
                 .C => {
@@ -174,35 +174,21 @@ pub const Iterator = struct {
 
     fn parseMediaLine(line: []const u8) !Media {
         // m=<media> <port> <proto> <fmt> ...
-        var parts = std.mem.splitAny(u8, line, " ");
+        var parts = std.mem.splitScalar(u8, line, ' ');
 
         const media_str = parts.next() orelse return Error.InvalidMedia;
+        const media_type = std.meta.stringToEnum(MediaType, media_str) orelse return Error.InvalidMedia;
+
         const port_str = parts.next() orelse return Error.InvalidMedia;
         const proto = try Proto.fromSlice(parts.next() orelse return Error.InvalidMedia);
 
-        var media_type: Media.MediaType = undefined;
         var port_range: Media.PortRange = undefined;
-
-        if (std.mem.eql(u8, "audio", media_str)) {
-            media_type = .audio;
-        } else if (std.mem.eql(u8, "video", media_str)) {
-            media_type = .video;
-        } else if (std.mem.eql(u8, "application", media_str)) {
-            media_type = .application;
-        } else if (std.mem.eql(u8, "text", media_str)) {
-            media_type = .text;
-        } else {
-            return Error.InvalidMedia;
-        }
-
-        const index = std.mem.indexOf(u8, port_str, "/");
-        if (index) |i| {
-            const port = try std.fmt.parseInt(u16, port_str[0..i], 10);
-            const count = try std.fmt.parseInt(u16, port_str[i + 1 ..], 10);
+        if (std.mem.cutScalar(u8, port_str, '/')) |range| {
+            const port = try std.fmt.parseInt(u16, range.@"0", 10);
+            const count = try std.fmt.parseInt(u16, range.@"1", 10);
             port_range = .{ .port = port, .count = count };
         } else {
-            const port = try std.fmt.parseInt(u16, port_str, 10);
-            port_range = .{ .port = port, .count = 1 };
+            port_range = .{ .port = try std.fmt.parseInt(u16, port_str, 10) };
         }
 
         return Media{
