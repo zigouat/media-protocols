@@ -49,10 +49,13 @@ pub const CandidateType = enum {
 pub const Candidate = struct {
     foundation: u32 = 0,
     component: u8 = 1,
+    transport: Transport = .udp,
     base: Io.net.IpAddress,
     address: Io.net.IpAddress,
     candidate_type: CandidateType,
     priority: u32 = 0,
+
+    pub const Transport = enum { udp, tcp };
 
     pub fn initHost(address: Io.net.IpAddress) Candidate {
         var candidate: Candidate = .{
@@ -82,8 +85,13 @@ pub const Candidate = struct {
         const foundation = try std.fmt.parseUnsigned(u32, try nextToken(it.next()), 10);
         const component = try std.fmt.parseUnsigned(u8, try nextToken(it.next()), 10);
 
-        const transport = try nextToken(it.next());
-        if (!std.mem.eql(u8, transport, "udp")) return error.UnsupportedTransport;
+        const transport_str = try nextToken(it.next());
+        const transport = if (std.ascii.eqlIgnoreCase(transport_str, "udp"))
+            Transport.udp
+        else if (std.ascii.eqlIgnoreCase(transport_str, "tcp"))
+            Transport.tcp
+        else
+            return error.InvalidTransport;
 
         const priority = try std.fmt.parseUnsigned(u32, try nextToken(it.next()), 10);
 
@@ -98,6 +106,7 @@ pub const Candidate = struct {
         return .{
             .foundation = foundation,
             .component = component,
+            .transport = transport,
             .priority = priority,
             .base = addr,
             .address = addr,
@@ -169,7 +178,8 @@ pub const Candidate = struct {
     test "parse" {
         const values = [_][]const u8{
             "1890 1 udp 998000 10.77.0.1 45909 typ prflx ufrag username",
-            "1890 1 tcp 998000 10.77.0.1 45909 typ prflx ufrag username",
+            "1890 2 tcp 998000 ::1 45908 typ host ufrag username",
+            "1890 1 unknown 998000 10.77.0.1 45909 typ prflx ufrag username",
         };
 
         {
@@ -177,6 +187,7 @@ pub const Candidate = struct {
             try std.testing.expectEqual(1890, candidate.foundation);
             try std.testing.expectEqual(998000, candidate.priority);
             try std.testing.expectEqual(.prflx, candidate.candidate_type);
+            try std.testing.expectEqual(.udp, candidate.transport);
 
             const expected_addr = Io.net.IpAddress{ .ip4 = .{ .bytes = [_]u8{ 10, 77, 0, 1 }, .port = 45909 } };
             try std.testing.expect(expected_addr.eql(&candidate.address));
@@ -184,7 +195,19 @@ pub const Candidate = struct {
         }
 
         {
-            try std.testing.expectError(error.UnsupportedTransport, parse(values[1]));
+            const candidate = try parse(values[1]);
+            try std.testing.expectEqual(1890, candidate.foundation);
+            try std.testing.expectEqual(998000, candidate.priority);
+            try std.testing.expectEqual(.host, candidate.candidate_type);
+            try std.testing.expectEqual(.tcp, candidate.transport);
+
+            const expected_addr = Io.net.IpAddress{ .ip6 = .loopback(45908) };
+            try std.testing.expect(expected_addr.eql(&candidate.address));
+            try std.testing.expect(expected_addr.eql(&candidate.base));
+        }
+
+        {
+            try std.testing.expectError(error.InvalidTransport, parse(values[2]));
         }
     }
 
