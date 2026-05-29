@@ -323,7 +323,7 @@ test "parse minimal SDP" {
     try std.testing.expectEqual(.RTP_AVP, media.proto);
     try std.testing.expectEqualStrings(media.formats, "0");
     try std.testing.expect(media.connection == null);
-    try std.testing.expect(media.attributes == null);
+    try std.testing.expect(media.attributes.len == 0);
 
     media = try media_iterator.next() orelse unreachable;
     try std.testing.expect(media.media_type == .audio);
@@ -332,7 +332,7 @@ test "parse minimal SDP" {
     try std.testing.expectEqual(.RTP_AVPF, media.proto);
     try std.testing.expectEqualStrings(media.formats, "0");
     try std.testing.expect(media.connection == null);
-    try std.testing.expect(media.attributes == null);
+    try std.testing.expect(media.attributes.len == 0);
 
     media = try media_iterator.next() orelse unreachable;
     try std.testing.expect(media.media_type == .video);
@@ -341,7 +341,7 @@ test "parse minimal SDP" {
     try std.testing.expectEqual(.RTP_SAVP, media.proto);
     try std.testing.expectEqualStrings(media.formats, "99");
     try std.testing.expect(media.connection != null);
-    try std.testing.expect(media.attributes != null);
+    try std.testing.expect(media.attributes.len != 0);
 
     // Media-level attributes
     attributes_iter = media.attributeIterator();

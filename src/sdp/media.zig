@@ -92,7 +92,7 @@ port_range: PortRange,
 proto: Proto,
 formats: []const u8,
 connection: ?Connection = null,
-attributes: ?[]const u8 = null,
+attributes: []const u8 = &.{},
 
 pub const Iterator = struct {
     const MediaState = enum { M, I, C, B, K, A };
@@ -154,14 +154,15 @@ pub const Iterator = struct {
                 },
                 .A => {
                     if (std.mem.startsWith(u8, line, "a=")) {
-                        result.?.attributes = result.?.attributes orelse self.buffer[offset..];
+                        if (result.?.attributes.len == 0)
+                            result.?.attributes = self.buffer[offset..];
                         state = .A;
                         continue :read;
                     }
 
-                    if (result.?.attributes) |attr| {
-                        const len = attr.len - self.buffer[offset..].len;
-                        result.?.attributes = attr[0..len];
+                    if (result.?.attributes.len != 0) {
+                        const len = result.?.attributes.len - self.buffer[offset..].len;
+                        result.?.attributes = result.?.attributes[0..len];
                     }
 
                     self.buffer = self.buffer[offset..];
@@ -220,7 +221,5 @@ pub const Iterator = struct {
 
 /// Get an iterator over the media attributes.
 pub fn attributeIterator(self: *const Media) Media.AttributeIterator {
-    return AttributeIterator{
-        .reader = Io.Reader.fixed(self.attributes orelse ""),
-    };
+    return AttributeIterator{ .reader = Io.Reader.fixed(self.attributes) };
 }
