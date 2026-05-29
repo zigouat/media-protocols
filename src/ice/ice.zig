@@ -6,6 +6,8 @@ const Io = std.Io;
 
 pub const ConnectionState = enum { new, checking, connected, completed, disconnected, failed, closed };
 
+pub const GatheringState = enum { new, gathering, complete };
+
 pub const Role = enum { controlling, controlled };
 
 pub const CandidateType = enum {
@@ -115,7 +117,7 @@ pub const Candidate = struct {
     }
 
     pub fn format(self: @This(), writer: *std.Io.Writer) !void {
-        try writer.print("{d} {} {s} {} ", .{ self.foundation, self.component, "udp", self.priority });
+        try writer.print("{d} {} {s} {} ", .{ self.foundation, self.component, @tagName(self.transport), self.priority });
         switch (self.address) {
             .ip4 => |ip| try writer.print("{d}.{d}.{d}.{d} {d} ", .{
                 ip.bytes[0],
