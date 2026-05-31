@@ -22,6 +22,15 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    const srtp = b.addModule("srtp", .{
+        .root_source_file = b.path("src/srtp/srtp.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "rtp", .module = rtp },
+        },
+    });
+
     const sdp = b.addModule("sdp", .{
         .root_source_file = b.path("src/sdp/sdp.zig"),
         .target = target,
@@ -64,7 +73,8 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .imports = &.{
             .{ .name = "rtp", .module = rtp },
-            .{ .name = "rtcp", .module = rtp },
+            .{ .name = "rtcp", .module = rtcp },
+            .{ .name = "srtp", .module = srtp },
             .{ .name = "sdp", .module = sdp },
             .{ .name = "rtsp", .module = rtsp },
             .{ .name = "stun", .module = stun },
@@ -74,7 +84,7 @@ pub fn build(b: *std.Build) void {
 
     {
         const test_filters = b.option([]const []const u8, "test-filter", "Skip tests that do not match any filter") orelse &[0][]const u8{};
-        const modules = [_]*std.Build.Module{ rtp, rtcp, sdp, rtsp, stun, ice };
+        const modules = [_]*std.Build.Module{ rtp, rtcp, sdp, rtsp, stun, ice, srtp };
         const test_step = b.step("test", "Run tests");
 
         inline for (modules) |sub_module| {
