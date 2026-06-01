@@ -267,7 +267,7 @@ pub const Credentials = struct {
         errdefer allocator.free(username);
         _ = encoder.encode(username, &user_bytes);
 
-        var password_bytes: [12]u8 = undefined;
+        var password_bytes: [18]u8 = undefined;
         try io.randomSecure(&password_bytes);
         const password = try allocator.alloc(u8, encoder.calcSize(password_bytes.len));
         _ = encoder.encode(password, &password_bytes);
