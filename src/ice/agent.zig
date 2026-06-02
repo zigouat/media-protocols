@@ -130,7 +130,7 @@ pub fn deinit(agent: *Agent) void {
 pub fn startEventLoop(agent: *Agent) !void {
     return agent.innerEventHandler() catch |err| switch (err) {
         error.Canceled => error.Canceled,
-        else => |e| std.log.err("error in event loop: {}", .{e}),
+        else => |e| Logger.err("error in event loop: {}", .{e}),
     };
 }
 
@@ -657,7 +657,7 @@ fn batchSendConnectivityCheck(agent: *Agent) !void {
     if (agent.selected_pair == null) agent.selected_pair = agent.selectBestPair();
 
     if (agent.selected_pair) |selected_pair| {
-        std.log.debug("Send binding request with use candidate on pair: {f}", .{selected_pair.pair});
+        Logger.debug("Send binding request with use candidate on pair: {f}", .{selected_pair.pair});
 
         const transaction_id = randomNumber(u96, agent.io);
         const msg = try agent.buildBindingRequest(transaction_id, true, buffer);
@@ -763,8 +763,8 @@ fn handleConsentFreshness(agent: *Agent, message: Message) !void {
     const msg = try stun.Message.parse(message.incoming_message.data);
     switch (msg.header.message_type.class()) {
         .request => {
+            Logger.debug("Received consent freshness request", .{});
             _ = try agent.parseAndValidateStunRequest(&msg);
-            Logger.info("Received consent freshness request", .{});
             const buffer = try agent.buffer_pool.create(agent.allocator);
             defer agent.destroyPacket(buffer);
 
