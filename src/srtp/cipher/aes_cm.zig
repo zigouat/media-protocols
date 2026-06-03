@@ -98,10 +98,10 @@ pub fn decryptRtcp(cm: *AesCm, src: []const u8, dst: []u8, encrypted: bool, inde
         return error.AuthenticationFailed;
     }
 
-    const encrypted_data_size = src.len - tag_size - rtcp_index_size;
+    const payload_size = src.len - tag_size - rtcp_index_size;
     if (!encrypted) {
-        @memcpy(dst[0..encrypted_data_size], src[0..encrypted_data_size]);
-        return dst[0..encrypted_data_size];
+        @memcpy(dst[0..payload_size], src[0..payload_size]);
+        return dst[0..payload_size];
     }
 
     var iv: [enc_key_size]u8 = @splat(0);
@@ -109,7 +109,7 @@ pub fn decryptRtcp(cm: *AesCm, src: []const u8, dst: []u8, encrypted: bool, inde
     std.mem.writeInt(u32, iv[10..14], index, .big);
     for (iv[0..salt_size], &cm.rtcp_salt) |*iv_b, salt_b| iv_b.* ^= salt_b;
 
-    ctr(@TypeOf(cm.rtcp_enc_ctx), cm.rtcp_enc_ctx, dst[8..], src[8..encrypted_data_size], iv, .big);
+    ctr(@TypeOf(cm.rtcp_enc_ctx), cm.rtcp_enc_ctx, dst[8..], src[8..payload_size], iv, .big);
     @memcpy(dst[0..8], src[0..8]);
-    return dst[0..encrypted_data_size];
+    return dst[0..payload_size];
 }
