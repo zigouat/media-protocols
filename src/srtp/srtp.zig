@@ -1,6 +1,9 @@
 const std = @import("std");
 const rtp = @import("rtp");
 const cipher = @import("cipher.zig");
+const ReplayDetector = @import("replay_detector.zig");
+
+const default_replay_detection_window = 64;
 
 /// An enum describing the list of supported SRTP profiles.
 pub const Profile = enum {
@@ -38,6 +41,11 @@ const RtpSsrcState = struct {
 
     index: u64 = 0,
     rollover_has_processed: bool = false,
+    replay_detector: ReplayDetector,
+
+    pub fn deinit(state: *RtpSsrcState, allocator: std.mem.Allocator) void {
+        state.replay_detector.deinit(allocator);
+    }
 
     pub fn getRoc(state: *const RtpSsrcState, sequence_number: u16) struct { u32, i32 } {
         const local_roc: u32 = @intCast(state.index >> 16);
@@ -72,7 +80,7 @@ const RtpSsrcState = struct {
     }
 
     test "rollover count" {
-        var rtp_ssrc_state: RtpSsrcState = .{};
+        var rtp_ssrc_state: RtpSsrcState = .{ .replay_detector = undefined };
 
         var roc, var diff = rtp_ssrc_state.getRoc(65530);
         try std.testing.expectEqual(0, roc);
@@ -141,6 +149,8 @@ pub const Session = struct {
     }
 
     pub fn deinit(session: *Session) void {
+        var it = session.rtp_ssrc_states.iterator();
+        while (it.next()) |entry| entry.value_ptr.deinit(session.rtp_ssrc_states.allocator);
         session.rtp_ssrc_states.deinit();
     }
 
@@ -150,15 +160,22 @@ pub const Session = struct {
 
         const entry = session.rtp_ssrc_states.getPtr(rtp_packet.header.ssrc);
         var rtp_ssrc_state = entry orelse blk: {
-            var state = RtpSsrcState{};
+            var state = RtpSsrcState{
+                .replay_detector = try .init(session.rtp_ssrc_states.allocator, default_replay_detection_window),
+            };
             break :blk &state;
         };
+        errdefer if (entry == null) rtp_ssrc_state.deinit(session.rtp_ssrc_states.allocator);
+
         const roc, const diff = rtp_ssrc_state.getRoc(rtp_packet.header.sequence_number);
+        const packet_index = @as(u64, roc) << 16 | rtp_packet.header.sequence_number;
+        try rtp_ssrc_state.replay_detector.check(packet_index);
 
         switch (session.cipher) {
             .AesCm128HmacSha1_32, .AesCm128HmacSha1_80 => |*c| {
                 const result = try c.decryptRtp(roc, header_size, packet, dst);
                 rtp_ssrc_state.updateRolloverCount(rtp_packet.header.sequence_number, diff);
+                rtp_ssrc_state.replay_detector.accept(packet_index);
                 if (entry == null) {
                     @branchHint(.cold);
                     try session.rtp_ssrc_states.put(rtp_packet.header.ssrc, rtp_ssrc_state.*);
@@ -174,6 +191,7 @@ const testing = std.testing;
 test {
     std.testing.refAllDecls(@This());
     _ = @import("kdf.zig");
+    _ = @import("replay_detector.zig");
 }
 
 const test_keying_material = "mysecretkey12345mysaltvalue123";
