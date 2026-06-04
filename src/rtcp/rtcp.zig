@@ -3,9 +3,12 @@ const std = @import("std");
 const Reader = std.Io.Reader;
 
 const reception_report_size = 24;
+const sr_base_size = 24;
+const rr_base_size = 4;
 
 pub const PayloadType = enum(u8) {
     sender_report = 200,
+    receiver_report = 201,
     _,
 };
 
@@ -17,8 +20,39 @@ pub const Header = packed struct {
     version: u2 = 2,
 };
 
-pub const Packet = union(PayloadType) {
-    sender_report: SenderReport,
+pub const Packet = struct {
+    header: Header,
+    payload: union(PayloadType) {
+        sender_report: SenderReport,
+        receiver_report: ReceiverReport,
+    },
+
+    pub fn parse(data: []const u8) Reader.Error!Packet {
+        var reader = Reader.fixed(data);
+        var packet: Packet = undefined;
+
+        packet.header = try reader.takeStruct(Header, .big);
+        const payload = try reader.take(packet.header.length * 4);
+
+        switch (packet.header.payload_type) {
+            .sender_report => {
+                if (payload.len < @as(usize, packet.header.rc) * reception_report_size + sr_base_size) return error.EndOfStream;
+                packet.payload = .{ .sender_report = .fromSlice(payload, packet.header.rc) };
+            },
+            .receiver_report => {
+                if (payload.len < @as(usize, packet.header.rc) * reception_report_size + rr_base_size) return error.EndOfStream;
+                packet.payload = .{ .receiver_report = .fromSlice(payload, packet.header.rc) };
+            },
+            else => {},
+        }
+
+        return packet;
+    }
+
+    // Get the size of the packet
+    pub fn getSize(packet: *const Packet) usize {
+        return (packet.header.length + 1) * 4;
+    }
 };
 
 pub const SenderReport = struct {
@@ -27,20 +61,43 @@ pub const SenderReport = struct {
     rtp_timestamp: u32,
     packet_count: u32,
     octet_count: u32,
-    report_bytes: []const u8,
+    report_bytes: []const u8 = &.{},
+    profile_extensions: []const u8 = &.{},
 
-    pub fn fromSlice(data: []const u8) Reader.Error!SenderReport {
-        var r = Reader.fixed(data);
-        var sr: SenderReport = undefined;
+    pub fn fromSlice(data: []const u8, rr_count: u5) SenderReport {
+        const report_offset = @as(usize, reception_report_size) * rr_count + 24;
 
-        sr.ssrc = try r.takeInt(u32, .big);
-        sr.ntp_timestamp = try r.takeInt(u64, .big);
-        sr.rtp_timestamp = try r.takeInt(u32, .big);
-        sr.packet_count = try r.takeInt(u32, .big);
-        sr.octet_count = try r.takeInt(u32, .big);
-        sr.report_bytes = r.buffer[r.seek..];
+        return .{
+            .ssrc = std.mem.readInt(u32, data[0..4], .big),
+            .ntp_timestamp = std.mem.readInt(u64, data[4..12], .big),
+            .rtp_timestamp = std.mem.readInt(u32, data[12..16], .big),
+            .packet_count = std.mem.readInt(u32, data[16..20], .big),
+            .octet_count = std.mem.readInt(u32, data[20..24], .big),
+            .report_bytes = data[24..report_offset],
+            .profile_extensions = data[report_offset..],
+        };
+    }
 
-        return sr;
+    pub fn getReceptionReport(sr: *const SenderReport, index: usize) ReceptionReport {
+        const offset = index * reception_report_size;
+        std.debug.assert(offset + reception_report_size <= sr.report_bytes.len);
+        return .fromSlice(sr.report_bytes[offset .. offset + reception_report_size]);
+    }
+};
+
+pub const ReceiverReport = struct {
+    ssrc: u32,
+    report_bytes: []const u8 = &.{},
+    profile_extensions: []const u8 = &.{},
+
+    pub fn fromSlice(data: []const u8, rr_count: u5) ReceiverReport {
+        const report_offset = @as(usize, reception_report_size) * rr_count + 4;
+
+        return .{
+            .ssrc = std.mem.readInt(u32, data[0..4], .big),
+            .report_bytes = data[4..report_offset],
+            .profile_extensions = data[report_offset..],
+        };
     }
 
     pub fn getReceptionReport(sr: *const SenderReport, index: usize) ReceptionReport {
@@ -80,6 +137,25 @@ test "Header: bit size is 32" {
     try testing.expectEqual(32, @bitSizeOf(Header));
 }
 
+test "Packet: parse receiver report" {
+    const data = [_]u8{
+        0x81, 0xC9, 0x00, 0x08,
+        0x00, 0x0F, 0x1A, 0x64,
+        0xAB, 0xCD, 0xEF, 0x01,
+        0x05, 0x00, 0x00, 0x10,
+        0x00, 0x00, 0x12, 0x34,
+        0x00, 0x00, 0x00, 0x50,
+        0xE8, 0xC5, 0xF7, 0x3B,
+        0x00, 0x00, 0x01, 0x00,
+        0x01, 0x02, 0x03, 0x04,
+    };
+
+    const packet = try Packet.parse(&data);
+    try std.testing.expectEqual(PayloadType.receiver_report, packet.header.payload_type);
+    try std.testing.expectEqual(989796, packet.payload.receiver_report.ssrc);
+    try std.testing.expectEqualSlices(u8, data[32..36], packet.payload.receiver_report.profile_extensions);
+}
+
 test "SenderReport.fromSlice: parses all fields" {
     const data = [_]u8{
         // ssrc
@@ -95,7 +171,7 @@ test "SenderReport.fromSlice: parses all fields" {
         0x00, 0x00, 0x27, 0x10,
     };
 
-    const sr = try SenderReport.fromSlice(&data);
+    const sr = SenderReport.fromSlice(&data, 0);
 
     try testing.expectEqual(0x12345678, sr.ssrc);
     try testing.expectEqual(0xE8C5F73B1A2B3C4D, sr.ntp_timestamp);
@@ -127,25 +203,8 @@ test "SenderReport.fromSlice: report_bytes contains trailing data" {
         0x00, 0x00, 0x01, 0x00,
     };
 
-    const sr = try SenderReport.fromSlice(&data);
-
+    const sr = SenderReport.fromSlice(&data, 1);
     try testing.expectEqualSlices(u8, data[24..], sr.report_bytes);
-}
-
-test "SenderReport.fromSlice: short data returns EndOfStream" {
-    const data = [_]u8{
-        // ssrc + ntp + rtp_timestamp = 16 bytes (missing packet_count + octet_count)
-        0x12, 0x34, 0x56, 0x78,
-        0xE8, 0xC5, 0xF7, 0x3B,
-        0x1A, 0x2B, 0x3C, 0x4D,
-        0x00, 0x0D, 0xDF, 0x22,
-    };
-
-    try testing.expectError(error.EndOfStream, SenderReport.fromSlice(&data));
-}
-
-test "SenderReport.fromSlice: empty input returns EndOfStream" {
-    try testing.expectError(error.EndOfStream, SenderReport.fromSlice(&.{}));
 }
 
 test "ReceptionReport.fromSlice: parses all fields" {
@@ -214,7 +273,7 @@ test "SenderReport.getReceptionReport: single report" {
         0x00, 0x00, 0x01, 0x00,
     };
 
-    const sr = try SenderReport.fromSlice(&data);
+    const sr = SenderReport.fromSlice(&data, 1);
     const rr = sr.getReceptionReport(0);
 
     try testing.expectEqual(0xABCDEF01, rr.ssrc);
@@ -251,7 +310,7 @@ test "SenderReport.getReceptionReport: multiple reports indexed correctly" {
         0x00, 0x00, 0x00, 0x02,
     };
 
-    const sr = try SenderReport.fromSlice(&data);
+    const sr = SenderReport.fromSlice(&data, 2);
 
     const rr0 = sr.getReceptionReport(0);
     try testing.expectEqual(0x11111111, rr0.ssrc);
