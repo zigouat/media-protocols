@@ -133,6 +133,7 @@ const RtpSsrcState = struct {
 };
 
 const RtcpSsrcState = struct {
+    index: u31 = 1,
     replay_detector: ReplayDetector,
 
     pub fn deinit(state: *RtcpSsrcState, allocator: std.mem.Allocator) void {
@@ -171,6 +172,33 @@ pub const Session = struct {
         var rtcp_it = session.rtcp_ssrc_states.iterator();
         while (rtcp_it.next()) |entry| entry.value_ptr.deinit(session.rtcp_ssrc_states.allocator);
         session.rtcp_ssrc_states.deinit();
+    }
+
+    pub fn encryptRtcp(session: *Session, rtcp_data: []const u8, dst: []u8) ![]const u8 {
+        const ssrc = std.mem.readInt(u32, rtcp_data[4..8], .big);
+
+        const entry = session.rtcp_ssrc_states.getPtr(ssrc);
+        var rtcp_ssrc_state = entry orelse blk: {
+            var state: RtcpSsrcState = .{
+                .replay_detector = try .init(session.rtcp_ssrc_states.allocator, 128),
+            };
+
+            break :blk &state;
+        };
+        errdefer if (entry == null) rtcp_ssrc_state.deinit(session.rtcp_ssrc_states.allocator);
+
+        switch (session.cipher) {
+            .AesCm128HmacSha1_80, .AesCm128HmacSha1_32 => |*c| {
+                const result = try c.encryptRtcp(rtcp_data, dst, rtcp_ssrc_state.index);
+                rtcp_ssrc_state.index +%= 1;
+                if (entry == null) {
+                    @branchHint(.cold);
+                    try session.rtcp_ssrc_states.put(ssrc, rtcp_ssrc_state.*);
+                }
+
+                return result;
+            },
+        }
     }
 
     pub fn decryptRtp(session: *Session, packet: []const u8, dst: []u8) ![]const u8 {
@@ -232,6 +260,7 @@ pub const Session = struct {
             .AesCm128HmacSha1_80, .AesCm128HmacSha1_32 => |*c| {
                 const result = try c.decryptRtcp(rtcp_data, dst, encrypted, index);
                 rtcp_ssrc_state.replay_detector.accept(index);
+
                 if (entry == null) {
                     @branchHint(.cold);
                     try session.rtcp_ssrc_states.put(ssrc, rtcp_ssrc_state.*);
@@ -245,12 +274,6 @@ pub const Session = struct {
 };
 
 const testing = std.testing;
-
-test {
-    std.testing.refAllDecls(@This());
-    _ = @import("kdf.zig");
-    _ = @import("replay_detector.zig");
-}
 
 const test_keying_material = "mysecretkey12345mysaltvalue123";
 const encrypted_rtp_aes_128_cm_hmac1_80 = [_]u8{
@@ -281,6 +304,13 @@ const plain_rtcp_aes_128_cm_hmac1_80 = [_]u8{
 const encrypted_rtp_aes_128_cm_hmac1_32 = [_]u8{};
 const plain_rtp_aes_128_cm_hmac1_32 = [_]u8{};
 
+test {
+    std.testing.refAllDecls(@This());
+    _ = @import("kdf.zig");
+    _ = @import("replay_detector.zig");
+    _ = @import("cipher.zig");
+}
+
 test "init session" {
     var srtp_session = try Session.init(testing.allocator, test_keying_material, .AesCm128HmacSha1_80);
     defer srtp_session.deinit();
@@ -298,6 +328,8 @@ test "decrypt rtp: Aes128CmHmacSha1_80" {
     const decrypted = try session.decryptRtp(&encrypted_rtp_aes_128_cm_hmac1_80, &dest);
     try testing.expectEqualSlices(u8, &plain_rtp_aes_128_cm_hmac1_80, decrypted);
     try testing.expectEqual(1, session.rtp_ssrc_states.count());
+
+    try testing.expectError(error.Replayed, session.decryptRtp(&encrypted_rtp_aes_128_cm_hmac1_80, &dest));
 }
 
 test "decrypt rtcp: Aes128CmHmacSha1_80" {
@@ -308,4 +340,15 @@ test "decrypt rtcp: Aes128CmHmacSha1_80" {
     const decrypted = try session.decryptRtcp(&encrypted_rtcp_aes_128_cm_hmac1_80, &dest);
     try testing.expectEqualSlices(u8, &plain_rtcp_aes_128_cm_hmac1_80, decrypted);
     try testing.expectEqual(1, session.rtcp_ssrc_states.count());
+
+    try testing.expectError(error.Replayed, session.decryptRtcp(&encrypted_rtcp_aes_128_cm_hmac1_80, &dest));
+}
+
+test "encrypt rtcp: Aes128CmHmacSha1_80" {
+    var session = try Session.init(std.testing.allocator, test_keying_material, .AesCm128HmacSha1_80);
+    defer session.deinit();
+
+    var dest: [1024]u8 = @splat(0);
+    const decrypted = try session.encryptRtcp(&plain_rtcp_aes_128_cm_hmac1_80, &dest);
+    try testing.expectEqualSlices(u8, &encrypted_rtcp_aes_128_cm_hmac1_80, decrypted);
 }
