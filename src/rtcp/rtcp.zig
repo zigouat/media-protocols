@@ -1,3 +1,5 @@
+pub const SourceDescription = @import("source_description.zig");
+
 const std = @import("std");
 
 const Reader = std.Io.Reader;
@@ -45,7 +47,7 @@ pub const Packet = struct {
                 if (payload.len < @as(usize, packet.header.rc) * reception_report_size + rr_base_size) return error.EndOfStream;
                 packet.payload = .{ .receiver_report = .fromSlice(payload, packet.header.rc) };
             },
-            .source_description => packet.payload = .{ .source_description = .{ .chunk_bytes = payload } },
+            .source_description => packet.payload = .{ .source_description = .{ .chunks_bytes = payload } },
             else => {},
         }
 
@@ -134,89 +136,11 @@ pub const ReceptionReport = struct {
     }
 };
 
-pub const SourceDescription = struct {
-    chunk_bytes: []const u8 = &.{},
-
-    pub const ChunkItem = union(enum(u8)) {
-        cname: []const u8,
-        name: []const u8,
-        email: []const u8,
-        phone: []const u8,
-        loc: []const u8,
-        tool: []const u8,
-        note: []const u8,
-        priv: []const u8,
-    };
-
-    pub const Chunk = struct {
-        ssrc: u32,
-        items: []const u8 = &.{},
-
-        pub const ItemIterator = struct {
-            data: []const u8,
-
-            fn init(data: []const u8) ItemIterator {
-                return .{ .data = data };
-            }
-
-            pub fn next(it: *ItemIterator) !?ChunkItem {
-                const data = it.data;
-
-                if (data.len == 0) return null;
-                if (data.len < 2 or data.len < @as(usize, data[1]) + 2) return error.ParseError;
-
-                const value = data[2 .. @as(usize, data[1]) + 2];
-
-                const item: ChunkItem = switch (data[0]) {
-                    1 => .{ .cname = value },
-                    2 => .{ .name = value },
-                    3 => .{ .email = value },
-                    4 => .{ .phone = value },
-                    5 => .{ .loc = value },
-                    6 => .{ .tool = value },
-                    7 => .{ .note = value },
-                    8 => .{ .priv = value },
-                    else => return error.InvalidChunkItem,
-                };
-
-                it.data = it.data[value.len + 2 ..];
-                return item;
-            }
-        };
-
-        pub fn iterateItems(chunk: *const Chunk) ItemIterator {
-            return .init(chunk.items);
-        }
-    };
-
-    pub const ChunkIterator = struct {
-        bytes: []const u8,
-
-        pub fn init(bytes: []const u8) ChunkIterator {
-            return .{ .bytes = bytes };
-        }
-
-        pub fn next(it: *ChunkIterator) !?Chunk {
-            const data = it.bytes;
-            if (data.len == 0) return null;
-            if (data.len < 4) return error.InvalidChunk;
-
-            const ssrc = std.mem.readInt(u32, data[0..4], .big);
-            const null_pos = std.mem.findScalarPos(u8, data, 4, 0) orelse return error.InvalidChunk;
-            const items = data[4..null_pos];
-
-            var skip = null_pos + 1;
-            while (skip % 4 != 0) : (skip += 1) {
-                if (skip >= data.len or data[skip] != 0) return error.InvalidChunk;
-            }
-
-            it.bytes = data[skip..];
-            return .{ .ssrc = ssrc, .items = items };
-        }
-    };
-};
-
 const testing = std.testing;
+
+test {
+    _ = @import("source_description.zig");
+}
 
 test "Header: bit size is 32" {
     try testing.expectEqual(32, @bitSizeOf(Header));
@@ -423,167 +347,34 @@ test "Packet: parse source description" {
 
     const packet = try Packet.parse(&data);
     try testing.expectEqual(PayloadType.source_description, packet.header.payload_type);
-    try testing.expectEqualSlices(u8, data[4..], packet.payload.source_description.chunk_bytes);
+    try testing.expectEqualSlices(u8, data[4..], packet.payload.source_description.chunks_bytes);
 }
 
-test "SourceDescription: iterate single chunk and its items" {
-    const chunk_bytes = [_]u8{
-        0xFD, 0x8D, 0xA5, 0x3B,
-        0x01, 0x04, 'e',  'v',
-        'c',  'a',  0x00, 0x00,
-    };
+test {
+    const text = "80c80006fd8da53bedcbbbb7316a6a018c6fc86b0000394d00c67a8781ca000cfd8da53b01267b61613131383931632d613639342d343734352d386565322d6561323461366161616632327d00000000";
+    var buffer: [text.len / 2]u8 = undefined;
+    try std.crypto.codecs.hex.decode(&buffer, text);
 
-    var chunks = SourceDescription.ChunkIterator.init(&chunk_bytes);
+    const packet = try Packet.parse(&buffer);
+    _ = packet;
 
-    const chunk = (try chunks.next()).?;
-    try testing.expectEqual(0xFD8DA53B, chunk.ssrc);
+    // var slice: []u8 = &buffer;
 
-    var items = chunk.iterateItems();
-    const item = (try items.next()).?;
-    try testing.expectEqualStrings("evca", item.cname);
-    try testing.expectEqual(null, try items.next());
+    // while (true) {
+    //     const header: Header = @bitCast(std.mem.readInt(u32, slice[0..4], .big));
+    //     std.debug.print("{any}\n", .{header});
 
-    try testing.expectEqual(null, try chunks.next());
-}
+    //     switch (header.payload_type) {
+    //         .sender_report => {
+    //             const sr = try SenderReport.fromSlice(slice[4 .. (header.length + 1) * 4]);
+    //             std.debug.print("{any}\n", .{sr});
+    //         },
+    //         else => {
+    //             std.debug.print("Unknown payload type: {}\n", .{header.payload_type});
+    //         },
+    //     }
 
-test "SourceDescription: item list ending on a 32-bit boundary is padded with a full word" {
-    const chunk_bytes = [_]u8{
-        0x12, 0x34, 0x56, 0x78,
-        0x01, 0x02, 'a',  'b',
-        0x00, 0x00, 0x00, 0x00,
-    };
-
-    var chunks = SourceDescription.ChunkIterator.init(&chunk_bytes);
-
-    const chunk = (try chunks.next()).?;
-    try testing.expectEqual(0x12345678, chunk.ssrc);
-
-    var items = chunk.iterateItems();
-    try testing.expectEqualStrings("ab", (try items.next()).?.cname);
-
-    try testing.expectEqual(null, try chunks.next());
-}
-
-test "SourceDescription: multiple items in one chunk" {
-    const chunk_bytes = [_]u8{
-        0xAA, 0xBB, 0xCC, 0xDD,
-        0x01, 0x03, 'a',  'b',
-        'c',  0x06, 0x04, 'z',
-        'i',  'g',  '0',  0x00,
-    };
-
-    var chunks = SourceDescription.ChunkIterator.init(&chunk_bytes);
-    const chunk = (try chunks.next()).?;
-    try testing.expectEqual(0xAABBCCDD, chunk.ssrc);
-
-    var items = chunk.iterateItems();
-    try testing.expectEqualStrings("abc", (try items.next()).?.cname);
-    try testing.expectEqualStrings("zig0", (try items.next()).?.tool);
-    try testing.expectEqual(null, try items.next());
-
-    try testing.expectEqual(null, try chunks.next());
-}
-
-test "SourceDescription: multiple chunks" {
-    const chunk_bytes = [_]u8{
-        // chunk 0
-        0x11, 0x11, 0x11, 0x11,
-        0x01, 0x02, 'h',  'i',
-        0x00, 0x00, 0x00, 0x00,
-        // chunk 1
-        0x22, 0x22, 0x22, 0x22,
-        0x01, 0x01, 'x',  0x00,
-    };
-
-    var chunks = SourceDescription.ChunkIterator.init(&chunk_bytes);
-
-    const c0 = (try chunks.next()).?;
-    try testing.expectEqual(0x11111111, c0.ssrc);
-    var it0 = c0.iterateItems();
-    try testing.expectEqualStrings("hi", (try it0.next()).?.cname);
-
-    const c1 = (try chunks.next()).?;
-    try testing.expectEqual(0x22222222, c1.ssrc);
-    var it1 = c1.iterateItems();
-    try testing.expectEqualStrings("x", (try it1.next()).?.cname);
-
-    try testing.expectEqual(null, try chunks.next());
-}
-
-test "SourceDescription: empty chunk (ssrc only, no items)" {
-    const chunk_bytes = [_]u8{
-        0xDE, 0xAD, 0xBE, 0xEF,
-        0x00, 0x00, 0x00, 0x00,
-    };
-
-    var chunks = SourceDescription.ChunkIterator.init(&chunk_bytes);
-    const chunk = (try chunks.next()).?;
-    try testing.expectEqual(0xDEADBEEF, chunk.ssrc);
-    try testing.expectEqual(0, chunk.items.len);
-
-    var items = chunk.iterateItems();
-    try testing.expectEqual(null, try items.next());
-
-    try testing.expectEqual(null, try chunks.next());
-}
-
-test "SourceDescription: empty bytes yields no chunks" {
-    var chunks = SourceDescription.ChunkIterator.init(&.{});
-    try testing.expectEqual(null, try chunks.next());
-}
-
-test "SourceDescription: item with maximum length value does not overflow" {
-    var chunk_bytes: [264]u8 = @splat(0);
-    std.mem.writeInt(u32, chunk_bytes[0..4], 0x01020304, .big);
-    chunk_bytes[4] = 1; // cname
-    chunk_bytes[5] = 255; // length
-    for (chunk_bytes[6 .. 6 + 255], 0..) |*b, i| b.* = @intCast('A' + (i % 26));
-
-    var chunks = SourceDescription.ChunkIterator.init(&chunk_bytes);
-    const chunk = (try chunks.next()).?;
-
-    var items = chunk.iterateItems();
-    const item = (try items.next()).?;
-    try testing.expectEqual(255, item.cname.len);
-    try testing.expectEqualSlices(u8, chunk_bytes[6 .. 6 + 255], item.cname);
-}
-
-test "SourceDescription: truncated chunk (no ssrc) is rejected" {
-    const chunk_bytes = [_]u8{ 0x12, 0x34, 0x56 };
-    var it = SourceDescription.ChunkIterator.init(&chunk_bytes);
-    try testing.expectError(error.InvalidChunk, it.next());
-}
-
-test "SourceDescription: chunk with no terminator is rejected" {
-    const chunk_bytes = [_]u8{
-        0x12, 0x34, 0x56, 0x78,
-        0x01, 0x02, 'a',  'b',
-    };
-    var chunks = SourceDescription.ChunkIterator.init(&chunk_bytes);
-    try testing.expectError(error.InvalidChunk, chunks.next());
-}
-
-test "SourceDescription: unknown item type is rejected" {
-    const chunk_bytes = [_]u8{
-        0xDE, 0xAD, 0xBE, 0xEF,
-        0x09, 0x01, 'x',  0x00,
-    };
-    var chunks = SourceDescription.ChunkIterator.init(&chunk_bytes);
-    const chunk = (try chunks.next()).?;
-    var items = chunk.iterateItems();
-    try testing.expectError(error.InvalidChunkItem, items.next());
-}
-
-test "SourceDescription: item length running past the buffer is rejected" {
-    const chunk_bytes = [_]u8{
-        0xDE, 0xAD, 0xBE, 0xEF,
-        // cname claims length 10, but the item list (bounded by the terminator)
-        // only carries 2 value bytes
-        0x01, 0x0A, 'x',  'y',
-        0x00, 0x00, 0x00, 0x00,
-    };
-    var chunks = SourceDescription.ChunkIterator.init(&chunk_bytes);
-    const chunk = (try chunks.next()).?;
-    var items = chunk.iterateItems();
-    try testing.expectError(error.ParseError, items.next());
+    //     slice = slice[(header.length + 1) * 4 ..];
+    //     if (slice.len == 0) break;
+    // }
 }
