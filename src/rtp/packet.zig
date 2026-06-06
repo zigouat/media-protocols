@@ -46,70 +46,49 @@ pub const Extension = struct {
     };
 
     pub const Iterator = struct {
-        const two_bytes_header_size = 2;
-
         profile: Profile,
-        bytes: []const u8,
+        reader: Reader,
 
         pub fn init(ext: Extension) !Iterator {
             return switch (ext.profile) {
-                .one_byte, .two_bytes => .{ .profile = ext.profile, .bytes = ext.data },
+                .one_byte, .two_bytes => .{ .profile = ext.profile, .reader = .fixed(ext.data) },
                 else => error.UnsupportedProfile,
             };
         }
 
         pub fn next(it: *Iterator) !?Item {
-            if (it.bytes.len == 0) return null;
-
             return switch (it.profile) {
-                .one_byte => try it.parseOneByteExt(),
-                .two_bytes => try it.parseTwoBytesExt(),
+                .one_byte => it.parseOneByteExt() catch error.InvalidExtension,
+                .two_bytes => it.parseTwoBytesExt() catch error.InvalidExtension,
                 else => unreachable,
             };
         }
 
         fn parseOneByteExt(it: *Iterator) !?Item {
-            var offset: usize = 0;
-            while (offset < it.bytes.len) {
-                const id = it.bytes[offset] >> 4;
+            var reader = &it.reader;
 
-                if (id == 0) {
-                    offset += 1;
-                    continue;
-                }
-
+            while (true) {
+                const byte = reader.takeByte() catch return null;
+                const id = byte >> 4;
+                if (id == 0) continue;
                 if (id == 15) return null;
 
-                const len = (it.bytes[offset] & 0x0F) + 1;
-                offset += 1;
-                if (it.bytes.len < len + offset) return error.InvalidExtension;
+                const len = (byte & 0x0F) + 1;
+                const value = try reader.take(len);
 
-                const value = it.bytes[offset .. len + offset];
-                it.bytes = it.bytes[len + offset ..];
                 return .{ .id = id, .value = value };
             }
-
-            return null;
         }
 
         fn parseTwoBytesExt(it: *Iterator) !?Item {
-            var offset: usize = 0;
-            var slice = it.bytes;
-            while (offset < slice.len and slice[offset] == 0) : (offset += 1) {}
-            if (slice.len <= offset) return null;
+            var reader = &it.reader;
 
-            slice = slice[offset..];
-            const item_len = it.bytes[1];
-            if (slice.len < two_bytes_header_size or slice.len < item_len + two_bytes_header_size)
-                return error.InvalidExtension;
-
-            const item: Item = .{
-                .id = slice[0],
-                .value = slice[two_bytes_header_size .. item_len + two_bytes_header_size],
-            };
-
-            it.bytes = slice[two_bytes_header_size + item_len ..];
-            return item;
+            while (true) {
+                const id = reader.takeByte() catch return null;
+                if (id == 0) continue;
+                const len = try reader.takeByte();
+                return .{ .id = id, .value = try reader.take(len) };
+            }
         }
     };
 
