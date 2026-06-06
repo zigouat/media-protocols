@@ -4,7 +4,12 @@ Zig implementations of various protocols related to media processing and streami
 
 The projects is structured into modules, each module is a separate library that can be used independently. The modules are:
 
-* `rtp/rtcp` - [RTP (Real-time Transport Protocol)](https://datatracker.ietf.org/doc/html/rfc3550) implementation of the real-time transport protocol based on RFC 3550.
+* `rtp/rtcp` - implementation of the real-time transport protocol (RTP) and real-time transport control protocol (RTCP).
+    
+    The following RFCs are also implemented as part of the `rtp/rtcp` module:
+    * [RFC 3550](https://datatracker.ietf.org/doc/html/rfc3550) - RTP: A Transport Protocol for Real-Time Applications.
+    * [RFC 8285](https://datatracker.ietf.org/doc/html/rfc8285) - A General Mechanism for RTP Header Extensions.
+
 * `srtp` - [SRTP (Secure Real-time Transport Protocol)](https://datatracker.ietf.org/doc/html/rfc3711) implementation of the secure real-time transport protocol based on RFC 3711.
 * `sdp` - [SDP (Session Description Protocol)](https://datatracker.ietf.org/doc/html/rfc4566) implementation for describing multimedia sessions based on RFC 4566.
 * `rtsp` - [RTSP (Real Time Streaming Protocol)](https://datatracker.ietf.org/doc/html/rfc2326) implementation for controlling streaming media servers based on RFC 2326.

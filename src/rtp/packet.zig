@@ -22,13 +22,84 @@ pub const Header = packed struct {
 
 /// Describes an RTP Extension
 pub const Extension = struct {
-    profile: u16,
+    profile: Profile,
     data: []const u8,
 
+    pub const Profile = enum(u16) {
+        one_byte = 0xBEDE,
+        // When parsing, all values between 0x1000 and 0x100F are mapped to two bytes extension
+        two_bytes = 0x1000,
+        _,
+
+        pub inline fn fromInt(profile: u16) Profile {
+            return switch (profile) {
+                0x1000...0x100F => .two_bytes,
+                else => |v| @enumFromInt(v),
+            };
+        }
+    };
+
+    /// Item describes a one byte and two bytes extension item.
+    pub const Item = struct {
+        id: u8,
+        value: []const u8,
+    };
+
+    pub const Iterator = struct {
+        profile: Profile,
+        bytes: []const u8,
+
+        pub fn init(ext: Extension) !Iterator {
+            return switch (ext.profile) {
+                .one_byte, .two_bytes => .{ .profile = ext.profile, .bytes = ext.data },
+                else => error.UnsupportedProfile,
+            };
+        }
+
+        pub fn next(it: *Iterator) !?Item {
+            return switch (it.profile) {
+                .one_byte => try it.parseOneByteExt(),
+                .two_bytes => try it.parseTwoBytesExt(),
+                else => unreachable,
+            };
+        }
+
+        fn parseOneByteExt(it: *Iterator) !?Item {
+            if (it.bytes.len == 0) return null;
+
+            var offset: usize = 0;
+            while (offset < it.bytes.len) {
+                const id = it.bytes[offset] >> 4;
+
+                if (id == 0) {
+                    offset += 1;
+                    continue;
+                }
+
+                if (id == 15) return null;
+
+                const len = (it.bytes[offset] & 0x0F) + 1;
+                offset += 1;
+                if (it.bytes.len < len + offset) return error.InvalidExtension;
+
+                const value = it.bytes[offset .. len + offset];
+                it.bytes = it.bytes[len + offset ..];
+                return .{ .id = id, .value = value };
+            }
+
+            return null;
+        }
+
+        fn parseTwoBytesExt(it: *Iterator) !?Item {
+            _ = it;
+            return error.Unimplemented;
+        }
+    };
+
     fn parse(reader: *Reader) !Extension {
-        const profile = reader.takeInt(u16, .big) catch return error.EndOfStream;
-        const extension_size = (reader.takeInt(u16, .big) catch return error.EndOfStream) * 4;
-        const ext_data = reader.take(extension_size) catch return error.EndOfStream;
+        const profile: Profile = .fromInt(try reader.takeInt(u16, .big));
+        const extension_size = (try reader.takeInt(u16, .big)) * 4;
+        const ext_data = try reader.take(extension_size);
 
         return .{
             .profile = profile,
@@ -37,13 +108,70 @@ pub const Extension = struct {
     }
 
     fn write(ext: *const Extension, writer: *std.Io.Writer) !void {
-        try writer.writeInt(u16, ext.profile, .big);
+        try writer.writeInt(u16, @intFromEnum(ext.profile), .big);
         try writer.writeInt(u16, @intCast(@divExact(ext.data.len, 4)), .big);
         try writer.writeAll(ext.data);
     }
 
-    inline fn size(ext: *const Extension) usize {
+    fn size(ext: *const Extension) usize {
         return ext.data.len + 4;
+    }
+
+    test "Iterator: init fails with extensions other than ony byte or two bytes" {
+        var ext: Extension = .{ .profile = .one_byte, .data = &.{} };
+        _ = try Iterator.init(ext);
+
+        ext.profile = .two_bytes;
+        _ = try Iterator.init(ext);
+
+        ext.profile = @enumFromInt(0x9090);
+        try std.testing.expectError(error.UnsupportedProfile, Iterator.init(ext));
+    }
+
+    test "Iterator: one byte extension" {
+        var ext: Extension = .{
+            .profile = .one_byte,
+            .data = &[_]u8{
+                0x10, 0x1F, 0x00, 0x00,
+                0xA2, 0x01, 0x02, 0x03,
+                0xF0, 0x00, 0x00, 0x00,
+            },
+        };
+
+        {
+            var it = try Iterator.init(ext);
+            var item = (try it.next()).?;
+            try std.testing.expectEqual(1, item.id);
+            try std.testing.expectEqualSlices(u8, &[_]u8{0x1F}, item.value);
+
+            item = (try it.next()).?;
+            try std.testing.expectEqual(10, item.id);
+            try std.testing.expectEqualSlices(u8, &[_]u8{ 0x01, 0x02, 0x03 }, item.value);
+
+            try std.testing.expectEqual(null, it.next());
+        }
+
+        // no padding
+        {
+            ext.data = &[_]u8{ 0x32, 0x01, 0x02, 0x03 };
+            var it = try Iterator.init(ext);
+
+            const item = (try it.next()).?;
+            try std.testing.expectEqual(3, item.id);
+            try std.testing.expectEqualSlices(u8, &[_]u8{ 0x01, 0x02, 0x03 }, item.value);
+
+            try std.testing.expectEqual(null, it.next());
+        }
+    }
+
+    test "Iterator: Invalid extension" {
+        const ext: Extension = .{
+            .profile = .one_byte,
+            .data = &[_]u8{ 0x1A, 0x01, 0x02, 0x03 },
+        };
+
+        var it = try Iterator.init(ext);
+        try std.testing.expectError(error.InvalidExtension, it.next());
     }
 };
 
@@ -65,7 +193,7 @@ pub fn parse(data: []const u8) ParseError!Self {
     const csrc_count = reader.take(@as(usize, packet.header.csrc_count) * 4) catch return error.EndOfStream;
     packet.csrc_list = std.mem.bytesAsSlice(u32, csrc_count);
 
-    if (packet.header.extension) packet.extension = try .parse(&reader);
+    if (packet.header.extension) packet.extension = Extension.parse(&reader) catch return error.EndOfStream;
 
     if (packet.header.padding) {
         if (reader.seek >= data.len or data[data.len - 1] != data.len - reader.seek) {
@@ -122,6 +250,10 @@ pub fn size(packet: *const Self) usize {
     const ext_size = if (packet.extension) |ext| ext.size() else 0;
     const padding_size = if (packet.header.padding) 4 - @rem(packet.payload.len + ext_size, 4) else 0;
     return header_size + packet.csrc_list.len * 4 + ext_size + packet.payload.len + padding_size;
+}
+
+test {
+    std.testing.refAllDecls(@This());
 }
 
 test "parse packet" {
@@ -188,7 +320,7 @@ test "packet with extension" {
 
     const parsed_packet = try Self.parse(packet[0..]);
     try std.testing.expect(parsed_packet.header.extension);
-    try std.testing.expect(parsed_packet.extension.?.profile == 0xBDDE);
+    try std.testing.expectEqual(@as(Extension.Profile, @enumFromInt(0xBDDE)), parsed_packet.extension.?.profile);
     try std.testing.expectEqualSlices(u8, packet[16..28], parsed_packet.extension.?.data);
 }
 
@@ -290,7 +422,7 @@ test "write packet with extension" {
             .ssrc = 0x37B8307F,
         },
         .extension = .{
-            .profile = 0xBDDE,
+            .profile = @enumFromInt(0xBDDE),
             .data = expected[16..28],
         },
         .payload = expected[28..33],
@@ -307,7 +439,7 @@ test "write packet with padding" {
         0xB3, 0x6F, 0x41, 0xFF, 0xD2, 0x14, 0x8B,
         0xBA, 0x37, 0xB8, 0x30, 0x7F, 0x37, 0xB8,
         0x30, 0x7F, 0x37, 0xB8, 0x30, 0x7E, 0x37,
-        0xB8, 0x30, 0x73, 0xBD, 0xDE, 0x00, 0x03,
+        0xB8, 0x30, 0x73, 0xBE, 0xDE, 0x00, 0x03,
         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
         0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x00,
         0x09, 0x00, 0x00, 0x00, 0x00, 0x04,
@@ -326,7 +458,7 @@ test "write packet with padding" {
         },
         .csrc_list = std.mem.bytesAsSlice(u32, expected[12..24]),
         .extension = .{
-            .profile = 0xBDDE,
+            .profile = .one_byte,
             .data = expected[28..40],
         },
         .payload = expected[40..44],
