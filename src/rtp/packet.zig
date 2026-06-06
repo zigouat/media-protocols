@@ -46,6 +46,8 @@ pub const Extension = struct {
     };
 
     pub const Iterator = struct {
+        const two_bytes_header_size = 2;
+
         profile: Profile,
         bytes: []const u8,
 
@@ -57,6 +59,8 @@ pub const Extension = struct {
         }
 
         pub fn next(it: *Iterator) !?Item {
+            if (it.bytes.len == 0) return null;
+
             return switch (it.profile) {
                 .one_byte => try it.parseOneByteExt(),
                 .two_bytes => try it.parseTwoBytesExt(),
@@ -65,8 +69,6 @@ pub const Extension = struct {
         }
 
         fn parseOneByteExt(it: *Iterator) !?Item {
-            if (it.bytes.len == 0) return null;
-
             var offset: usize = 0;
             while (offset < it.bytes.len) {
                 const id = it.bytes[offset] >> 4;
@@ -91,8 +93,23 @@ pub const Extension = struct {
         }
 
         fn parseTwoBytesExt(it: *Iterator) !?Item {
-            _ = it;
-            return error.Unimplemented;
+            var offset: usize = 0;
+            var slice = it.bytes;
+            while (offset < slice.len and slice[offset] == 0) : (offset += 1) {}
+            if (slice.len <= offset) return null;
+
+            slice = slice[offset..];
+            const item_len = it.bytes[1];
+            if (slice.len < two_bytes_header_size or slice.len < item_len + two_bytes_header_size)
+                return error.InvalidExtension;
+
+            const item: Item = .{
+                .id = slice[0],
+                .value = slice[two_bytes_header_size .. item_len + two_bytes_header_size],
+            };
+
+            it.bytes = slice[two_bytes_header_size + item_len ..];
+            return item;
         }
     };
 
@@ -172,6 +189,69 @@ pub const Extension = struct {
 
         var it = try Iterator.init(ext);
         try std.testing.expectError(error.InvalidExtension, it.next());
+    }
+
+    test "Iterator: two bytes extension" {
+        var ext: Extension = .{
+            .profile = .two_bytes,
+            .data = &[_]u8{
+                0x01, 0x01, 0x1F, 0x02,
+                0x03, 0x01, 0x02, 0x03,
+                0x00, 0x00, 0x0F, 0x00,
+                0xC0, 0x01, 0xFF, 0x00,
+            },
+        };
+
+        {
+            var it = try Iterator.init(ext);
+            var item = (try it.next()).?;
+            try std.testing.expectEqual(1, item.id);
+            try std.testing.expectEqualSlices(u8, &[_]u8{0x1F}, item.value);
+
+            item = (try it.next()).?;
+            try std.testing.expectEqual(2, item.id);
+            try std.testing.expectEqualSlices(u8, &[_]u8{ 0x01, 0x02, 0x03 }, item.value);
+
+            item = (try it.next()).?;
+            try std.testing.expectEqual(15, item.id);
+            try std.testing.expectEqualSlices(u8, &[_]u8{}, item.value);
+
+            item = (try it.next()).?;
+            try std.testing.expectEqual(192, item.id);
+            try std.testing.expectEqualSlices(u8, &[_]u8{0xFF}, item.value);
+
+            try std.testing.expectEqual(null, it.next());
+        }
+
+        // no padding
+        {
+            ext.data = &[_]u8{ 0x01, 0x02, 0x02, 0x03 };
+            var it = try Iterator.init(ext);
+
+            const item = (try it.next()).?;
+            try std.testing.expectEqual(1, item.id);
+            try std.testing.expectEqualSlices(u8, &[_]u8{ 0x02, 0x03 }, item.value);
+
+            try std.testing.expectEqual(null, it.next());
+        }
+    }
+
+    test "Iterator: two bytes invalid extension" {
+        var ext: Extension = .{
+            .profile = .two_bytes,
+            .data = &[_]u8{ 0x01, 0x03, 0x02, 0x03 },
+        };
+
+        {
+            var it = try Iterator.init(ext);
+            try std.testing.expectError(error.InvalidExtension, it.next());
+        }
+
+        {
+            ext.data = &[_]u8{ 0x00, 0x00, 0x00, 0x03 };
+            var it = try Iterator.init(ext);
+            try std.testing.expectError(error.InvalidExtension, it.next());
+        }
     }
 };
 
