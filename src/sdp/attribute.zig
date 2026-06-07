@@ -4,77 +4,91 @@ const Reader = std.Io.Reader;
 const Attribute = @This();
 
 const attribute_types_map: std.StaticStringMap(AttributeType) = .initComptime(&.{
+    .{ "candidate", .candidate },
+    .{ "control", .control },
+    .{ "end-of-candidates", .end_of_candidates },
+    .{ "extmap", .extmap },
+    .{ "extmap-allow-mixed", .extmap_allow_mixed },
     .{ "fingerprint", .fingerprint },
-    .{ "rtpmap", .rtpmap },
     .{ "fmtp", .fmtp },
     .{ "group", .group },
-    .{ "ice-ufrag", .ice_ufrag },
     .{ "ice-pwd", .ice_pwd },
+    .{ "ice-ufrag", .ice_ufrag },
     .{ "ice-lite", .ice_lite },
-    .{ "candidate", .candidate },
-    .{ "end-of-candidates", .end_of_candidates },
+    .{ "mid", .mid },
+    .{ "msid", .msid },
     .{ "sendrecv", .direction },
     .{ "sendonly", .direction },
     .{ "recvonly", .direction },
     .{ "inactive", .direction },
-    .{ "mid", .mid },
-    .{ "setup", .setup },
     .{ "rtcp-mux", .rtcp_mux },
     .{ "rtcp-mux-only", .rtcp_mux_only },
     .{ "rtcp-rsize", .rtcp_rsize },
-    .{ "msid", .msid },
+    .{ "rtpmap", .rtpmap },
+    .{ "setup", .setup },
 });
 
 pub const AttributeType = enum {
-    rtpmap,
-    fmtp,
-    fingerprint,
-    group,
-    ice_ufrag,
-    ice_pwd,
-    ice_lite,
     candidate,
-    end_of_candidates,
+    control,
     direction,
+    end_of_candidates,
+    extmap,
+    extmap_allow_mixed,
+    fingerprint,
+    fmtp,
+    group,
+    ice_lite,
+    ice_pwd,
+    ice_ufrag,
     mid,
     msid,
-    setup,
     rtcp_mux,
     rtcp_mux_only,
     rtcp_rsize,
-    control,
+    rtpmap,
+    setup,
     unknown,
 };
 
 pub const Setup = enum { actpass, active, passive, holdconn };
 
 pub const ParsedAttribute = union(AttributeType) {
-    rtpmap: RtpMap,
-    fmtp: struct { u8, []const u8 },
-    fingerprint: Fingerprint,
-    group: Group,
-    ice_ufrag: []const u8,
-    ice_pwd: []const u8,
-    ice_lite: void,
     candidate: []const u8,
-    end_of_candidates: void,
+    control: []const u8,
     direction: []const u8,
+    end_of_candidates: void,
+    extmap: ExtMap,
+    extmap_allow_mixed: void,
+    fingerprint: Fingerprint,
+    fmtp: struct { u8, []const u8 },
+    group: Group,
+    ice_lite: void,
+    ice_pwd: []const u8,
+    ice_ufrag: []const u8,
     mid: []const u8,
     msid: Msid,
-    setup: Setup,
     rtcp_mux: void,
     rtcp_mux_only: void,
     rtcp_rsize: void,
-    control: []const u8,
+    rtpmap: RtpMap,
+    setup: Setup,
     unknown,
 
     pub fn write(attr: ParsedAttribute, w: *std.Io.Writer) std.Io.Writer.Error!void {
         switch (attr) {
+            .control => |url| try w.print("a=control:{s}\r\n", .{url}),
+            .direction => |v| try w.print("a={s}\r\n", .{v}),
+            .end_of_candidates => try w.writeAll("a=end-of-candidates\r\n"),
+            .extmap => |extmap| {
+                try w.writeAll("a=extmap:");
+                try extmap.write(w);
+                try w.writeAll("\r\n");
+            },
+            .extmap_allow_mixed => try w.writeAll("a=extmap-allow-mixed\r\n"),
             .ice_ufrag => |v| try w.print("a=ice-ufrag:{s}\r\n", .{v}),
             .ice_pwd => |v| try w.print("a=ice-pwd:{s}\r\n", .{v}),
             .ice_lite => try w.writeAll("a=ice-lite\r\n"),
-            .end_of_candidates => try w.writeAll("a=end-of-candidates\r\n"),
-            .direction => |v| try w.print("a={s}\r\n", .{v}),
             .mid => |v| try w.print("a=mid:{s}\r\n", .{v}),
             .setup => |v| try w.print("a=setup:{s}\r\n", .{@tagName(v)}),
             .rtpmap => |rtpmap| try w.print("a={f}\r\n", .{rtpmap}),
@@ -86,7 +100,6 @@ pub const ParsedAttribute = union(AttributeType) {
                 try fingerprint.write(w);
                 try w.writeAll("\r\n");
             },
-            .control => |url| try w.print("a=control:{s}\r\n", .{url}),
             else => {},
         }
     }
@@ -103,17 +116,13 @@ pub fn parse(attr: *const Attribute) !ParsedAttribute {
     const value = attr.value orelse "";
 
     return switch (attr.getType()) {
-        .fingerprint => .{ .fingerprint = try Fingerprint.parse(attr.*) },
-        .rtpmap => .{ .rtpmap = try RtpMap.parse(value) },
-        .group => .{ .group = try Group.parse(value) },
-        .ice_ufrag => .{ .ice_ufrag = value },
-        .ice_pwd => .{ .ice_pwd = value },
-        .ice_lite => .ice_lite,
         .candidate => .{ .candidate = value },
+        .control => .{ .control = value },
         .direction => .{ .direction = attr.key },
         .end_of_candidates => .end_of_candidates,
-        .mid => .{ .mid = value },
-        .msid => .{ .msid = Msid.fromSlice(value) },
+        .extmap_allow_mixed => .extmap_allow_mixed,
+        .extmap => .{ .extmap = try ExtMap.parse(value) },
+        .fingerprint => .{ .fingerprint = try Fingerprint.parse(attr.*) },
         .fmtp => blk: {
             if (std.mem.cutScalar(u8, value, ' ')) |cut| {
                 const pt, const params = cut;
@@ -122,11 +131,17 @@ pub fn parse(attr: *const Attribute) !ParsedAttribute {
             }
             break :blk error.InvalidAttribute;
         },
-        .setup => if (std.meta.stringToEnum(Setup, value)) |setup| .{ .setup = setup } else error.InvalidAttribute,
+        .group => .{ .group = try Group.parse(value) },
+        .ice_ufrag => .{ .ice_ufrag = value },
+        .ice_pwd => .{ .ice_pwd = value },
+        .ice_lite => .ice_lite,
+        .mid => .{ .mid = value },
+        .msid => .{ .msid = Msid.fromSlice(value) },
         .rtcp_mux => .rtcp_mux,
         .rtcp_mux_only => .rtcp_mux_only,
         .rtcp_rsize => .rtcp_rsize,
-        .control => .{ .control = value },
+        .rtpmap => .{ .rtpmap = try RtpMap.parse(value) },
+        .setup => if (std.meta.stringToEnum(Setup, value)) |setup| .{ .setup = setup } else error.InvalidAttribute,
         else => .unknown,
     };
 }
@@ -368,6 +383,52 @@ pub const Group = struct {
     }
 };
 
+pub const ExtMap = struct {
+    id: u32,
+    direction: ?[]const u8 = null,
+    uri: []const u8,
+    attributes: []const u8 = &.{},
+
+    pub fn parse(attr: []const u8) !ExtMap {
+        var it = std.mem.tokenizeScalar(u8, attr, ' ');
+        var extmap: ExtMap = .{
+            .id = 0,
+            .uri = &.{},
+        };
+
+        const map_entry = it.next() orelse return error.InvalidAttribute;
+        if (std.mem.findScalar(u8, map_entry, '/')) |pos| {
+            extmap.id = try std.fmt.parseInt(u32, map_entry[0..pos], 10);
+            const direction = attribute_types_map.get(map_entry[pos + 1 ..]) orelse return error.InvalidAttribute;
+            if (direction != .direction) return error.InvalidAtttribute;
+            extmap.direction = map_entry[pos + 1 ..];
+        } else {
+            extmap.id = try std.fmt.parseInt(u32, map_entry, 10);
+        }
+
+        extmap.uri = it.next() orelse return error.InvalidAttribute;
+        extmap.attributes = it.rest();
+
+        return extmap;
+    }
+
+    pub fn write(extmap: *const ExtMap, w: *std.Io.Writer) !void {
+        try w.printInt(extmap.id, 10, .lower, .{});
+        if (extmap.direction) |direction| {
+            try w.writeByte('/');
+            try w.writeAll(direction);
+        }
+
+        try w.writeByte(' ');
+        try w.writeAll(extmap.uri);
+
+        if (extmap.attributes.len != 0) {
+            try w.writeByte(' ');
+            try w.writeAll(extmap.attributes);
+        }
+    }
+};
+
 test "attribute parsing" {
     const input =
         \\a=rtpmap:96 opus/48000/2
@@ -606,6 +667,22 @@ test "parse attribute" {
     }
 
     {
+        const attr = try (Attribute{ .key = "extmap-allow-mixed", .value = null }).parse();
+        try std.testing.expectEqual(.extmap_allow_mixed, @as(AttributeType, attr));
+    }
+
+    {
+        const attr = try (Attribute{ .key = "extmap", .value = "10/sendrecv http://my-header-extension" }).parse();
+        try std.testing.expectEqual(.extmap, @as(AttributeType, attr));
+
+        const extmap = attr.extmap;
+        try std.testing.expectEqual(10, extmap.id);
+        try std.testing.expectEqualStrings("sendrecv", extmap.direction.?);
+        try std.testing.expectEqualStrings("http://my-header-extension", extmap.uri);
+        try std.testing.expectEqualStrings("", extmap.attributes);
+    }
+
+    {
         const unknown = try (Attribute{ .key = "some-unknown-key", .value = "some-value" }).parse();
         try std.testing.expect(unknown == .unknown);
     }
@@ -655,4 +732,16 @@ test "ParsedAttribute write" {
     try expectWrite(&w, .{ .msid = .{ .id = "stream-id" } }, "");
     try expectWrite(&w, .{ .control = "trackID=0" }, "a=control:trackID=0\r\n");
     try expectWrite(&w, .unknown, "");
+
+    try expectWrite(&w, .extmap_allow_mixed, "a=extmap-allow-mixed\r\n");
+    try expectWrite(
+        &w,
+        .{ .extmap = .{ .id = 1, .uri = "https://my-custom-ext" } },
+        "a=extmap:1 https://my-custom-ext\r\n",
+    );
+    try expectWrite(
+        &w,
+        .{ .extmap = .{ .id = 1, .direction = "sendrecv", .uri = "https://my-custom-ext", .attributes = "att=1" } },
+        "a=extmap:1/sendrecv https://my-custom-ext att=1\r\n",
+    );
 }
