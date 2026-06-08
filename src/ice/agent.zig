@@ -177,8 +177,6 @@ pub fn sendData(agent: *const Agent, data: []const u8) Socket.SendError!void {
 
 /// Free the buffer and return it to the pool.
 pub fn destroyPacket(agent: *Agent, data: []const u8) void {
-    agent.mutex.lockUncancelable(agent.io);
-    defer agent.mutex.unlock(agent.io);
     agent.buffer_pool.destroy(@ptrCast(@alignCast(@constCast(data))));
 }
 
@@ -583,13 +581,13 @@ fn innerEventHandler(agent: *Agent) !void {
                 },
                 else => |e| return e,
             };
-
+            defer agent.destroyPacket(message.incoming_message.data);
             select.async(.app_data, receiveTimeout, .{ agent, message.socket, .{ .duration = disconnect_timeout } });
 
-            if (stun.isMessage(message.incoming_message.data)) {
-                defer agent.destroyPacket(message.incoming_message.data);
-                agent.handleConsentFreshness(message) catch continue;
-            } else agent.on_data(agent, message.incoming_message.data);
+            if (stun.isMessage(message.incoming_message.data))
+                agent.handleConsentFreshness(message) catch continue
+            else
+                agent.on_data(agent, message.incoming_message.data);
         },
         .keep_alive => |timeout| {
             try timeout;
@@ -709,8 +707,8 @@ fn handleConnectivityCheckMessage(agent: *Agent, select: *Io.Select(InnerEvent),
         else => {},
     }
 
+    defer agent.destroyPacket(data);
     if (stun.isMessage(data)) {
-        defer agent.destroyPacket(data);
         const msg = try stun.Message.parse(data);
 
         switch (msg.header.message_type.class()) {
@@ -750,10 +748,7 @@ fn handleConnectivityCheckMessage(agent: *Agent, select: *Io.Select(InnerEvent),
                 agent.on_data(agent, data);
                 break;
             }
-        } else {
-            Logger.warn("Drop non stun message from unknown remote candidate: {f}", .{sender});
-            agent.destroyPacket(data);
-        }
+        } else Logger.warn("Drop non stun message from unknown remote candidate: {f}", .{sender});
     }
 
     select.async(.message, receiveTimeout, .{ agent, message.socket, .none });
