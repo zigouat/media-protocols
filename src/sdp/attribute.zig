@@ -12,9 +12,10 @@ const attribute_types_map: std.StaticStringMap(AttributeType) = .initComptime(&.
     .{ "fingerprint", .fingerprint },
     .{ "fmtp", .fmtp },
     .{ "group", .group },
+    .{ "ice-lite", .ice_lite },
+    .{ "ice-options", .ice_options },
     .{ "ice-pwd", .ice_pwd },
     .{ "ice-ufrag", .ice_ufrag },
-    .{ "ice-lite", .ice_lite },
     .{ "mid", .mid },
     .{ "msid", .msid },
     .{ "sendrecv", .direction },
@@ -28,6 +29,9 @@ const attribute_types_map: std.StaticStringMap(AttributeType) = .initComptime(&.
     .{ "setup", .setup },
 });
 
+key: []const u8,
+value: ?[]const u8,
+
 pub const AttributeType = enum {
     candidate,
     control,
@@ -39,6 +43,7 @@ pub const AttributeType = enum {
     fmtp,
     group,
     ice_lite,
+    ice_options,
     ice_pwd,
     ice_ufrag,
     mid,
@@ -64,6 +69,7 @@ pub const ParsedAttribute = union(AttributeType) {
     fmtp: struct { u8, []const u8 },
     group: Group,
     ice_lite: void,
+    ice_options: IceOptions,
     ice_pwd: []const u8,
     ice_ufrag: []const u8,
     mid: []const u8,
@@ -86,9 +92,15 @@ pub const ParsedAttribute = union(AttributeType) {
                 try w.writeAll("\r\n");
             },
             .extmap_allow_mixed => try w.writeAll("a=extmap-allow-mixed\r\n"),
+            .ice_lite => try w.writeAll("a=ice-lite\r\n"),
+            .ice_options => |options| {
+                try w.writeAll("a=ice-options:");
+                if (options.ice2) try w.writeAll(" ice2");
+                if (options.trickle) try w.writeAll(" trickle");
+                try w.writeAll("\r\n");
+            },
             .ice_ufrag => |v| try w.print("a=ice-ufrag:{s}\r\n", .{v}),
             .ice_pwd => |v| try w.print("a=ice-pwd:{s}\r\n", .{v}),
-            .ice_lite => try w.writeAll("a=ice-lite\r\n"),
             .mid => |v| try w.print("a=mid:{s}\r\n", .{v}),
             .setup => |v| try w.print("a=setup:{s}\r\n", .{@tagName(v)}),
             .rtpmap => |rtpmap| try w.print("a={f}\r\n", .{rtpmap}),
@@ -104,9 +116,6 @@ pub const ParsedAttribute = union(AttributeType) {
         }
     }
 };
-
-key: []const u8,
-value: ?[]const u8,
 
 pub inline fn getType(attr: *const Attribute) AttributeType {
     return attribute_types_map.get(attr.key) orelse .unknown;
@@ -132,9 +141,10 @@ pub fn parse(attr: *const Attribute) !ParsedAttribute {
             break :blk error.InvalidAttribute;
         },
         .group => .{ .group = try Group.parse(value) },
+        .ice_lite => .ice_lite,
+        .ice_options => .{ .ice_options = try IceOptions.parse(value) },
         .ice_ufrag => .{ .ice_ufrag = value },
         .ice_pwd => .{ .ice_pwd = value },
-        .ice_lite => .ice_lite,
         .mid => .{ .mid = value },
         .msid => .{ .msid = Msid.fromSlice(value) },
         .rtcp_mux => .rtcp_mux,
@@ -347,8 +357,8 @@ pub const Fingerprint = union(enum) {
     pub fn write(fingeprint: *const Fingerprint, w: *std.Io.Writer) !void {
         switch (fingeprint.*) {
             .sha_256 => |hash| {
-                try w.print("sha-256 {X}", .{hash[0]});
-                for (hash[1..]) |b| try w.print(":{X}", .{b});
+                try w.print("sha-256 {X:>2}", .{hash[0]});
+                for (hash[1..]) |b| try w.print(":{X:0>2}", .{b});
             },
             else => {},
         }
@@ -426,6 +436,27 @@ pub const ExtMap = struct {
             try w.writeByte(' ');
             try w.writeAll(extmap.attributes);
         }
+    }
+};
+
+pub const IceOptions = packed struct(u8) {
+    ice2: bool = false,
+    trickle: bool = false,
+    _pad: u6 = 0,
+
+    fn parse(attr_value: []const u8) !IceOptions {
+        var options: IceOptions = .{};
+        var it = std.mem.tokenizeScalar(u8, attr_value, ' ');
+        while (it.next()) |option| {
+            if (std.ascii.eqlIgnoreCase(option, "ice2"))
+                options.ice2 = true
+            else if (std.ascii.eqlIgnoreCase(option, "trickle"))
+                options.trickle = true
+            else
+                return error.InvalidAttribute;
+        }
+
+        return options;
     }
 };
 
@@ -683,6 +714,17 @@ test "parse attribute" {
     }
 
     {
+        const attr = try (Attribute{ .key = "ice-options", .value = "ice2 trickle" }).parse();
+        try std.testing.expectEqual(.ice_options, @as(AttributeType, attr));
+
+        const ice_options = attr.ice_options;
+        try std.testing.expect(ice_options.ice2);
+        try std.testing.expect(ice_options.trickle);
+
+        try std.testing.expectError(error.InvalidAttribute, (Attribute{ .key = "ice-options", .value = "trickl" }).parse());
+    }
+
+    {
         const unknown = try (Attribute{ .key = "some-unknown-key", .value = "some-value" }).parse();
         try std.testing.expect(unknown == .unknown);
     }
@@ -744,4 +786,7 @@ test "ParsedAttribute write" {
         .{ .extmap = .{ .id = 1, .direction = "sendrecv", .uri = "https://my-custom-ext", .attributes = "att=1" } },
         "a=extmap:1/sendrecv https://my-custom-ext att=1\r\n",
     );
+
+    try expectWrite(&w, .{ .ice_options = .{ .ice2 = true } }, "a=ice-options: ice2\r\n");
+    try expectWrite(&w, .{ .ice_options = .{ .ice2 = true, .trickle = true } }, "a=ice-options: ice2 trickle\r\n");
 }
