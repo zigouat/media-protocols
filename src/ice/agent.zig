@@ -684,7 +684,7 @@ fn batchSendConnectivityCheck(agent: *Agent) !void {
 
     if (agent.nominated_pair != null) return;
 
-    if (agent.selected_pair == null) agent.selected_pair = agent.selectBestPair();
+    if (agent.role == .controlling and agent.selected_pair == null) agent.selected_pair = agent.selectBestPair();
 
     if (agent.selected_pair) |selected_pair| {
         Logger.debug("Send binding request with use candidate on pair: {f}", .{selected_pair.pair});
