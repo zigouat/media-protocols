@@ -39,6 +39,7 @@ tie_breaker: u64,
 // Candidates and sockets
 sockets: []Io.net.Socket = &.{},
 candidates: std.ArrayList(Candidate) = .empty,
+remote_candidates: std.ArrayList(Candidate) = .empty,
 pairs: std.ArrayList(CandidatePair) = .empty,
 pending_requests: std.ArrayList(PendingRequest) = .empty,
 // This is a peer for which a use-candidate request is sent, but we didn't
@@ -116,6 +117,7 @@ pub fn deinit(agent: *Agent) void {
     allocator.free(agent.sockets);
 
     agent.candidates.deinit(allocator);
+    agent.remote_candidates.deinit(allocator);
     agent.pairs.deinit(allocator);
     agent.pending_requests.deinit(allocator);
     agent.credentials.deinit(allocator);
@@ -132,6 +134,11 @@ pub fn startEventLoop(agent: *Agent) !void {
         error.Canceled => error.Canceled,
         else => |e| Logger.err("error in event loop: {}", .{e}),
     };
+}
+
+pub fn setRole(agent: *Agent, role: ice.Role) void {
+    agent.role = role;
+    // TODO: Recalculate pairs priorities if role updated
 }
 
 /// Set remote credentials
@@ -160,9 +167,7 @@ pub fn addRemoteCandidate(agent: *Agent, remote_candidate: Candidate) !void {
 /// available to listen on.
 pub fn gatherCandidates(agent: *Agent) !void {
     agent.gathering_state = .gathering;
-    try agent.gatherHostCandidates();
-    agent.sockets = try initSockets(agent.io, agent.allocator, &agent.candidates);
-
+    try agent.gatherLocalHostsAndInitSockets();
     for (agent.candidates.items) |candidate| agent.on_candidate(agent, candidate);
     agent.gathering_state = .complete;
     agent.on_candidate(agent, null);
@@ -180,29 +185,33 @@ pub fn destroyPacket(agent: *Agent, data: []const u8) void {
     agent.buffer_pool.destroy(@ptrCast(@alignCast(@constCast(data))));
 }
 
-fn initSockets(io: Io, allocator: std.mem.Allocator, candidates: *std.ArrayList(Candidate)) ![]Socket {
-    var index: usize = 0;
+fn gatherLocalHostsAndInitSockets(agent: *Agent) !void {
+    const allocator = agent.allocator;
 
-    var sockets: std.ArrayList(Io.net.Socket) = try .initCapacity(allocator, candidates.items.len);
+    var it: IfIterator = undefined;
+    try it.init();
+    defer it.deinit();
+
+    var sockets: std.ArrayList(Io.net.Socket) = .empty;
     errdefer {
-        for (0..index) |idx| sockets.items[idx].close(io);
+        for (sockets.items) |*socket| socket.close(agent.io);
         sockets.deinit(allocator);
     }
 
-    while (true) {
-        if (index >= candidates.items.len) break;
-        const socket = candidates.items[index].address.bind(io, .{ .mode = .dgram }) catch {
-            _ = candidates.swapRemove(index);
+    while (it.next()) |addr| {
+        var candidate: Candidate = .initHost(addr);
+        const socket = candidate.address.bind(agent.io, .{ .mode = .dgram }) catch |err| {
+            Logger.warn("Could not bind address {f}: {}", .{ addr, err });
             continue;
         };
+        candidate.base = socket.address;
+        candidate.address = socket.address;
 
-        sockets.appendAssumeCapacity(socket);
-        candidates.items[index].base = socket.address;
-        candidates.items[index].address = socket.address;
-        index += 1;
+        try sockets.append(allocator, socket);
+        try agent.doAddLocalCandidate(candidate);
     }
 
-    return try sockets.toOwnedSlice(allocator);
+    agent.sockets = try sockets.toOwnedSlice(allocator);
 }
 
 fn calculatePairPriority(l: u32, r: u32, role: ice.Role) u64 {
@@ -225,19 +234,42 @@ fn gatherHostCandidates(agent: *Agent) !void {
     try it.init();
     defer it.deinit();
 
-    while (it.next()) |addr| try agent.candidates.append(agent.allocator, .initHost(addr));
+    while (it.next()) |addr| try agent.doAddLocalCandidate(.initHost(addr));
 }
 
 fn doAddRemoteCandidate(agent: *Agent, remote_candidate: Candidate) Allocator.Error!void {
+    agent.mutex.lockUncancelable(agent.io);
+    defer agent.mutex.unlock(agent.io);
+    try agent.remote_candidates.append(agent.allocator, remote_candidate);
+
     outer_loop: for (agent.candidates.items) |candidate| {
         for (agent.pairs.items) |*pair|
             if (pair.local.base.eql(&candidate.base) and pair.remote.address.eql(&remote_candidate.address))
                 continue :outer_loop;
 
-        try agent.appendCandidatePair(.{
+        try agent.pairs.append(agent.allocator, .{
             .local = candidate,
             .remote = remote_candidate,
             .priority = calculatePairPriority(candidate.priority, remote_candidate.priority, agent.role),
+        });
+    }
+}
+
+fn doAddLocalCandidate(agent: *Agent, local_candidate: Candidate) Allocator.Error!void {
+    agent.mutex.lockUncancelable(agent.io);
+    defer agent.mutex.unlock(agent.io);
+
+    try agent.candidates.append(agent.allocator, local_candidate);
+
+    outer_loop: for (agent.remote_candidates.items) |remote_candidate| {
+        for (agent.pairs.items) |*pair|
+            if (pair.local.base.eql(&local_candidate.base) and pair.remote.address.eql(&remote_candidate.address))
+                continue :outer_loop;
+
+        try agent.pairs.append(agent.allocator, .{
+            .local = local_candidate,
+            .remote = remote_candidate,
+            .priority = calculatePairPriority(local_candidate.priority, remote_candidate.priority, agent.role),
         });
     }
 }
@@ -777,6 +809,7 @@ fn markConnectionCompleted(agent: *Agent) void {
     agent.allocator.free(agent.sockets);
     agent.sockets = &.{};
 
+    agent.remote_candidates.clearAndFree(agent.allocator);
     agent.pairs.clearAndFree(agent.allocator);
     agent.pending_requests.clearAndFree(agent.allocator);
     agent.setConnectionState(.completed);
@@ -965,31 +998,4 @@ test "randomNumber" {
     try testing.expect(a != b);
     try testing.expect(b != c);
     try testing.expect(a != c);
-}
-
-test "initSockets" {
-    var candidates: std.ArrayList(Candidate) = .empty;
-    defer candidates.deinit(testing.allocator);
-
-    const addrs = [_]IpAddress{
-        .{ .ip4 = .loopback(0) },
-        .{ .ip4 = .{ .port = 0, .bytes = [_]u8{ 192, 192, 192, 192 } } },
-        .{ .ip4 = .loopback(0) },
-        .{ .ip4 = .loopback(0) },
-    };
-
-    for (addrs) |addr| try candidates.append(testing.allocator, .initHost(addr));
-
-    const sockets = try initSockets(testing.io, testing.allocator, &candidates);
-    defer testing.allocator.free(sockets);
-
-    try testing.expectEqual(3, sockets.len);
-    try testing.expectEqual(3, candidates.items.len);
-
-    for (candidates.items) |candidate| {
-        try testing.expectEqualSlices(u8, &[_]u8{ 127, 0, 0, 1 }, &candidate.base.ip4.bytes);
-        try testing.expect(candidate.base.getPort() != 0);
-        try testing.expectEqualSlices(u8, &[_]u8{ 127, 0, 0, 1 }, &candidate.address.ip4.bytes);
-        try testing.expect(candidate.address.getPort() != 0);
-    }
 }
