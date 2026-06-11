@@ -136,6 +136,11 @@ pub fn startEventLoop(agent: *Agent) !void {
     };
 }
 
+pub fn setRole(agent: *Agent, role: ice.Role) void {
+    agent.role = role;
+    // TODO: Recalculate pairs priorities if role updated
+}
+
 /// Set remote credentials
 ///
 /// Calling this function will trigger connectivity checks. `gatherCandidates` should be called first.
