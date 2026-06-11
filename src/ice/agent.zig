@@ -233,18 +233,16 @@ fn gatherHostCandidates(agent: *Agent) !void {
 }
 
 fn doAddRemoteCandidate(agent: *Agent, remote_candidate: Candidate) Allocator.Error!void {
-    {
-        agent.mutex.lockUncancelable(agent.io);
-        defer agent.mutex.unlock(agent.io);
-        try agent.remote_candidates.append(agent.allocator, remote_candidate);
-    }
+    agent.mutex.lockUncancelable(agent.io);
+    defer agent.mutex.unlock(agent.io);
+    try agent.remote_candidates.append(agent.allocator, remote_candidate);
 
     outer_loop: for (agent.candidates.items) |candidate| {
         for (agent.pairs.items) |*pair|
             if (pair.local.base.eql(&candidate.base) and pair.remote.address.eql(&remote_candidate.address))
                 continue :outer_loop;
 
-        try agent.appendCandidatePair(.{
+        try agent.pairs.append(agent.allocator, .{
             .local = candidate,
             .remote = remote_candidate,
             .priority = calculatePairPriority(candidate.priority, remote_candidate.priority, agent.role),
@@ -253,18 +251,17 @@ fn doAddRemoteCandidate(agent: *Agent, remote_candidate: Candidate) Allocator.Er
 }
 
 fn doAddLocalCandidate(agent: *Agent, local_candidate: Candidate) Allocator.Error!void {
-    {
-        agent.mutex.lockUncancelable(agent.io);
-        defer agent.mutex.unlock(agent.io);
-        try agent.candidates.append(agent.allocator, local_candidate);
-    }
+    agent.mutex.lockUncancelable(agent.io);
+    defer agent.mutex.unlock(agent.io);
+
+    try agent.candidates.append(agent.allocator, local_candidate);
 
     outer_loop: for (agent.remote_candidates.items) |remote_candidate| {
         for (agent.pairs.items) |*pair|
             if (pair.local.base.eql(&local_candidate.base) and pair.remote.address.eql(&remote_candidate.address))
                 continue :outer_loop;
 
-        try agent.appendCandidatePair(.{
+        try agent.pairs.append(agent.allocator, .{
             .local = local_candidate,
             .remote = remote_candidate,
             .priority = calculatePairPriority(local_candidate.priority, remote_candidate.priority, agent.role),
