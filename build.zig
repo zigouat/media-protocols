@@ -1,4 +1,5 @@
 const std = @import("std");
+const os = @import("builtin").os;
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
@@ -28,6 +29,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{
             .{ .name = "rtp", .module = rtp },
+            .{ .name = "rtcp", .module = rtcp },
         },
     });
 
@@ -52,21 +54,24 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    const translate_c = b.addTranslateC(.{
-        .root_source_file = b.path("src/ice/c.h"),
-        .target = target,
-        .optimize = optimize,
-    });
+    const ice_imports: []const std.Build.Module.Import = if (os.tag == .linux or os.tag.isBSD()) blk: {
+        const translate_c = b.addTranslateC(.{
+            .root_source_file = b.path("src/ice/c.h"),
+            .target = target,
+            .optimize = optimize,
+        });
+
+        break :blk &.{
+            .{ .name = "stun", .module = stun },
+            .{ .name = "c", .module = translate_c.createModule() },
+        };
+    } else &.{.{ .name = "stun", .module = stun }};
 
     const ice = b.addModule("ice", .{
         .root_source_file = b.path("src/ice/ice.zig"),
         .target = target,
         .optimize = optimize,
-        .imports = &.{
-            .{ .name = "stun", .module = stun },
-            .{ .name = "c", .module = translate_c.createModule() },
-        },
-        .link_libc = true,
+        .imports = ice_imports,
     });
     _ = b.addModule("protocols", .{
         .root_source_file = b.path("src/root.zig"),
