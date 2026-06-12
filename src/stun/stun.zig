@@ -82,7 +82,7 @@ pub const Message = struct {
     pub fn parse(msg: []const u8) Error!Message {
         std.debug.assert(msg.len >= header_size);
 
-        const header_int = std.mem.readInt(@typeInfo(Header).@"struct".backing_integer.?, msg[0..header_size], .big);
+        const header_int = std.mem.readInt(@Int(.unsigned, @bitSizeOf(Header)), msg[0..header_size], .big);
         const header: Header = @bitCast(header_int);
         if (header.magic_cookie != magic_cookie) {
             return error.WrongMagicCookie;

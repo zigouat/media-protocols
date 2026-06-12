@@ -1,4 +1,2 @@
-#ifdef __linux
-#include "ifaddrs.h"
-#include "netinet/in.h"
-#endif
+#include <net/if.h>
+#include <ifaddrs.h>
