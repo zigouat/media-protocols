@@ -174,6 +174,10 @@ pub const Session = struct {
         session.rtcp_ssrc_states.deinit();
     }
 
+    pub inline fn encryptRtp(session: *Session, rtp_data: []const u8, dst: []u8) ![]const u8 {
+        return try processRtp(session, rtp_data, dst, true);
+    }
+
     pub fn encryptRtcp(session: *Session, rtcp_data: []const u8, dst: []u8) ![]const u8 {
         const ssrc = std.mem.readInt(u32, rtcp_data[4..8], .big);
 
@@ -201,35 +205,8 @@ pub const Session = struct {
         }
     }
 
-    pub fn decryptRtp(session: *Session, packet: []const u8, dst: []u8) ![]const u8 {
-        const rtp_packet = try rtp.Packet.parse(packet);
-        const header_size = packet.len - rtp_packet.payload.len - rtp_packet.padding_size;
-
-        const entry = session.rtp_ssrc_states.getPtr(rtp_packet.header.ssrc);
-        var rtp_ssrc_state = entry orelse blk: {
-            var state = RtpSsrcState{
-                .replay_detector = try .init(session.rtp_ssrc_states.allocator, default_replay_detection_window),
-            };
-            break :blk &state;
-        };
-        errdefer if (entry == null) rtp_ssrc_state.deinit(session.rtp_ssrc_states.allocator);
-
-        const roc, const diff = rtp_ssrc_state.getRoc(rtp_packet.header.sequence_number);
-        const packet_index = @as(u64, roc) << 16 | rtp_packet.header.sequence_number;
-        try rtp_ssrc_state.replay_detector.check(packet_index);
-
-        switch (session.cipher) {
-            .AesCm128HmacSha1_32, .AesCm128HmacSha1_80 => |*c| {
-                const result = try c.decryptRtp(roc, header_size, packet, dst);
-                rtp_ssrc_state.updateRolloverCount(rtp_packet.header.sequence_number, diff);
-                rtp_ssrc_state.replay_detector.accept(packet_index);
-                if (entry == null) {
-                    @branchHint(.cold);
-                    try session.rtp_ssrc_states.put(rtp_packet.header.ssrc, rtp_ssrc_state.*);
-                }
-                return result;
-            },
-        }
+    pub inline fn decryptRtp(session: *Session, rtp_data: []const u8, dst: []u8) ![]const u8 {
+        return try processRtp(session, rtp_data, dst, false);
     }
 
     pub fn decryptRtcp(session: *Session, rtcp_data: []const u8, dst: []u8) ![]const u8 {
@@ -271,6 +248,40 @@ pub const Session = struct {
 
         return dst[0..];
     }
+
+    fn processRtp(session: *Session, rtp_data: []const u8, dst: []u8, encrypt: bool) ![]const u8 {
+        const rtp_packet = try rtp.Packet.parse(rtp_data);
+        const header_size = rtp_data.len - rtp_packet.payload.len - rtp_packet.padding_size;
+
+        const entry = session.rtp_ssrc_states.getPtr(rtp_packet.header.ssrc);
+        var rtp_ssrc_state = entry orelse blk: {
+            var state = RtpSsrcState{
+                .replay_detector = try .init(session.rtp_ssrc_states.allocator, default_replay_detection_window),
+            };
+            break :blk &state;
+        };
+        errdefer if (entry == null) rtp_ssrc_state.deinit(session.rtp_ssrc_states.allocator);
+
+        const roc, const diff = rtp_ssrc_state.getRoc(rtp_packet.header.sequence_number);
+        const packet_index = @as(u64, roc) << 16 | rtp_packet.header.sequence_number;
+        if (!encrypt) try rtp_ssrc_state.replay_detector.check(packet_index);
+
+        switch (session.cipher) {
+            .AesCm128HmacSha1_32, .AesCm128HmacSha1_80 => |*c| {
+                const result = if (encrypt)
+                    try c.encryptRtp(roc, header_size, rtp_data, dst)
+                else
+                    try c.decryptRtp(roc, header_size, rtp_data, dst);
+                rtp_ssrc_state.updateRolloverCount(rtp_packet.header.sequence_number, diff);
+                if (!encrypt) rtp_ssrc_state.replay_detector.accept(packet_index);
+                if (entry == null) {
+                    @branchHint(.cold);
+                    try session.rtp_ssrc_states.put(rtp_packet.header.ssrc, rtp_ssrc_state.*);
+                }
+                return result;
+            },
+        }
+    }
 };
 
 const testing = std.testing;
@@ -300,9 +311,6 @@ const plain_rtcp_aes_128_cm_hmac1_80 = [_]u8{
     144, 171, 205, 239, 0,   1,   226, 64,  0,   0,   0,   100,
     0,   0,   0,   200, 129, 203, 0,   1,   137, 161, 255, 135,
 };
-
-const encrypted_rtp_aes_128_cm_hmac1_32 = [_]u8{};
-const plain_rtp_aes_128_cm_hmac1_32 = [_]u8{};
 
 test {
     std.testing.refAllDecls(@This());
@@ -351,4 +359,60 @@ test "encrypt rtcp: Aes128CmHmacSha1_80" {
     var dest: [1024]u8 = @splat(0);
     const decrypted = try session.encryptRtcp(&plain_rtcp_aes_128_cm_hmac1_80, &dest);
     try testing.expectEqualSlices(u8, &encrypted_rtcp_aes_128_cm_hmac1_80, decrypted);
+}
+
+test "encrypt/decrypt rtp" {
+    const assert_enc_dec = struct {
+        pub fn encrypt_decrypt(session: *Session) !void {
+            var header = rtp.Packet.Header{
+                .extension = false,
+                .marker = false,
+                .padding = false,
+                .payload_type = 99,
+                .sequence_number = 0xFF90,
+                .ssrc = 0xFE1A8988,
+                .timestamp = 1000,
+            };
+
+            var dst_enc: [1200]u8 = @splat(0);
+            var dst_dec: [1000]u8 = @splat(0);
+
+            // Batch size is 64 because that's the default replay window size
+            // Otherwise we'll get `error.TooOld` when decrypting.
+            var batch: [64][1000]u8 = @splat(@splat(0));
+            var r = std.Random.DefaultPrng.init(testing.random_seed);
+            var random = r.random();
+
+            var idx: usize = 0;
+            while (idx < 1000) : (idx += batch.len) {
+                for (0..batch.len) |i| {
+                    var payload = &batch[i];
+                    testing.io.random(payload[12..payload.len]);
+                    std.mem.writeInt(u96, payload[0..12], @bitCast(header), .big);
+                    header.sequence_number +%= 1;
+                }
+
+                random.shuffle([1000]u8, &batch);
+
+                for (0..batch.len) |i| {
+                    const encrypted = try session.encryptRtp(&batch[i], &dst_enc);
+                    const decrypted = try session.decryptRtp(encrypted, &dst_dec);
+
+                    try testing.expectEqualSlices(u8, &batch[i], decrypted);
+                }
+            }
+        }
+    }.encrypt_decrypt;
+
+    {
+        var session = try Session.init(std.testing.allocator, test_keying_material, .AesCm128HmacSha1_80);
+        defer session.deinit();
+        try assert_enc_dec(&session);
+    }
+
+    {
+        var session = try Session.init(std.testing.allocator, test_keying_material, .AesCm128HmacSha1_32);
+        defer session.deinit();
+        try assert_enc_dec(&session);
+    }
 }
