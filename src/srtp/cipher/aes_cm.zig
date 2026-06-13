@@ -50,6 +50,34 @@ pub fn init(profile: srtp.Profile, master_key: []const u8, master_salt: []const 
     return cipher;
 }
 
+pub fn encryptRtp(cm: *AesCm, roc: u32, header_size: usize, src: []const u8, dst: []u8) Error![]const u8 {
+    const tag_size = cm.profile.rtpTagLength();
+    const roc_bytes: [4]u8 = std.mem.toBytes(std.mem.nativeToBig(u32, roc));
+
+    var iv: [enc_key_size]u8 = @splat(0);
+    generateRtpIV(&iv, &cm.rtp_salt, src, &roc_bytes);
+
+    ctr(
+        @TypeOf(cm.rtp_enc_ctx),
+        cm.rtp_enc_ctx,
+        dst[header_size..src.len],
+        src[header_size..src.len],
+        iv,
+        .big,
+    );
+
+    var hash: [HmacSha1.mac_length]u8 = undefined;
+    var hasher = HmacSha1.init(&cm.rtp_auth_key);
+    hasher.update(src[0..header_size]);
+    hasher.update(dst[header_size..src.len]);
+    hasher.update(&roc_bytes);
+    hasher.final(&hash);
+
+    @memcpy(dst[0..header_size], src[0..header_size]);
+    @memcpy(dst[src.len .. src.len + tag_size], hash[0..tag_size]);
+    return dst[0 .. src.len + tag_size];
+}
+
 pub fn encryptRtcp(cm: *AesCm, src: []const u8, dst: []u8, index: u32) Error![]const u8 {
     const tag_size = cm.profile.rtcpTagLength();
     std.debug.assert(dst.len >= src.len + tag_size + rtcp_index_size);
@@ -85,10 +113,7 @@ pub fn decryptRtp(cm: *AesCm, roc: u32, header_size: usize, src: []const u8, dst
 
     // Decrypt
     var iv: [enc_key_size]u8 = @splat(0);
-    @memcpy(iv[4..8], src[8..12]);
-    @memcpy(iv[8..12], &roc_bytes);
-    @memcpy(iv[12..14], src[2..4]);
-    for (iv[0..salt_size], &cm.rtp_salt) |*b1, b2| b1.* ^= b2;
+    generateRtpIV(&iv, &cm.rtp_salt, src, &roc_bytes);
 
     const payload_size = src.len - tag_size - header_size;
     ctr(
@@ -136,6 +161,13 @@ fn generateRtcpIV(iv: *[enc_key_size]u8, salt: *const [salt_size]u8, ssrc: *cons
     for (iv[0..salt_size], salt) |*iv_b, salt_b| iv_b.* ^= salt_b;
 }
 
+fn generateRtpIV(iv: *[enc_key_size]u8, salt: *const [salt_size]u8, src: []const u8, roc: []const u8) void {
+    @memcpy(iv[4..8], src[8..12]);
+    @memcpy(iv[8..12], roc);
+    @memcpy(iv[12..14], src[2..4]);
+    for (iv[0..salt_size], salt) |*b1, b2| b1.* ^= b2;
+}
+
 const plain_rtp = [_]u8{
     0x80, 0x0E, 0x0F, 0x8F, 0x62, 0x91, 0x7F, 0xF7,
     0xE9, 0xA4, 0x91, 0x8C, 0x87, 0x9C, 0xF1, 0xE2,
@@ -150,6 +182,23 @@ const plain_rtcp = [_]u8{
 
 const encrypted_rtp_aes_128_cm_hmac1_32 = [_]u8{};
 const plain_rtp_aes_128_cm_hmac1_32 = [_]u8{};
+
+test "encrypt/decrypt rtp" {
+    var master_key: [enc_key_size]u8 = undefined;
+    var master_salt: [enc_key_size]u8 = undefined;
+
+    std.testing.io.random(&master_key);
+    std.testing.io.random(&master_salt);
+
+    var cm = AesCm.init(.AesCm128HmacSha1_80, &master_key, &master_salt);
+
+    var enc_dst: [200]u8 = undefined;
+    var dec_dst: [200]u8 = undefined;
+    const encrypted = try cm.encryptRtp(0, 12, &plain_rtp, &enc_dst);
+    const decrypted = try cm.decryptRtp(0, 12, encrypted, &dec_dst);
+
+    try std.testing.expectEqualSlices(u8, &plain_rtp, decrypted);
+}
 
 test "encrypt/decrypt rtcp" {
     var master_key: [enc_key_size]u8 = undefined;
