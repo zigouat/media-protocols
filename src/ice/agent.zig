@@ -20,7 +20,6 @@ const keep_alive_interval: std.Io.Duration = .fromSeconds(4);
 const disconnect_timeout: Io.Clock.Duration = .{ .clock = .awake, .raw = .fromSeconds(5) };
 const failing_timeout: Io.Clock.Duration = .{ .clock = .awake, .raw = .fromSeconds(25) };
 
-// io: Io,
 allocator: Allocator,
 buffer_pool: std.heap.MemoryPool([max_message_size]u8),
 connection_state: ice.ConnectionState = .new,
@@ -100,7 +99,6 @@ pub fn init(io: Io, allocator: Allocator, config: AgentConfig) !Agent {
     const select_buffer = try allocator.alloc(InnerEvent, 10);
 
     return .{
-        // .io = io,
         .allocator = allocator,
         .buffer_pool = .empty,
         .role = config.role,
