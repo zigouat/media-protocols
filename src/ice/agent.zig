@@ -157,7 +157,7 @@ pub fn pollEvent(agent: *Agent) !Event {
                 else => {},
             };
 
-            const maybe_event = agent.handleConnectivityCheckMessage(&agent.select, message) catch |err| switch (err) {
+            const maybe_event = agent.handleConnectivityCheckMessage(message) catch |err| switch (err) {
                 error.Canceled => return error.Canceled,
                 else => continue,
             };
@@ -714,9 +714,10 @@ fn batchSendConnectivityCheck(agent: *Agent) !void {
     };
 }
 
-fn handleConnectivityCheckMessage(agent: *Agent, select: *Io.Select(InnerEvent), message: Message) !?Event {
+fn handleConnectivityCheckMessage(agent: *Agent, message: Message) !?Event {
     const data = message.incoming_message.data;
     const sender = message.incoming_message.from;
+    defer if (agent.connection_state != .connected) agent.select.async(.message, receiveTimeout, .{ agent, message.socket, .none });
 
     switch (agent.connection_state) {
         .completed => {
@@ -756,9 +757,9 @@ fn handleConnectivityCheckMessage(agent: *Agent, select: *Io.Select(InnerEvent),
         if (agent.nominated_pair != null and agent.connection_state != .connected) {
             agent.setConnectionState(.connected);
 
-            select.async(.complete, Io.sleep, .{ agent.select.io, .fromSeconds(3), .awake });
-            select.async(.keep_alive, Io.sleep, .{ agent.select.io, keep_alive_interval, .awake });
-            select.async(.app_data, receiveTimeout, .{ agent, &agent.nominated_pair.?.socket, .{ .duration = disconnect_timeout } });
+            agent.select.async(.complete, Io.sleep, .{ agent.select.io, .fromSeconds(3), .awake });
+            agent.select.async(.keep_alive, Io.sleep, .{ agent.select.io, keep_alive_interval, .awake });
+            agent.select.async(.app_data, receiveTimeout, .{ agent, &agent.nominated_pair.?.socket, .{ .duration = disconnect_timeout } });
             return .{ .connection_state = agent.connection_state };
         }
     } else {
@@ -770,7 +771,6 @@ fn handleConnectivityCheckMessage(agent: *Agent, select: *Io.Select(InnerEvent),
         }
     }
 
-    select.async(.message, receiveTimeout, .{ agent, message.socket, .none });
     return null;
 }
 
