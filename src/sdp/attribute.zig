@@ -787,6 +787,6 @@ test "ParsedAttribute write" {
         "a=extmap:1/sendrecv https://my-custom-ext att=1\r\n",
     );
 
-    try expectWrite(&w, .{ .ice_options = .{ .ice2 = true } }, "a=ice-options: ice2\r\n");
-    try expectWrite(&w, .{ .ice_options = .{ .ice2 = true, .trickle = true } }, "a=ice-options: ice2 trickle\r\n");
+    try expectWrite(&w, .{ .ice_options = .{ .ice2 = true } }, "a=ice-options:ice2 \r\n");
+    try expectWrite(&w, .{ .ice_options = .{ .ice2 = true, .trickle = true } }, "a=ice-options:ice2 trickle \r\n");
 }

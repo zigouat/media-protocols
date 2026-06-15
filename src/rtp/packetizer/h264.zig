@@ -3,7 +3,7 @@ const media = @import("media");
 const Packet = @import("../rtp.zig").Packet;
 const Packetizer = @This();
 
-const max_payload_size: usize = 1460;
+const max_payload_size: usize = 1400;
 const max_timestamp: u64 = std.math.maxInt(u32) + 1;
 
 pub const InitConfig = struct {
@@ -218,7 +218,7 @@ test "h264 packetizer: fu-a fragmentation" {
     try std.testing.expectEqual(2002, packet.header.sequence_number);
     try std.testing.expectEqual(180_000, packet.header.timestamp);
     try std.testing.expect(packet.header.marker);
-    try std.testing.expectEqual(85, packet.payload.len);
+    try std.testing.expectEqual(205, packet.payload.len);
     try std.testing.expectEqualSlices(u8, &.{ 0x7c, 0x45 }, packet.payload[0..2]);
     for (packet.payload[2..]) |*b| {
         try std.testing.expectEqual(idx, b.*);
