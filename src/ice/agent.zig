@@ -123,8 +123,6 @@ pub fn deinit(agent: *Agent) void {
     agent.credentials.deinit(allocator);
     if (agent.remote_credentials) |*credens| credens.deinit(allocator);
 
-    agent.buffer_pool.deinit(allocator);
-
     while (agent.select.cancel()) |event| switch (event) {
         .message, .app_data => |message| {
             if (message.err) |_| continue;
@@ -133,10 +131,11 @@ pub fn deinit(agent: *Agent) void {
         else => {},
     };
     allocator.free(agent.select_buffer);
+    agent.buffer_pool.deinit(allocator);
 }
 
 /// Poll the next event.
-pub fn pollEvent(agent: *Agent) !Event {
+pub fn poll(agent: *Agent) !Event {
     const io = agent.select.io;
 
     while (agent.select.await()) |event| switch (event) {
@@ -154,11 +153,12 @@ pub fn pollEvent(agent: *Agent) !Event {
         .message => |message| {
             if (message.err) |err| switch (err) {
                 error.Canceled => return error.Canceled,
-                else => {},
+                else => continue,
             };
 
             const maybe_event = agent.handleConnectivityCheckMessage(message) catch |err| switch (err) {
                 error.Canceled => return error.Canceled,
+                error.SwitchRole => return error.SwitchRole, // TODO: switch role
                 else => continue,
             };
 
@@ -258,8 +258,16 @@ pub fn sendData(agent: *const Agent, data: []const u8) Socket.SendError!void {
     }
 }
 
+pub fn createPacket(agent: *Agent) []u8 {
+    agent.mutex.lockUncancelable(agent.select.io);
+    defer agent.mutex.unlock(agent.select.io);
+    return agent.buffer_pool.create(agent.allocator);
+}
+
 /// Free the buffer and return it to the pool.
 pub fn destroyPacket(agent: *Agent, data: []const u8) void {
+    agent.mutex.lockUncancelable(agent.select.io);
+    defer agent.mutex.unlock(agent.select.io);
     agent.buffer_pool.destroy(@ptrCast(@alignCast(@constCast(data))));
 }
 
@@ -717,7 +725,7 @@ fn batchSendConnectivityCheck(agent: *Agent) !void {
 fn handleConnectivityCheckMessage(agent: *Agent, message: Message) !?Event {
     const data = message.incoming_message.data;
     const sender = message.incoming_message.from;
-    defer if (agent.connection_state != .connected) agent.select.async(.message, receiveTimeout, .{ agent, message.socket, .none });
+    defer if (agent.connection_state != .completed) agent.select.async(.message, receiveTimeout, .{ agent, message.socket, .none });
 
     switch (agent.connection_state) {
         .completed => {
