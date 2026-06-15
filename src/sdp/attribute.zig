@@ -95,8 +95,8 @@ pub const ParsedAttribute = union(AttributeType) {
             .ice_lite => try w.writeAll("a=ice-lite\r\n"),
             .ice_options => |options| {
                 try w.writeAll("a=ice-options:");
-                if (options.ice2) try w.writeAll(" ice2");
-                if (options.trickle) try w.writeAll(" trickle");
+                if (options.ice2) try w.writeAll("ice2 ");
+                if (options.trickle) try w.writeAll("trickle ");
                 try w.writeAll("\r\n");
             },
             .ice_ufrag => |v| try w.print("a=ice-ufrag:{s}\r\n", .{v}),

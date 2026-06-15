@@ -5,12 +5,12 @@
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
         .media = .{
-            .url = "git+https://github.com/zig-streaming/media.git#885fb40b02713aef72962bd293802f762b497263",
-            .hash = "media-0.1.0-qc-dCCXmAACZlsAhgPccDjhOohDBJoCucRz7-uboeNOe",
+            .url = "git+https://github.com/zig-streaming/media.git#010b7d8e1a10282758c8a6cd54f4bd8fcec046c7",
+            .hash = "media-0.1.0-qc-dCJzsAACfvL7pUfAyRw0O16yn3G_NPSbL8NIAWSKV",
         },
         .zbench = .{
-            .url = "git+https://github.com/hendriknielaender/zBench?ref=v0.13.0#b2b89c475e3ef1bb2bd71255c80478a82d3e0ca8",
-            .hash = "zbench-0.13.0-YTdc7xVBAQCCMC-IdLLuotBeiNNNm8k9Pi2V4VYqrwfI",
+            .url = "https://github.com/hendriknielaender/zBench/archive/c24d128bfa80ec6a1b495b84ec827c6a0bec7865.tar.gz",
+            .hash = "zbench-0.11.2-YTdc76Q_AQAxonIKZ2-H1PdcESJGwyuYylw6RkPiBqyx",
         },
     },
     .paths = .{
