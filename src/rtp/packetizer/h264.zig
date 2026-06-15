@@ -3,7 +3,6 @@ const media = @import("media");
 const Packet = @import("../rtp.zig").Packet;
 const Packetizer = @This();
 
-const max_payload_size: usize = 1400;
 const max_timestamp: u64 = std.math.maxInt(u32) + 1;
 
 pub const InitConfig = struct {
@@ -28,7 +27,7 @@ const FuState = struct {
 
     /// Gets the next fragment from the NALu.
     fn next(state: *FuState, buffer: []u8) []const u8 {
-        const offset: usize = @min(max_payload_size - 2, state.nalu.len);
+        const offset: usize = @min(buffer.len - 2, state.nalu.len);
         const last_fragment = offset == state.nalu.len;
 
         @memcpy(buffer[2 .. offset + 2], state.nalu[0..offset]);
@@ -46,7 +45,6 @@ const FuState = struct {
     }
 };
 
-buffer: [max_payload_size]u8 = @splat(0),
 ssrc: u32,
 payload_type: u7,
 seq_number: u16,
@@ -72,14 +70,14 @@ pub fn consume(packetizer: *Packetizer, packet: *const media.Packet) void {
     packetizer.fu_state = null;
 }
 
-pub fn next(packetizer: *Packetizer) !?Packet {
+pub fn next(packetizer: *Packetizer, out: []u8) !?Packet {
     if (packetizer.packet) |packet| {
         @branchHint(.likely);
         errdefer packetizer.pos = 0;
         const timestamp: u32 = @intCast(@rem(packet.pts, max_timestamp));
 
         if (packetizer.fu_state) |*fu_state| {
-            const buffer = fu_state.next(&packetizer.buffer);
+            const payload = fu_state.next(out);
 
             var marker = false;
             if (fu_state.empty()) {
@@ -88,7 +86,7 @@ pub fn next(packetizer: *Packetizer) !?Packet {
                 if (marker) packetizer.clearPacket();
             }
 
-            return packetizer.newRtpPacket(marker, timestamp, buffer);
+            return packetizer.newRtpPacket(marker, timestamp, payload);
         }
 
         var reader: std.Io.Reader = .fixed(packet.data[packetizer.pos..]);
@@ -96,11 +94,11 @@ pub fn next(packetizer: *Packetizer) !?Packet {
         const nalu = try reader.take(nalu_size);
         defer packetizer.pos += nalu_size + 4;
 
-        if (nalu_size > max_payload_size) {
+        if (nalu_size > out.len) {
             // FU unit
             packetizer.fu_state = .init(nalu);
-            const buffer = packetizer.fu_state.?.next(&packetizer.buffer);
-            return packetizer.newRtpPacket(false, timestamp, buffer);
+            const payload = packetizer.fu_state.?.next(out);
+            return packetizer.newRtpPacket(false, timestamp, payload);
         }
 
         // Single nalu
@@ -142,6 +140,8 @@ test "h264 packetizer: single nalu" {
         .seq_number = 1000,
     });
 
+    var out: [1500]u8 = @splat(0);
+
     const nalu1 = [_]u8{ 0x67, 0x42, 0xC0, 0x1E };
     const nalu2 = [_]u8{ 0x65, 0x88, 0x84, 0x21, 0xA0 };
     const avc_data = [_]u8{ 0x00, 0x00, 0x00, nalu1.len } ++ nalu1 ++
@@ -152,7 +152,7 @@ test "h264 packetizer: single nalu" {
 
     packetizer.consume(&media_packet);
 
-    const first = try packetizer.next() orelse return error.TestUnexpectedNull;
+    const first = try packetizer.next(&out) orelse return error.TestUnexpectedNull;
     try std.testing.expectEqual(96, first.header.payload_type);
     try std.testing.expectEqual(0xDEADBEEF, first.header.ssrc);
     try std.testing.expectEqual(1000, first.header.sequence_number);
@@ -160,7 +160,7 @@ test "h264 packetizer: single nalu" {
     try std.testing.expect(!first.header.marker);
     try std.testing.expectEqualSlices(u8, &nalu1, first.payload);
 
-    const second = try packetizer.next() orelse return error.TestUnexpectedNull;
+    const second = try packetizer.next(&out) orelse return error.TestUnexpectedNull;
     try std.testing.expectEqual(96, second.header.payload_type);
     try std.testing.expectEqual(0xDEADBEEF, second.header.ssrc);
     try std.testing.expectEqual(1001, second.header.sequence_number);
@@ -170,7 +170,7 @@ test "h264 packetizer: single nalu" {
 
     try std.testing.expectEqual(1002, packetizer.seq_number);
 
-    try std.testing.expectEqual(null, try packetizer.next());
+    try std.testing.expectEqual(null, try packetizer.next(&out));
 }
 
 test "h264 packetizer: fu-a fragmentation" {
@@ -179,6 +179,8 @@ test "h264 packetizer: fu-a fragmentation" {
         .ssrc = 0xCAFEBABE,
         .seq_number = 2000,
     });
+
+    var out: [1400]u8 = @splat(0);
 
     // Header byte 0x65: F=0, NRI=3, Type=5 (IDR slice).
     const nalu_size: usize = 3000;
@@ -191,11 +193,11 @@ test "h264 packetizer: fu-a fragmentation" {
     media_packet.pts = 180_000;
     packetizer.consume(&media_packet);
 
-    var packet = try packetizer.next() orelse unreachable;
+    var packet = try packetizer.next(out[0..1400]) orelse unreachable;
     try std.testing.expectEqual(2000, packet.header.sequence_number);
     try std.testing.expectEqual(180_000, packet.header.timestamp);
     try std.testing.expect(!packet.header.marker);
-    try std.testing.expectEqual(max_payload_size, packet.payload.len);
+    try std.testing.expectEqual(1400, packet.payload.len);
     try std.testing.expectEqualSlices(u8, &.{ 0x7c, 0x85 }, packet.payload[0..2]);
     var idx: u8 = 0;
     for (packet.payload[2..]) |*b| {
@@ -203,27 +205,27 @@ test "h264 packetizer: fu-a fragmentation" {
         idx +%= 1;
     }
 
-    packet = try packetizer.next() orelse unreachable;
+    packet = try packetizer.next(out[0..1350]) orelse unreachable;
     try std.testing.expectEqual(2001, packet.header.sequence_number);
     try std.testing.expectEqual(180_000, packet.header.timestamp);
     try std.testing.expect(!packet.header.marker);
-    try std.testing.expectEqual(max_payload_size, packet.payload.len);
+    try std.testing.expectEqual(1350, packet.payload.len);
     try std.testing.expectEqualSlices(u8, &.{ 0x7c, 0x05 }, packet.payload[0..2]);
     for (packet.payload[2..]) |*b| {
         try std.testing.expectEqual(idx, b.*);
         idx +%= 1;
     }
 
-    packet = try packetizer.next() orelse unreachable;
+    packet = try packetizer.next(out[0..1000]) orelse unreachable;
     try std.testing.expectEqual(2002, packet.header.sequence_number);
     try std.testing.expectEqual(180_000, packet.header.timestamp);
     try std.testing.expect(packet.header.marker);
-    try std.testing.expectEqual(205, packet.payload.len);
+    try std.testing.expectEqual(255, packet.payload.len);
     try std.testing.expectEqualSlices(u8, &.{ 0x7c, 0x45 }, packet.payload[0..2]);
     for (packet.payload[2..]) |*b| {
         try std.testing.expectEqual(idx, b.*);
         idx +%= 1;
     }
 
-    try std.testing.expectEqual(null, try packetizer.next());
+    try std.testing.expectEqual(null, try packetizer.next(&out));
 }
