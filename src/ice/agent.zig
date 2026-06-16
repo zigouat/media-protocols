@@ -191,7 +191,7 @@ pub fn poll(agent: *Agent) !Event {
             try timeout;
             agent.select.async(.keep_alive, Io.sleep, .{ io, keep_alive_interval, .awake });
 
-            const buffer = try agent.buffer_pool.create(agent.allocator);
+            const buffer = try agent.createPacket();
             defer agent.destroyPacket(buffer);
 
             const req = try agent.buildBindingRequest(randomNumber(u96, io), false, buffer);
@@ -258,10 +258,10 @@ pub fn sendData(agent: *const Agent, data: []const u8) Socket.SendError!void {
     }
 }
 
-pub fn createPacket(agent: *Agent) []u8 {
+pub fn createPacket(agent: *Agent) ![]u8 {
     agent.mutex.lockUncancelable(agent.select.io);
     defer agent.mutex.unlock(agent.select.io);
-    return agent.buffer_pool.create(agent.allocator);
+    return try agent.buffer_pool.create(agent.allocator);
 }
 
 /// Free the buffer and return it to the pool.
@@ -354,13 +354,15 @@ fn doAddLocalCandidate(agent: *Agent, local_candidate: Candidate) Allocator.Erro
 
 fn handleRequest(agent: *Agent, msg: *const stun.Message, base_addr: IpAddress, from: IpAddress) ![]const u8 {
     Logger.debug("Handle request on {f} from {f}", .{ base_addr, from });
-    const buffer = try agent.buffer_pool.create(agent.allocator);
-    errdefer agent.buffer_pool.destroy(buffer);
+    const buffer = try agent.createPacket();
+    errdefer agent.destroyPacket(buffer);
 
     const stun_req = agent.parseAndValidateStunRequest(msg) catch |err| switch (err) {
         error.RoleConflict => return try agent.buildRoleConflictErrorMessage(msg.header.transaction_id, buffer),
         else => |e| return e,
     };
+
+    if (stun_req.use_candidate) Logger.debug("Request wants to nominate the pair", .{});
 
     if (agent.findCandidatePair(&base_addr, &from)) |candidate_pair| {
         switch (candidate_pair.status) {
@@ -511,8 +513,8 @@ fn parseAndValidateStunResponse(agent: *Agent, msg: *const stun.Message) !IpAddr
     return if (maybe_addr) |addr| addr else error.MissingMappedAddress;
 }
 
-fn buildBindingRequest(agent: *Agent, tx_id: u96, use_candidate: bool, buffer: *[max_message_size]u8) ![]const u8 {
-    var w = stun.Writer.init(&(buffer.*), .{ .password = agent.remote_credentials.?.password });
+fn buildBindingRequest(agent: *Agent, tx_id: u96, use_candidate: bool, buffer: []u8) ![]const u8 {
+    var w = stun.Writer.init(buffer, .{ .password = agent.remote_credentials.?.password });
     try w.writeHeader(.{
         .message_type = .fromClassAndMethod(.request, .binding),
         .transaction_id = tx_id,
@@ -550,9 +552,9 @@ fn buildSuccessResponse(
     agent: *const Agent,
     msg: *const stun.Message,
     from: IpAddress,
-    buffer: *[max_message_size]u8,
+    buffer: []u8,
 ) ![]const u8 {
-    var w = stun.Writer.init(&(buffer.*), .{ .password = agent.credentials.password });
+    var w = stun.Writer.init(buffer, .{ .password = agent.credentials.password });
     try w.writeHeader(.{
         .message_type = .fromClassAndMethod(.success_response, .binding),
         .transaction_id = msg.header.transaction_id,
@@ -564,8 +566,8 @@ fn buildSuccessResponse(
     return w.final();
 }
 
-fn buildRoleConflictErrorMessage(agent: *const Agent, transaction_id: u96, buffer: *[max_message_size]u8) ![]const u8 {
-    var w = stun.Writer.init(&(buffer.*), .{ .password = agent.credentials.password });
+fn buildRoleConflictErrorMessage(agent: *const Agent, transaction_id: u96, buffer: []u8) ![]const u8 {
+    var w = stun.Writer.init(buffer, .{ .password = agent.credentials.password });
     try w.writeHeader(.{
         .message_type = .fromClassAndMethod(.error_response, .binding),
         .transaction_id = transaction_id,
@@ -640,12 +642,12 @@ fn receiveTimeout(agent: *Agent, socket: *const Socket, timeout: Io.Timeout) Mes
         .incoming_message = undefined,
     };
 
-    const buffer = agent.buffer_pool.create(agent.allocator) catch |err| {
+    const buffer = agent.createPacket() catch |err| {
         result.err = err;
         return result;
     };
 
-    result.incoming_message = socket.receiveTimeout(agent.select.io, &(buffer.*), timeout) catch |err| {
+    result.incoming_message = socket.receiveTimeout(agent.select.io, buffer, timeout) catch |err| {
         agent.destroyPacket(buffer);
         result.err = err;
         return result;
@@ -674,7 +676,7 @@ fn selectBestPair(agent: *Agent) ?SelectedPair {
 }
 
 fn batchSendConnectivityCheck(agent: *Agent) !void {
-    const buffer = try agent.buffer_pool.create(agent.allocator);
+    const buffer = try agent.createPacket();
     defer agent.destroyPacket(buffer);
 
     if (agent.nominated_pair != null) return;
@@ -714,6 +716,7 @@ fn batchSendConnectivityCheck(agent: *Agent) !void {
             });
 
             const socket = findSocket(agent.sockets, &candidate_pair.local.base);
+            Logger.debug("Send request: {f}", .{candidate_pair});
             socket.send(agent.select.io, &candidate_pair.remote.address, msg) catch |err| {
                 Logger.warn("Failed to send binding request on pair {f}: {}", .{ candidate_pair, err });
             };
@@ -788,7 +791,7 @@ fn handleConsentFreshness(agent: *Agent, message: Message) !void {
         .request => {
             Logger.debug("Received consent freshness request", .{});
             _ = try agent.parseAndValidateStunRequest(&msg);
-            const buffer = try agent.buffer_pool.create(agent.allocator);
+            const buffer = try agent.createPacket();
             defer agent.destroyPacket(buffer);
 
             const resp = try agent.buildSuccessResponse(&msg, message.incoming_message.from, buffer);
