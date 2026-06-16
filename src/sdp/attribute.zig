@@ -28,6 +28,7 @@ const attribute_types_map: std.StaticStringMap(AttributeType) = .initComptime(&.
     .{ "rtpmap", .rtpmap },
     .{ "setup", .setup },
     .{ "ssrc", .ssrc },
+    .{ "ssrc-group", .ssrc_group },
 });
 
 key: []const u8,
@@ -55,6 +56,7 @@ pub const AttributeType = enum {
     rtpmap,
     setup,
     ssrc,
+    ssrc_group,
     unknown,
 };
 
@@ -82,6 +84,7 @@ pub const ParsedAttribute = union(AttributeType) {
     rtpmap: RtpMap,
     setup: Setup,
     ssrc: Ssrc,
+    ssrc_group: Group,
     unknown,
 
     pub fn write(attr: ParsedAttribute, w: *std.Io.Writer) std.Io.Writer.Error!void {
@@ -157,6 +160,7 @@ pub fn parse(attr: *const Attribute) !ParsedAttribute {
         .rtpmap => .{ .rtpmap = try RtpMap.parse(value) },
         .setup => if (std.meta.stringToEnum(Setup, value)) |setup| .{ .setup = setup } else error.InvalidAttribute,
         .ssrc => .{ .ssrc = try Ssrc.parse(value) },
+        .ssrc_group => .{ .ssrc_group = try Group.parse(value) },
         else => .unknown,
     };
 }
@@ -757,6 +761,15 @@ test "parse attribute" {
         try std.testing.expectEqualStrings("dummy", ssrc.attr_value);
 
         try std.testing.expectError(error.InvalidAttribute, (Attribute{ .key = "ssrc", .value = "-459889 ddf" }).parse());
+    }
+
+    {
+        const attr = try (Attribute{ .key = "ssrc-group", .value = "FID 4110286963 3937822633" }).parse();
+        try std.testing.expectEqual(.ssrc_group, @as(AttributeType, attr));
+
+        const group = attr.ssrc_group;
+        try std.testing.expectEqual(.FID, group.semantics);
+        try std.testing.expectEqualStrings("4110286963 3937822633", group.mids);
     }
 
     {
