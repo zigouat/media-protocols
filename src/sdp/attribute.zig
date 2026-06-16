@@ -27,6 +27,8 @@ const attribute_types_map: std.StaticStringMap(AttributeType) = .initComptime(&.
     .{ "rtcp-rsize", .rtcp_rsize },
     .{ "rtpmap", .rtpmap },
     .{ "setup", .setup },
+    .{ "ssrc", .ssrc },
+    .{ "ssrc-group", .ssrc_group },
 });
 
 key: []const u8,
@@ -53,6 +55,8 @@ pub const AttributeType = enum {
     rtcp_rsize,
     rtpmap,
     setup,
+    ssrc,
+    ssrc_group,
     unknown,
 };
 
@@ -79,6 +83,8 @@ pub const ParsedAttribute = union(AttributeType) {
     rtcp_rsize: void,
     rtpmap: RtpMap,
     setup: Setup,
+    ssrc: Ssrc,
+    ssrc_group: Group,
     unknown,
 
     pub fn write(attr: ParsedAttribute, w: *std.Io.Writer) std.Io.Writer.Error!void {
@@ -112,6 +118,7 @@ pub const ParsedAttribute = union(AttributeType) {
                 try fingerprint.write(w);
                 try w.writeAll("\r\n");
             },
+            .ssrc => |ssrc| try w.print("a=ssrc:{} {s}:{s}\r\n", .{ ssrc.id, ssrc.attr_key, ssrc.attr_value }),
             else => {},
         }
     }
@@ -152,6 +159,8 @@ pub fn parse(attr: *const Attribute) !ParsedAttribute {
         .rtcp_rsize => .rtcp_rsize,
         .rtpmap => .{ .rtpmap = try RtpMap.parse(value) },
         .setup => if (std.meta.stringToEnum(Setup, value)) |setup| .{ .setup = setup } else error.InvalidAttribute,
+        .ssrc => .{ .ssrc = try Ssrc.parse(value) },
+        .ssrc_group => .{ .ssrc_group = try Group.parse(value) },
         else => .unknown,
     };
 }
@@ -460,6 +469,24 @@ pub const IceOptions = packed struct(u8) {
     }
 };
 
+pub const Ssrc = struct {
+    id: u32,
+    attr_key: []const u8,
+    attr_value: []const u8,
+
+    fn parse(value: []const u8) !Ssrc {
+        const cut = std.mem.cutScalar(u8, value, ' ') orelse return error.InvalidAttribute;
+        const id = std.fmt.parseInt(u32, cut.@"0", 10) catch return error.InvalidAttribute;
+        const attr_key, const attr_value = std.mem.cutScalar(u8, cut.@"1", ':') orelse return error.InvalidAttribute;
+
+        return .{
+            .id = id,
+            .attr_key = std.mem.trimStart(u8, attr_key, " "),
+            .attr_value = std.mem.trim(u8, attr_value, " "),
+        };
+    }
+};
+
 test "attribute parsing" {
     const input =
         \\a=rtpmap:96 opus/48000/2
@@ -725,6 +752,27 @@ test "parse attribute" {
     }
 
     {
+        const attr = try (Attribute{ .key = "ssrc", .value = "4110286963 cname:dummy" }).parse();
+        try std.testing.expectEqual(.ssrc, @as(AttributeType, attr));
+
+        const ssrc = attr.ssrc;
+        try std.testing.expectEqual(4110286963, ssrc.id);
+        try std.testing.expectEqualStrings("cname", ssrc.attr_key);
+        try std.testing.expectEqualStrings("dummy", ssrc.attr_value);
+
+        try std.testing.expectError(error.InvalidAttribute, (Attribute{ .key = "ssrc", .value = "-459889 ddf" }).parse());
+    }
+
+    {
+        const attr = try (Attribute{ .key = "ssrc-group", .value = "FID 4110286963 3937822633" }).parse();
+        try std.testing.expectEqual(.ssrc_group, @as(AttributeType, attr));
+
+        const group = attr.ssrc_group;
+        try std.testing.expectEqual(.FID, group.semantics);
+        try std.testing.expectEqualStrings("4110286963 3937822633", group.mids);
+    }
+
+    {
         const unknown = try (Attribute{ .key = "some-unknown-key", .value = "some-value" }).parse();
         try std.testing.expect(unknown == .unknown);
     }
@@ -789,4 +837,10 @@ test "ParsedAttribute write" {
 
     try expectWrite(&w, .{ .ice_options = .{ .ice2 = true } }, "a=ice-options:ice2 \r\n");
     try expectWrite(&w, .{ .ice_options = .{ .ice2 = true, .trickle = true } }, "a=ice-options:ice2 trickle \r\n");
+
+    try expectWrite(
+        &w,
+        .{ .ssrc = .{ .id = 4110286963, .attr_key = "cname", .attr_value = "dummy" } },
+        "a=ssrc:4110286963 cname:dummy\r\n",
+    );
 }
