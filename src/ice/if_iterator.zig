@@ -1,19 +1,34 @@
 const std = @import("std");
 const os = @import("builtin").os;
-const c = @import("c");
+
+pub const IFF_LOOPBACK: u32 = 8;
+
+extern fn getifaddrs([*c][*c]IfAddrs) c_int;
+extern fn freeifaddrs([*c]IfAddrs) void;
 
 const posix = std.posix;
 const IfIterator = @This();
 
-ifa: switch (os.tag) {
+const IfAddrs = switch (os.tag) {
     .windows => void,
-    else => [*c]c.ifaddrs,
-},
+    else => extern struct {
+        next: [*c]IfAddrs,
+        name: [*c]u8,
+        flags: u32,
+        addr: [*c]posix.sockaddr,
+    },
+};
 
-pub fn init(iterator: *IfIterator) !void {
+ifa: [*c]IfAddrs,
+
+pub fn init() !IfIterator {
     switch (os.tag) {
-        .windows => {},
-        else => if (c.getifaddrs(&iterator.ifa) != 0) return error.GetIfAddrsFailed,
+        .windows => return {},
+        else => {
+            var it: IfIterator = .{ .ifa = undefined };
+            if (getifaddrs(&it.ifa) != 0) return error.GetIfAddrsFailed;
+            return it;
+        },
     }
 }
 
@@ -26,20 +41,20 @@ pub fn next(it: *IfIterator) ?std.Io.net.IpAddress {
 
 pub fn deinit(iterator: *IfIterator) void {
     switch (os.tag) {
-        .linux => c.ifaddrs.freeifaddrs(iterator.ifa),
-        else => {},
+        .windows => {},
+        else => freeifaddrs(iterator.ifa),
     }
 }
 
 fn nextInterafaceIpAddress(it: *IfIterator) ?std.Io.net.IpAddress {
     while (it.ifa) |ifa| {
-        defer it.ifa = ifa.*.ifa_next;
-        if (ifa.*.ifa_addr == null) continue;
+        defer it.ifa = ifa.*.next;
+        if (ifa.*.addr == null) continue;
 
-        const sockaddr: posix.sockaddr = @bitCast(ifa.*.ifa_addr.*);
+        const sockaddr = ifa.*.addr.*;
         switch (sockaddr.family) {
             posix.AF.INET => {
-                if (ifa.*.ifa_flags & c.IFF_LOOPBACK != 0) continue;
+                if (ifa.*.flags & IFF_LOOPBACK != 0) continue;
 
                 const in: posix.sockaddr.in = @bitCast(sockaddr);
                 return .{ .ip4 = .{ .bytes = std.mem.toBytes(in.addr), .port = 0 } };
