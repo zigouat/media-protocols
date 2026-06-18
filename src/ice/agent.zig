@@ -110,18 +110,8 @@ pub fn init(io: Io, allocator: Allocator, config: AgentConfig) !Agent {
 }
 
 pub fn deinit(agent: *Agent) void {
-    const io = agent.select.io;
-    const allocator = agent.allocator;
-
-    for (agent.sockets) |socket| socket.close(io);
-    allocator.free(agent.sockets);
-
-    agent.candidates.deinit(allocator);
-    agent.remote_candidates.deinit(allocator);
-    agent.pairs.deinit(allocator);
-    agent.pending_requests.deinit(allocator);
-    agent.credentials.deinit(allocator);
-    if (agent.remote_credentials) |*credens| credens.deinit(allocator);
+    agent.closeConnection();
+    agent.credentials.deinit(agent.allocator);
 
     while (agent.select.cancel()) |event| switch (event) {
         .message, .app_data => |message| {
@@ -130,13 +120,18 @@ pub fn deinit(agent: *Agent) void {
         },
         else => {},
     };
-    allocator.free(agent.select_buffer);
-    agent.buffer_pool.deinit(allocator);
+    agent.allocator.free(agent.select_buffer);
+    agent.buffer_pool.deinit(agent.allocator);
 }
 
 /// Poll the next event.
 pub fn poll(agent: *Agent) !Event {
     const io = agent.select.io;
+
+    switch (agent.connection_state) {
+        .failed, .closed => return error.FailedOrClosedAgent,
+        else => {},
+    }
 
     while (agent.select.await()) |event| switch (event) {
         .candidate => |c| return .{ .candidate = c },
@@ -202,6 +197,10 @@ pub fn poll(agent: *Agent) !Event {
             try result;
             agent.markConnectionCompleted();
             return .{ .connection_state = agent.connection_state };
+        },
+        .close => {
+            agent.closeConnection();
+            return .{ .connection_state = .closed };
         },
     } else |err| return err;
 }
@@ -269,6 +268,39 @@ pub fn destroyPacket(agent: *Agent, data: []const u8) void {
     agent.mutex.lockUncancelable(agent.select.io);
     defer agent.mutex.unlock(agent.select.io);
     agent.buffer_pool.destroy(@ptrCast(@alignCast(@constCast(data))));
+}
+
+/// Close the agent connection
+///
+/// This function will only enqueue an event that'll be handled
+/// by the inner queue. The user will get connection state update.
+pub fn close(agent: *Agent) void {
+    agent.select.queue.putOneUncancelable(agent.select.io, .close) catch {};
+}
+
+fn closeConnection(agent: *Agent) void {
+    const allocator = agent.allocator;
+
+    agent.pairs.clearAndFree(allocator);
+    agent.candidates.clearAndFree(allocator);
+    agent.remote_candidates.clearAndFree(allocator);
+    agent.pending_requests.clearAndFree(allocator);
+
+    if (agent.remote_credentials) |*credens| {
+        credens.deinit(allocator);
+        agent.remote_credentials = null;
+    }
+
+    if (agent.nominated_pair) |*pair| {
+        pair.socket.close(agent.select.io);
+        agent.nominated_pair = null;
+    }
+
+    for (agent.sockets) |socket| socket.close(agent.select.io);
+    allocator.free(agent.sockets);
+    agent.sockets = &.{};
+
+    agent.connection_state = .closed;
 }
 
 fn gatherLocalHostsAndInitSockets(agent: *Agent) !void {
@@ -634,6 +666,7 @@ const InnerEvent = union(enum) {
     app_data: Message,
     keep_alive: Io.Cancelable!void,
     candidate: ?Candidate,
+    close: void,
 };
 
 fn receiveTimeout(agent: *Agent, socket: *const Socket, timeout: Io.Timeout) Message {
@@ -730,14 +763,6 @@ fn handleConnectivityCheckMessage(agent: *Agent, message: Message) !?Event {
     const sender = message.incoming_message.from;
     defer if (agent.connection_state != .completed) agent.select.async(.message, receiveTimeout, .{ agent, message.socket, .none });
 
-    switch (agent.connection_state) {
-        .completed => {
-            agent.destroyPacket(data);
-            return null;
-        },
-        else => {},
-    }
-
     if (stun.isMessage(data)) {
         defer agent.destroyPacket(data);
         const msg = try stun.Message.parse(data);
@@ -777,7 +802,7 @@ fn handleConnectivityCheckMessage(agent: *Agent, message: Message) !?Event {
         for (agent.pairs.items) |*candidate_pair| {
             if (candidate_pair.remote.address.eql(&sender)) return .{ .data = data };
         } else {
-            defer agent.destroyPacket(data);
+            agent.destroyPacket(data);
             Logger.warn("Drop non stun message from unknown remote candidate: {f}", .{sender});
         }
     }
@@ -988,4 +1013,32 @@ test "randomNumber" {
     try testing.expect(a != b);
     try testing.expect(b != c);
     try testing.expect(a != c);
+}
+
+test "close" {
+    var agent = try testNewAgent();
+    defer agent.deinit();
+
+    var grp: Io.Group = .init;
+    defer grp.cancel(testing.io);
+
+    const closeAgent = struct {
+        pub fn close(a: *Agent) !void {
+            try a.select.io.sleep(.fromMilliseconds(100), .awake);
+            a.close();
+        }
+    }.close;
+
+    try agent.gatherCandidates();
+    try agent.setRemoteCredentials(.{ .username = "user", .password = "password" });
+
+    try grp.concurrent(testing.io, closeAgent, .{&agent});
+
+    while (agent.poll()) |event| switch (event) {
+        .connection_state => |state| switch (state) {
+            .closed => break,
+            else => {},
+        },
+        else => {},
+    } else |_| return error.FailedTest;
 }
