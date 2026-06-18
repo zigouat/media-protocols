@@ -6,7 +6,7 @@ const posix = std.posix;
 const IfIterator = @This();
 
 ifa: switch (os.tag) {
-    .windows => {},
+    .windows => void,
     else => [*c]c.ifaddrs,
 },
 
@@ -19,7 +19,7 @@ pub fn init(iterator: *IfIterator) !void {
 
 pub fn next(it: *IfIterator) ?std.Io.net.IpAddress {
     return switch (os.tag) {
-        .windows => {},
+        .windows => return null,
         else => it.nextInterafaceIpAddress(),
     };
 }
