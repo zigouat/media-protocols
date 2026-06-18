@@ -308,8 +308,7 @@ fn closeConnection(agent: *Agent) void {
 fn gatherLocalHostsAndInitSockets(agent: *Agent) !void {
     const allocator = agent.allocator;
 
-    var it: IfIterator = undefined;
-    try it.init();
+    var it: IfIterator = try .init();
     defer it.deinit();
 
     var sockets: std.ArrayList(Io.net.Socket) = .empty;
@@ -1043,4 +1042,6 @@ test "close" {
         },
         else => {},
     } else |_| return error.FailedTest;
+
+    try testing.expectError(error.FailedOrClosedAgent, agent.poll());
 }
