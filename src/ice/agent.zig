@@ -112,15 +112,6 @@ pub fn init(io: Io, allocator: Allocator, config: AgentConfig) !Agent {
 pub fn deinit(agent: *Agent) void {
     agent.closeConnection();
     agent.credentials.deinit(agent.allocator);
-
-    while (agent.select.cancel()) |event| switch (event) {
-        .message, .app_data => |message| {
-            if (message.err) |_| continue;
-            agent.destroyPacket(message.incoming_message.data);
-        },
-        else => {},
-    };
-    agent.allocator.free(agent.select_buffer);
     agent.buffer_pool.deinit(agent.allocator);
 }
 
@@ -280,6 +271,17 @@ pub fn close(agent: *Agent) void {
 
 fn closeConnection(agent: *Agent) void {
     const allocator = agent.allocator;
+
+    while (agent.select.cancel()) |event| switch (event) {
+        .message, .app_data => |message| {
+            if (message.err) |_| continue;
+            agent.destroyPacket(message.incoming_message.data);
+        },
+        else => {},
+    };
+    agent.allocator.free(agent.select_buffer);
+    agent.select_buffer = &.{};
+    _ = agent.buffer_pool.reset(agent.allocator, .free_all);
 
     agent.pairs.clearAndFree(allocator);
     agent.candidates.clearAndFree(allocator);
