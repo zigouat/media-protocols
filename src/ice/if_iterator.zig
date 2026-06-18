@@ -22,14 +22,11 @@ const IfAddrs = switch (os.tag) {
 ifa: [*c]IfAddrs,
 
 pub fn init() !IfIterator {
-    switch (os.tag) {
-        .windows => return {},
-        else => {
-            var it: IfIterator = .{ .ifa = undefined };
-            if (getifaddrs(&it.ifa) != 0) return error.GetIfAddrsFailed;
-            return it;
-        },
-    }
+    var it: IfIterator = .{ .ifa = undefined };
+    return switch (os.tag) {
+        .windows => it,
+        else => if (getifaddrs(&it.ifa) == 0) it else error.GetIfAddrsFailed,
+    };
 }
 
 pub fn next(it: *IfIterator) ?std.Io.net.IpAddress {
