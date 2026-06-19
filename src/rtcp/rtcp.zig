@@ -12,6 +12,7 @@ pub const PayloadType = enum(u8) {
     sender_report = 200,
     receiver_report = 201,
     source_description = 202,
+    bye = 203,
     _,
 };
 
@@ -29,10 +30,17 @@ pub const Packet = struct {
         sender_report: SenderReport,
         receiver_report: ReceiverReport,
         source_description: SourceDescription,
+        bye: []const u8,
     },
 
-    pub fn parse(data: []const u8) Reader.Error!Packet {
+    pub const Error = Reader.Error || error{UnknownPayloadType};
+
+    pub fn parse(data: []const u8) Error!Packet {
         var reader = Reader.fixed(data);
+        return parseFromReader(&reader);
+    }
+
+    fn parseFromReader(reader: *Reader) Error!Packet {
         var packet: Packet = undefined;
 
         packet.header = try reader.takeStruct(Header, .big);
@@ -48,7 +56,11 @@ pub const Packet = struct {
                 packet.payload = .{ .receiver_report = .fromSlice(payload, packet.header.rc) };
             },
             .source_description => packet.payload = .{ .source_description = .{ .chunks_bytes = payload } },
-            else => {},
+            .bye => {
+                if (payload.len < packet.header.rc * 4) return error.EndOfStream;
+                packet.payload = .{ .bye = payload };
+            },
+            else => return error.UnknownPayloadType,
         }
 
         return packet;
@@ -133,6 +145,20 @@ pub const ReceptionReport = struct {
             .last_sr = std.mem.readInt(u32, data[16..20], .big),
             .delay = std.mem.readInt(u32, data[20..24], .big),
         };
+    }
+};
+
+/// An iterator over compound rtcp packet.
+pub const Iterator = struct {
+    reader: Reader,
+
+    pub fn init(rtcp: []const u8) Iterator {
+        return .{ .reader = .fixed(rtcp) };
+    }
+
+    pub fn next(it: *Iterator) Packet.Error!?Packet {
+        if (it.reader.bufferedLen() == 0) return null;
+        return try Packet.parseFromReader(&it.reader);
     }
 };
 
@@ -350,31 +376,67 @@ test "Packet: parse source description" {
     try testing.expectEqualSlices(u8, data[4..], packet.payload.source_description.chunks_bytes);
 }
 
-test {
-    const text = "80c80006fd8da53bedcbbbb7316a6a018c6fc86b0000394d00c67a8781ca000cfd8da53b01267b61613131383931632d613639342d343734352d386565322d6561323461366161616632327d00000000";
-    var buffer: [text.len / 2]u8 = undefined;
-    try std.crypto.codecs.hex.decode(&buffer, text);
+test "Compound packet: iterate" {
+    const rtcp = [_]u8{
+        0x80, 0xc8, 0x00, 0x06, 0xb2, 0x39, 0x3f, 0x3f, 0xed, 0xdf, 0x9e,
+        0x71, 0x66, 0xd1, 0x39, 0x43, 0x1b, 0x13, 0x76, 0x14, 0x00, 0x00,
+        0x00, 0x92, 0x00, 0x01, 0xc5, 0x5c, 0x81, 0xca, 0x00, 0x0c, 0xb2,
+        0x39, 0x3f, 0x3f, 0x01, 0x26, 0x7b, 0x64, 0x30, 0x66, 0x35, 0x63,
+        0x66, 0x30, 0x30, 0x2d, 0x36, 0x63, 0x63, 0x37, 0x2d, 0x34, 0x65,
+        0x35, 0x66, 0x2d, 0x61, 0x38, 0x61, 0x30, 0x2d, 0x64, 0x63, 0x36,
+        0x35, 0x39, 0x38, 0x64, 0x66, 0x65, 0x31, 0x61, 0x66, 0x7d, 0x00,
+        0x00, 0x00, 0x00,
+    };
 
-    const packet = try Packet.parse(&buffer);
-    _ = packet;
+    const rtcp2 = [_]u8{
+        0x80, 0xc9, 0x00, 0x01, 0xb2, 0x39, 0x3f, 0x3f, 0x81,
+        0xca, 0x00, 0x0c, 0xb2, 0x39, 0x3f, 0x3f, 0x01, 0x26,
+        0x7b, 0x64, 0x30, 0x66, 0x35, 0x63, 0x66, 0x30, 0x30,
+        0x2d, 0x36, 0x63, 0x63, 0x37, 0x2d, 0x34, 0x65, 0x35,
+        0x66, 0x2d, 0x61, 0x38, 0x61, 0x30, 0x2d, 0x64, 0x63,
+        0x36, 0x35, 0x39, 0x38, 0x64, 0x66, 0x65, 0x31, 0x61,
+        0x66, 0x7d, 0x00, 0x00, 0x00, 0x00, 0x81, 0xcb, 0x00,
+        0x01, 0xb2, 0x39, 0x3f, 0x3f,
+    };
 
-    // var slice: []u8 = &buffer;
+    var it: Iterator = .init(&rtcp);
+    var packet = try it.next();
+    try testing.expect(packet != null);
+    try testing.expectEqual(.sender_report, packet.?.header.payload_type);
 
-    // while (true) {
-    //     const header: Header = @bitCast(std.mem.readInt(u32, slice[0..4], .big));
-    //     std.debug.print("{any}\n", .{header});
+    packet = try it.next();
+    try testing.expect(packet != null);
+    try testing.expectEqual(.source_description, packet.?.header.payload_type);
 
-    //     switch (header.payload_type) {
-    //         .sender_report => {
-    //             const sr = try SenderReport.fromSlice(slice[4 .. (header.length + 1) * 4]);
-    //             std.debug.print("{any}\n", .{sr});
-    //         },
-    //         else => {
-    //             std.debug.print("Unknown payload type: {}\n", .{header.payload_type});
-    //         },
-    //     }
+    var sdes = packet.?.payload.source_description;
+    var chunk_it = sdes.iterateChunks();
+    const chunk = (try chunk_it.next()).?;
+    try std.testing.expect(try chunk_it.next() == null);
 
-    //     slice = slice[(header.length + 1) * 4 ..];
-    //     if (slice.len == 0) break;
-    // }
+    var item_it = chunk.iterateItems();
+    const item = (try item_it.next()).?;
+    try testing.expectEqual(.cname, item.item_type);
+    try testing.expectEqualStrings("{d0f5cf00-6cc7-4e5f-a8a0-dc6598dfe1af}", item.value);
+
+    packet = try it.next();
+    try testing.expect(try it.next() == null);
+    try testing.expect(try it.next() == null);
+
+    // Rtcp2
+    it = .init(&rtcp2);
+
+    packet = try it.next();
+    try testing.expect(packet != null);
+    try testing.expectEqual(.receiver_report, packet.?.header.payload_type);
+
+    packet = try it.next();
+    try testing.expect(packet != null);
+    try testing.expectEqual(.source_description, packet.?.header.payload_type);
+
+    packet = try it.next();
+    try testing.expect(packet != null);
+    try testing.expectEqual(.bye, packet.?.header.payload_type);
+
+    packet = try it.next();
+    try testing.expect(packet == null);
 }
