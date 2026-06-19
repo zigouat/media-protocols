@@ -2,6 +2,10 @@ const std = @import("std");
 
 chunks_bytes: []const u8 = &.{},
 
+pub fn iterateChunks(sdes: *@This()) ChunkIterator {
+    return .init(sdes.chunks_bytes);
+}
+
 pub const ItemType = enum(u8) { cname = 1, name, email, phone, loc, tool, note, priv, mid = 15, _ };
 
 pub const ChunkItem = struct {
