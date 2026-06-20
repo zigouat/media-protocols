@@ -131,7 +131,7 @@ pub fn poll(agent: *Agent) !Event {
             switch (agent.connection_state) {
                 .completed, .failed, .closed => {},
                 else => {
-                    agent.select.async(.connectivity_check, Io.sleep, .{ io, connectivity_check_interval, .awake });
+                    try agent.select.concurrent(.connectivity_check, Io.sleep, .{ io, connectivity_check_interval, .awake });
                     agent.batchSendConnectivityCheck() catch |err| Logger.err("connectivity check failed due to {}", .{err});
                 },
             }
@@ -154,7 +154,7 @@ pub fn poll(agent: *Agent) !Event {
             if (message.err) |err| switch (err) {
                 error.Timeout => switch (agent.connection_state) {
                     .connected, .completed => {
-                        agent.select.async(.app_data, receiveTimeout, .{ agent, message.socket, .{ .duration = failing_timeout } });
+                        try agent.select.concurrent(.app_data, receiveTimeout, .{ agent, message.socket, .{ .duration = failing_timeout } });
                         agent.setConnectionState(.disconnected);
                         return .{ .connection_state = agent.connection_state };
                     },
@@ -166,7 +166,7 @@ pub fn poll(agent: *Agent) !Event {
                 },
                 else => |e| return e,
             };
-            agent.select.async(.app_data, receiveTimeout, .{ agent, message.socket, .{ .duration = disconnect_timeout } });
+            try agent.select.concurrent(.app_data, receiveTimeout, .{ agent, message.socket, .{ .duration = disconnect_timeout } });
 
             if (stun.isMessage(message.incoming_message.data)) {
                 defer agent.destroyPacket(message.incoming_message.data);
@@ -175,7 +175,7 @@ pub fn poll(agent: *Agent) !Event {
         },
         .keep_alive => |timeout| {
             try timeout;
-            agent.select.async(.keep_alive, Io.sleep, .{ io, keep_alive_interval, .awake });
+            try agent.select.concurrent(.keep_alive, Io.sleep, .{ io, keep_alive_interval, .awake });
 
             const buffer = try agent.createPacket();
             defer agent.destroyPacket(buffer);
@@ -209,7 +209,11 @@ pub fn setRemoteCredentials(agent: *Agent, credentials: ice.Credentials) !void {
         .new => {
             const credens = try credentials.dupe(agent.allocator);
             if (agent.remote_credentials == null) {
-                agent.select.async(.connectivity_check, Io.sleep, .{ agent.select.io, connectivity_check_interval, .awake });
+                try agent.select.concurrent(
+                    .connectivity_check,
+                    Io.sleep,
+                    .{ agent.select.io, connectivity_check_interval, .awake },
+                );
             }
             agent.remote_credentials = credens;
             agent.setConnectionState(.checking);
@@ -237,7 +241,7 @@ pub fn gatherCandidates(agent: *Agent) !void {
         try agent.select.queue.putOneUncancelable(agent.select.io, .{ .candidate = candidate });
     try agent.select.queue.putOneUncancelable(agent.select.io, .{ .candidate = null });
 
-    for (agent.sockets) |*socket| agent.select.async(.message, receiveTimeout, .{ agent, socket, .none });
+    for (agent.sockets) |*socket| try agent.select.concurrent(.message, receiveTimeout, .{ agent, socket, .none });
     agent.gathering_state = .complete;
 }
 
@@ -294,7 +298,7 @@ fn closeConnection(agent: *Agent) void {
     }
 
     if (agent.nominated_pair) |*pair| {
-        pair.socket.close(agent.select.io);
+        if (agent.sockets.len == 0) pair.socket.close(agent.select.io);
         agent.nominated_pair = null;
     }
 
@@ -762,7 +766,13 @@ fn batchSendConnectivityCheck(agent: *Agent) !void {
 fn handleConnectivityCheckMessage(agent: *Agent, message: Message) !?Event {
     const data = message.incoming_message.data;
     const sender = message.incoming_message.from;
-    defer if (agent.connection_state != .completed) agent.select.async(.message, receiveTimeout, .{ agent, message.socket, .none });
+    defer if (agent.connection_state != .completed) {
+        agent.select.concurrent(
+            .message,
+            receiveTimeout,
+            .{ agent, message.socket, .none },
+        ) catch {};
+    };
 
     if (stun.isMessage(data)) {
         defer agent.destroyPacket(data);
@@ -794,9 +804,9 @@ fn handleConnectivityCheckMessage(agent: *Agent, message: Message) !?Event {
         if (agent.nominated_pair != null and agent.connection_state != .connected) {
             agent.setConnectionState(.connected);
 
-            agent.select.async(.complete, Io.sleep, .{ agent.select.io, .fromSeconds(3), .awake });
-            agent.select.async(.keep_alive, Io.sleep, .{ agent.select.io, keep_alive_interval, .awake });
-            agent.select.async(.app_data, receiveTimeout, .{ agent, &agent.nominated_pair.?.socket, .{ .duration = disconnect_timeout } });
+            try agent.select.concurrent(.complete, Io.sleep, .{ agent.select.io, .fromSeconds(3), .awake });
+            try agent.select.concurrent(.keep_alive, Io.sleep, .{ agent.select.io, keep_alive_interval, .awake });
+            try agent.select.concurrent(.app_data, receiveTimeout, .{ agent, &agent.nominated_pair.?.socket, .{ .duration = disconnect_timeout } });
             return .{ .connection_state = agent.connection_state };
         }
     } else {
