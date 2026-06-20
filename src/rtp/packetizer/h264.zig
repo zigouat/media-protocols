@@ -11,6 +11,10 @@ pub const InitConfig = struct {
     seq_number: ?u16 = null,
 };
 
+ssrc: u32,
+payload_type: u7,
+seq_number: u16,
+
 const FuState = struct {
     nalu: []const u8,
     first_byte: u8,
@@ -45,14 +49,6 @@ const FuState = struct {
     }
 };
 
-ssrc: u32,
-payload_type: u7,
-seq_number: u16,
-packet: ?*const media.Packet = null,
-fu_state: ?FuState = null,
-// current pos in the access unit buffer
-pos: usize = 0,
-
 pub fn init(io: std.Io, config: InitConfig) Packetizer {
     const timestamp: u64 = @bitCast(std.Io.Clock.now(.awake, io).toMilliseconds());
     var rand = std.Random.DefaultPrng.init(timestamp);
@@ -64,50 +60,8 @@ pub fn init(io: std.Io, config: InitConfig) Packetizer {
     };
 }
 
-pub fn consume(packetizer: *Packetizer, packet: *const media.Packet) void {
-    packetizer.packet = packet;
-    packetizer.pos = 0;
-    packetizer.fu_state = null;
-}
-
-pub fn next(packetizer: *Packetizer, out: []u8) !?Packet {
-    if (packetizer.packet) |packet| {
-        @branchHint(.likely);
-        errdefer packetizer.pos = 0;
-        const timestamp: u32 = @intCast(@rem(packet.pts, max_timestamp));
-
-        if (packetizer.fu_state) |*fu_state| {
-            const payload = fu_state.next(out);
-
-            var marker = false;
-            if (fu_state.empty()) {
-                packetizer.fu_state = null;
-                marker = packetizer.pos == packet.data.len;
-                if (marker) packetizer.clearPacket();
-            }
-
-            return packetizer.newRtpPacket(marker, timestamp, payload);
-        }
-
-        var reader: std.Io.Reader = .fixed(packet.data[packetizer.pos..]);
-        const nalu_size = try reader.takeInt(u32, .big);
-        const nalu = try reader.take(nalu_size);
-        defer packetizer.pos += nalu_size + 4;
-
-        if (nalu_size > out.len) {
-            // FU unit
-            packetizer.fu_state = .init(nalu);
-            const payload = packetizer.fu_state.?.next(out);
-            return packetizer.newRtpPacket(false, timestamp, payload);
-        }
-
-        // Single nalu
-        const marker = reader.seek == reader.end;
-        if (marker) packetizer.clearPacket();
-        return packetizer.newRtpPacket(marker, timestamp, nalu);
-    }
-
-    return null;
+pub fn packetize(packetizer: *Packetizer, packet: *const media.Packet) Iterator {
+    return .{ .packetizer = packetizer, .packet = packet };
 }
 
 fn newRtpPacket(packetizer: *Packetizer, marker: bool, timestamp: u32, payload: []const u8) Packet {
@@ -128,10 +82,46 @@ fn newRtpPacket(packetizer: *Packetizer, marker: bool, timestamp: u32, payload: 
     };
 }
 
-fn clearPacket(packetizer: *Packetizer) void {
-    packetizer.packet = null;
-    packetizer.pos = 0;
-}
+pub const Iterator = struct {
+    packetizer: *Packetizer,
+    packet: *const media.Packet,
+    fu_state: ?FuState = null,
+    pos: usize = 0,
+    marker: bool = false,
+
+    pub fn next(it: *Iterator, out: []u8) !?Packet {
+        if (it.marker) return null;
+
+        const timestamp: u32 = @intCast(@rem(it.packet.pts, max_timestamp));
+
+        if (it.fu_state) |*fu_state| {
+            const payload = fu_state.next(out);
+
+            if (fu_state.empty()) {
+                it.fu_state = null;
+                it.marker = it.pos == it.packet.data.len;
+            }
+
+            return it.packetizer.newRtpPacket(it.marker, timestamp, payload);
+        }
+
+        var reader: std.Io.Reader = .fixed(it.packet.data[it.pos..]);
+        const nalu_size = try reader.takeInt(u32, .big);
+        const nalu = try reader.take(nalu_size);
+        defer it.pos += nalu_size + 4;
+
+        if (nalu_size > out.len) {
+            // FU unit
+            it.fu_state = .init(nalu);
+            const payload = it.fu_state.?.next(out);
+            return it.packetizer.newRtpPacket(false, timestamp, payload);
+        }
+
+        // Single nalu
+        it.marker = reader.seek == reader.end;
+        return it.packetizer.newRtpPacket(it.marker, timestamp, nalu);
+    }
+};
 
 test "h264 packetizer: single nalu" {
     var packetizer: Packetizer = .init(std.testing.io, .{
@@ -150,9 +140,9 @@ test "h264 packetizer: single nalu" {
     var media_packet: media.Packet = .fromSlice(&avc_data);
     media_packet.pts = 90000;
 
-    packetizer.consume(&media_packet);
+    var it = packetizer.packetize(&media_packet);
 
-    const first = try packetizer.next(&out) orelse return error.TestUnexpectedNull;
+    const first = try it.next(&out) orelse return error.TestUnexpectedNull;
     try std.testing.expectEqual(96, first.header.payload_type);
     try std.testing.expectEqual(0xDEADBEEF, first.header.ssrc);
     try std.testing.expectEqual(1000, first.header.sequence_number);
@@ -160,7 +150,7 @@ test "h264 packetizer: single nalu" {
     try std.testing.expect(!first.header.marker);
     try std.testing.expectEqualSlices(u8, &nalu1, first.payload);
 
-    const second = try packetizer.next(&out) orelse return error.TestUnexpectedNull;
+    const second = try it.next(&out) orelse return error.TestUnexpectedNull;
     try std.testing.expectEqual(96, second.header.payload_type);
     try std.testing.expectEqual(0xDEADBEEF, second.header.ssrc);
     try std.testing.expectEqual(1001, second.header.sequence_number);
@@ -170,7 +160,7 @@ test "h264 packetizer: single nalu" {
 
     try std.testing.expectEqual(1002, packetizer.seq_number);
 
-    try std.testing.expectEqual(null, try packetizer.next(&out));
+    try std.testing.expectEqual(null, try it.next(&out));
 }
 
 test "h264 packetizer: fu-a fragmentation" {
@@ -191,9 +181,9 @@ test "h264 packetizer: fu-a fragmentation" {
 
     var media_packet: media.Packet = .fromSlice(&avc_data);
     media_packet.pts = 180_000;
-    packetizer.consume(&media_packet);
+    var it = packetizer.packetize(&media_packet);
 
-    var packet = try packetizer.next(out[0..1400]) orelse unreachable;
+    var packet = try it.next(out[0..1400]) orelse unreachable;
     try std.testing.expectEqual(2000, packet.header.sequence_number);
     try std.testing.expectEqual(180_000, packet.header.timestamp);
     try std.testing.expect(!packet.header.marker);
@@ -205,7 +195,7 @@ test "h264 packetizer: fu-a fragmentation" {
         idx +%= 1;
     }
 
-    packet = try packetizer.next(out[0..1350]) orelse unreachable;
+    packet = try it.next(out[0..1350]) orelse unreachable;
     try std.testing.expectEqual(2001, packet.header.sequence_number);
     try std.testing.expectEqual(180_000, packet.header.timestamp);
     try std.testing.expect(!packet.header.marker);
@@ -216,7 +206,7 @@ test "h264 packetizer: fu-a fragmentation" {
         idx +%= 1;
     }
 
-    packet = try packetizer.next(out[0..1000]) orelse unreachable;
+    packet = try it.next(out[0..1000]) orelse unreachable;
     try std.testing.expectEqual(2002, packet.header.sequence_number);
     try std.testing.expectEqual(180_000, packet.header.timestamp);
     try std.testing.expect(packet.header.marker);
@@ -227,5 +217,5 @@ test "h264 packetizer: fu-a fragmentation" {
         idx +%= 1;
     }
 
-    try std.testing.expectEqual(null, try packetizer.next(&out));
+    try std.testing.expectEqual(null, try it.next(&out));
 }
