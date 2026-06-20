@@ -90,11 +90,12 @@ const PendingRequest = struct {
 };
 
 pub fn init(io: Io, allocator: Allocator, config: AgentConfig) !Agent {
-    const credens =
+    var credens =
         try if (config.credentials) |credens|
             credens.dupe(allocator)
         else
             ice.Credentials.generate(io, allocator);
+    errdefer credens.deinit(allocator);
 
     const select_buffer = try allocator.alloc(InnerEvent, 10);
 
@@ -875,8 +876,18 @@ fn testBuildRequest(req: StunRequest, peer_password: []const u8, buffer: []u8) !
 }
 
 test "init agent" {
-    var agent: Agent = try .init(testing.io, testing.allocator, .{});
-    defer agent.deinit();
+    {
+        var agent: Agent = try .init(testing.io, testing.allocator, .{});
+        defer agent.deinit();
+    }
+
+    {
+        var failing_alloc = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 2 });
+        try testing.expectError(
+            error.OutOfMemory,
+            Agent.init(testing.io, failing_alloc.allocator(), .{}),
+        );
+    }
 }
 
 test "handle request: generate success response" {
