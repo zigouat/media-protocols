@@ -313,8 +313,8 @@ fn closeConnection(agent: *Agent) void {
 fn gatherLocalHostsAndInitSockets(agent: *Agent) !void {
     const allocator = agent.allocator;
 
-    var it: IfIterator = try .init();
-    defer it.deinit();
+    var it: IfIterator = try .init(agent.allocator);
+    defer it.deinit(agent.allocator);
 
     var sockets: std.ArrayList(Io.net.Socket) = .empty;
     errdefer {
