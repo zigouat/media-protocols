@@ -130,7 +130,7 @@ pub fn poll(agent: *Agent) !Event {
 
     while (agent.queue.getOne(io)) |event| switch (event) {
         .candidate => |c| return .{ .candidate = c },
-        .connectivity_check => agent.batchSendConnectivityCheck() catch |err| Logger.err("connectivity check failed due to {}", .{err}),
+        .connectivity_check => agent.batchSendConnectivityCheck() catch |err| logError("connectivity check failed due to {}", .{err}),
         .message => |message| {
             const maybe_event = agent.handleConnectivityCheckMessage(message) catch |err| switch (err) {
                 error.Canceled => return error.Canceled,
@@ -664,7 +664,7 @@ fn receive(agent: *Agent, socket: *const Socket) !void {
                 error.Timeout => continue,
                 error.Canceled => return error.Canceled,
                 else => |e| {
-                    Logger.err("Error when listening: {}", .{e});
+                    logError("Error when listening: {}", .{e});
                     return;
                 },
             }
@@ -700,7 +700,7 @@ fn receiveAppData(agent: *Agent, socket: *const Socket) !void {
                 },
                 error.Canceled => return error.Canceled,
                 else => |e| {
-                    Logger.err("Error when listening: {}", .{e});
+                    logError("Error when listening: {}", .{e});
                     return;
                 },
             }
@@ -877,6 +877,15 @@ fn markConnectionCompleted(agent: *Agent, timeout: Io.Duration) !void {
     agent.setConnectionState(.completed);
 
     try agent.putInQueue(.{ .connection_state = .completed });
+}
+
+const builtin = @import("builtin");
+fn logError(comptime fmt: []const u8, args: anytype) void {
+    if (!builtin.is_test) {
+        Logger.err(fmt, args);
+    } else {
+        Logger.warn(fmt, args);
+    }
 }
 
 const testing = std.testing;
