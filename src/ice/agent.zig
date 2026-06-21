@@ -20,6 +20,7 @@ const keep_alive_interval: std.Io.Duration = .fromSeconds(4);
 const disconnect_timeout: Io.Clock.Duration = .{ .clock = .awake, .raw = .fromSeconds(5) };
 const failing_timeout: Io.Clock.Duration = .{ .clock = .awake, .raw = .fromSeconds(25) };
 
+io: Io,
 allocator: Allocator,
 buffer_pool: std.heap.MemoryPool([max_message_size]u8),
 connection_state: ice.ConnectionState = .new,
@@ -44,8 +45,9 @@ selected_pair: ?SelectedPair = null,
 nominated_pair: ?SelectedPair = null,
 
 mutex: Io.Mutex = .init,
-select_buffer: []InnerEvent,
-select: Select,
+group: Io.Group = .init,
+queue_buffer: []InnerEvent,
+queue: Io.Queue(InnerEvent),
 
 pub const AgentConfig = struct {
     /// Local credentials of the agent (ufrag and password)
@@ -97,16 +99,17 @@ pub fn init(io: Io, allocator: Allocator, config: AgentConfig) !Agent {
             ice.Credentials.generate(io, allocator);
     errdefer credens.deinit(allocator);
 
-    const select_buffer = try allocator.alloc(InnerEvent, 10);
+    const queue_buffer = try allocator.alloc(InnerEvent, 10);
 
     return .{
+        .io = io,
         .allocator = allocator,
         .buffer_pool = .empty,
         .role = config.role,
         .tie_breaker = randomNumber(u64, io),
         .credentials = credens,
-        .select_buffer = select_buffer,
-        .select = .init(io, select_buffer),
+        .queue_buffer = queue_buffer,
+        .queue = .init(queue_buffer),
     };
 }
 
@@ -118,31 +121,17 @@ pub fn deinit(agent: *Agent) void {
 
 /// Poll the next event.
 pub fn poll(agent: *Agent) !Event {
-    const io = agent.select.io;
+    const io = agent.io;
 
     switch (agent.connection_state) {
         .failed, .closed => return error.FailedOrClosedAgent,
         else => {},
     }
 
-    while (agent.select.await()) |event| switch (event) {
+    while (agent.queue.getOne(io)) |event| switch (event) {
         .candidate => |c| return .{ .candidate = c },
-        .connectivity_check => |timeout| {
-            try timeout;
-            switch (agent.connection_state) {
-                .completed, .failed, .closed => {},
-                else => {
-                    try agent.select.concurrent(.connectivity_check, Io.sleep, .{ io, connectivity_check_interval, .awake });
-                    agent.batchSendConnectivityCheck() catch |err| Logger.err("connectivity check failed due to {}", .{err});
-                },
-            }
-        },
+        .connectivity_check => agent.batchSendConnectivityCheck() catch |err| logError("connectivity check failed due to {}", .{err}),
         .message => |message| {
-            if (message.err) |err| switch (err) {
-                error.Canceled => return error.Canceled,
-                else => continue,
-            };
-
             const maybe_event = agent.handleConnectivityCheckMessage(message) catch |err| switch (err) {
                 error.Canceled => return error.Canceled,
                 error.SwitchRole => return error.SwitchRole, // TODO: switch role
@@ -151,45 +140,8 @@ pub fn poll(agent: *Agent) !Event {
 
             if (maybe_event) |ev| return ev;
         },
-        .app_data => |message| {
-            if (message.err) |err| switch (err) {
-                error.Timeout => switch (agent.connection_state) {
-                    .connected, .completed => {
-                        try agent.select.concurrent(.app_data, receiveTimeout, .{ agent, message.socket, .{ .duration = failing_timeout } });
-                        agent.setConnectionState(.disconnected);
-                        return .{ .connection_state = agent.connection_state };
-                    },
-                    .disconnected => {
-                        agent.setConnectionState(.failed);
-                        return .{ .connection_state = agent.connection_state };
-                    },
-                    else => unreachable,
-                },
-                else => |e| return e,
-            };
-            try agent.select.concurrent(.app_data, receiveTimeout, .{ agent, message.socket, .{ .duration = disconnect_timeout } });
-
-            if (stun.isMessage(message.incoming_message.data)) {
-                defer agent.destroyPacket(message.incoming_message.data);
-                agent.handleConsentFreshness(message) catch continue;
-            } else return .{ .data = message.incoming_message.data };
-        },
-        .keep_alive => |timeout| {
-            try timeout;
-            try agent.select.concurrent(.keep_alive, Io.sleep, .{ io, keep_alive_interval, .awake });
-
-            const buffer = try agent.createPacket();
-            defer agent.destroyPacket(buffer);
-
-            const req = try agent.buildBindingRequest(randomNumber(u96, io), false, buffer);
-            const selected_pair = &agent.nominated_pair.?;
-            try selected_pair.socket.send(agent.select.io, &selected_pair.pair.remote.address, req);
-        },
-        .complete => |result| {
-            try result;
-            agent.markConnectionCompleted();
-            return .{ .connection_state = agent.connection_state };
-        },
+        .app_data => |data| return .{ .data = data },
+        .connection_state => |state| return .{ .connection_state = state },
         .close => {
             agent.closeConnection();
             return .{ .connection_state = .closed };
@@ -210,11 +162,7 @@ pub fn setRemoteCredentials(agent: *Agent, credentials: ice.Credentials) !void {
         .new => {
             const credens = try credentials.dupe(agent.allocator);
             if (agent.remote_credentials == null) {
-                try agent.select.concurrent(
-                    .connectivity_check,
-                    Io.sleep,
-                    .{ agent.select.io, connectivity_check_interval, .awake },
-                );
+                try agent.group.concurrent(agent.io, connectivityCheck, .{ agent, connectivity_check_interval });
             }
             agent.remote_credentials = credens;
             agent.setConnectionState(.checking);
@@ -239,30 +187,32 @@ pub fn gatherCandidates(agent: *Agent) !void {
     try agent.gatherLocalHostsAndInitSockets();
 
     for (agent.candidates.items) |candidate|
-        try agent.select.queue.putOneUncancelable(agent.select.io, .{ .candidate = candidate });
-    try agent.select.queue.putOneUncancelable(agent.select.io, .{ .candidate = null });
+        try agent.queue.putOne(agent.io, .{ .candidate = candidate });
+    try agent.queue.putOne(agent.io, .{ .candidate = null });
 
-    for (agent.sockets) |*socket| try agent.select.concurrent(.message, receiveTimeout, .{ agent, socket, .none });
+    for (agent.sockets) |*socket| {
+        try agent.group.concurrent(agent.io, receive, .{ agent, socket });
+    }
     agent.gathering_state = .complete;
 }
 
 pub fn sendData(agent: *const Agent, data: []const u8) Socket.SendError!void {
     switch (agent.connection_state) {
-        .connected, .completed => try agent.nominated_pair.?.sendData(agent.select.io, data),
+        .connected, .completed => try agent.nominated_pair.?.sendData(agent.io, data),
         else => Logger.warn("Agent not connected: ignore send request", .{}),
     }
 }
 
 pub fn createPacket(agent: *Agent) ![]u8 {
-    agent.mutex.lockUncancelable(agent.select.io);
-    defer agent.mutex.unlock(agent.select.io);
+    agent.mutex.lockUncancelable(agent.io);
+    defer agent.mutex.unlock(agent.io);
     return try agent.buffer_pool.create(agent.allocator);
 }
 
 /// Free the buffer and return it to the pool.
 pub fn destroyPacket(agent: *Agent, data: []const u8) void {
-    agent.mutex.lockUncancelable(agent.select.io);
-    defer agent.mutex.unlock(agent.select.io);
+    agent.mutex.lockUncancelable(agent.io);
+    defer agent.mutex.unlock(agent.io);
     agent.buffer_pool.destroy(@ptrCast(@alignCast(@constCast(data))));
 }
 
@@ -271,21 +221,16 @@ pub fn destroyPacket(agent: *Agent, data: []const u8) void {
 /// This function will only enqueue an event that'll be handled
 /// by the inner queue. The user will get connection state update.
 pub fn close(agent: *Agent) void {
-    agent.select.queue.putOneUncancelable(agent.select.io, .close) catch {};
+    agent.queue.putOneUncancelable(agent.io, .close) catch {};
 }
 
 fn closeConnection(agent: *Agent) void {
     const allocator = agent.allocator;
 
-    while (agent.select.cancel()) |event| switch (event) {
-        .message, .app_data => |message| {
-            if (message.err) |_| continue;
-            agent.destroyPacket(message.incoming_message.data);
-        },
-        else => {},
-    };
-    agent.allocator.free(agent.select_buffer);
-    agent.select_buffer = &.{};
+    agent.group.cancel(agent.io);
+    allocator.free(agent.queue_buffer);
+    agent.queue_buffer = &.{};
+
     _ = agent.buffer_pool.reset(agent.allocator, .free_all);
 
     agent.pairs.clearAndFree(allocator);
@@ -299,11 +244,14 @@ fn closeConnection(agent: *Agent) void {
     }
 
     if (agent.nominated_pair) |*pair| {
-        if (agent.sockets.len == 0) pair.socket.close(agent.select.io);
+        if (agent.sockets.len == 0) pair.socket.close(agent.io);
         agent.nominated_pair = null;
     }
 
-    for (agent.sockets) |socket| socket.close(agent.select.io);
+    switch (agent.connection_state) {
+        .completed, .failed, .disconnected => {},
+        else => for (agent.sockets) |socket| socket.close(agent.io),
+    }
     allocator.free(agent.sockets);
     agent.sockets = &.{};
 
@@ -318,13 +266,13 @@ fn gatherLocalHostsAndInitSockets(agent: *Agent) !void {
 
     var sockets: std.ArrayList(Io.net.Socket) = .empty;
     errdefer {
-        for (sockets.items) |*socket| socket.close(agent.select.io);
+        for (sockets.items) |*socket| socket.close(agent.io);
         sockets.deinit(allocator);
     }
 
     while (it.next()) |addr| {
         var candidate: Candidate = .initHost(addr);
-        const socket = candidate.address.bind(agent.select.io, .{ .mode = .dgram }) catch |err| {
+        const socket = candidate.address.bind(agent.io, .{ .mode = .dgram }) catch |err| {
             Logger.warn("Could not bind address {f}: {}", .{ addr, err });
             continue;
         };
@@ -354,8 +302,8 @@ fn randomNumber(T: type, io: Io) T {
 }
 
 fn doAddRemoteCandidate(agent: *Agent, remote_candidate: Candidate) Allocator.Error!void {
-    agent.mutex.lockUncancelable(agent.select.io);
-    defer agent.mutex.unlock(agent.select.io);
+    agent.mutex.lockUncancelable(agent.io);
+    defer agent.mutex.unlock(agent.io);
     try agent.remote_candidates.append(agent.allocator, remote_candidate);
 
     outer_loop: for (agent.candidates.items) |candidate| {
@@ -372,8 +320,8 @@ fn doAddRemoteCandidate(agent: *Agent, remote_candidate: Candidate) Allocator.Er
 }
 
 fn doAddLocalCandidate(agent: *Agent, local_candidate: Candidate) Allocator.Error!void {
-    agent.mutex.lockUncancelable(agent.select.io);
-    defer agent.mutex.unlock(agent.select.io);
+    agent.mutex.lockUncancelable(agent.io);
+    defer agent.mutex.unlock(agent.io);
 
     try agent.candidates.append(agent.allocator, local_candidate);
 
@@ -457,8 +405,8 @@ fn handleSuccessResponse(agent: *Agent, msg: *const stun.Message, base_addr: IpA
 
         const local_candidate = agent.findLocalCandidate(&base_addr, &mapped_address) orelse blk: {
             const prflx_candidate: Candidate = .initPeerReflexive(base_addr, mapped_address);
-            try agent.mutex.lock(agent.select.io);
-            defer agent.mutex.unlock(agent.select.io);
+            try agent.mutex.lock(agent.io);
+            defer agent.mutex.unlock(agent.io);
             try agent.candidates.append(agent.allocator, prflx_candidate);
             break :blk prflx_candidate;
         };
@@ -651,53 +599,142 @@ fn setConnectionState(agent: *Agent, new_state: ice.ConnectionState) void {
 }
 
 fn appendCandidatePair(agent: *Agent, candidate_pair: CandidatePair) !void {
-    agent.mutex.lockUncancelable(agent.select.io);
-    defer agent.mutex.unlock(agent.select.io);
+    agent.mutex.lockUncancelable(agent.io);
+    defer agent.mutex.unlock(agent.io);
     try agent.pairs.append(agent.allocator, candidate_pair);
 }
 
 // ============== Io related functions ======================
-const MessageError = (Allocator.Error || Socket.ReceiveTimeoutError);
-
 const Message = struct {
     socket: *const Socket,
     incoming_message: Io.net.IncomingMessage,
-    err: ?MessageError = null,
 };
 
 const InnerEvent = union(enum) {
     message: Message,
-    connectivity_check: Io.Cancelable!void,
-    complete: Io.Cancelable!void,
-    app_data: Message,
-    keep_alive: Io.Cancelable!void,
+    connectivity_check: void,
+    app_data: []const u8,
     candidate: ?Candidate,
     close: void,
+    connection_state: ice.ConnectionState,
 };
 
-fn receiveTimeout(agent: *Agent, socket: *const Socket, timeout: Io.Timeout) Message {
-    var result: Message = .{
-        .socket = socket,
-        .incoming_message = undefined,
-    };
-
-    const buffer = agent.createPacket() catch |err| {
-        result.err = err;
-        return result;
-    };
-
-    result.incoming_message = socket.receiveTimeout(agent.select.io, buffer, timeout) catch |err| {
-        agent.destroyPacket(buffer);
-        result.err = err;
-        return result;
-    };
-
-    return result;
+fn connectivityCheck(agent: *Agent, timeout: Io.Duration) !void {
+    while (true) {
+        switch (agent.connection_state) {
+            .completed, .failed, .closed => return,
+            else => {
+                try agent.io.sleep(timeout, .awake);
+                try agent.putInQueue(.{ .connectivity_check = {} });
+            },
+        }
+    }
 }
 
-fn send(agent: *Agent, socket: *const Socket, address: *const IpAddress, buffer: []const u8) (Allocator.Error || Socket.SendError)!void {
+fn receive(agent: *Agent, socket: *const Socket) !void {
+    const io = agent.io;
+    const timeout: Io.Timeout = .{ .duration = .{ .clock = .awake, .raw = .fromSeconds(2) } };
+
+    while (true) {
+        switch (agent.connection_state) {
+            .completed => {
+                if (agent.nominated_pair.?.socket.address.eql(&socket.address))
+                    agent.group.concurrent(io, receiveAppData, .{ agent, socket }) catch return
+                else
+                    socket.close(io);
+                return;
+            },
+            .failed, .closed => {
+                socket.close(io);
+                return;
+            },
+            else => {},
+        }
+
+        var result: Message = .{ .socket = socket, .incoming_message = undefined };
+
+        const buffer = agent.createPacket() catch return;
+
+        result.incoming_message = socket.receiveTimeout(agent.io, buffer, timeout) catch |err| {
+            agent.destroyPacket(buffer);
+
+            switch (err) {
+                // We provide timeout to allow checking the agent status to close this socket
+                // if it's no longer needed
+                error.Timeout => continue,
+                error.Canceled => return error.Canceled,
+                else => |e| {
+                    logError("Error when listening: {}", .{e});
+                    return;
+                },
+            }
+        };
+
+        try agent.putInQueue(.{ .message = result });
+    }
+}
+
+fn receiveAppData(agent: *Agent, socket: *const Socket) !void {
+    var timeout: Io.Timeout = .{ .duration = disconnect_timeout };
+
+    while (true) {
+        const buffer = agent.createPacket() catch return;
+
+        const incoming_message = socket.receiveTimeout(agent.io, buffer, timeout) catch |err| {
+            agent.destroyPacket(buffer);
+
+            switch (err) {
+                error.Timeout => switch (agent.connection_state) {
+                    .connected, .completed => {
+                        agent.setConnectionState(.disconnected);
+                        try agent.putInQueue(.{ .connection_state = .disconnected });
+                        timeout = .{ .duration = failing_timeout };
+                        continue;
+                    },
+                    .disconnected => {
+                        agent.setConnectionState(.failed);
+                        try agent.putInQueue(.{ .connection_state = .failed });
+                        return;
+                    },
+                    else => return,
+                },
+                error.Canceled => return error.Canceled,
+                else => |e| {
+                    logError("Error when listening: {}", .{e});
+                    return;
+                },
+            }
+        };
+
+        if (stun.isMessage(incoming_message.data)) {
+            defer agent.destroyPacket(incoming_message.data);
+            agent.handleConsentFreshness(incoming_message) catch continue;
+        } else try agent.putInQueue(.{ .app_data = incoming_message.data });
+    }
+}
+
+fn keepAlive(agent: *Agent, timeout: Io.Duration) !void {
+    const io = agent.io;
+    while (true) {
+        try io.sleep(timeout, .awake);
+        agent.sendConsentFreshness() catch return;
+    }
+}
+
+fn sendConsentFreshness(agent: *Agent) !void {
+    const buffer = try agent.createPacket();
     defer agent.destroyPacket(buffer);
-    try socket.send(agent.select.io, address, buffer);
+
+    const req = try agent.buildBindingRequest(randomNumber(u96, agent.io), false, buffer);
+    const selected_pair = &agent.nominated_pair.?;
+    try selected_pair.socket.send(agent.io, &selected_pair.pair.remote.address, req);
+}
+
+fn putInQueue(agent: *Agent, event: InnerEvent) !void {
+    agent.queue.putOne(agent.io, event) catch |in_err| switch (in_err) {
+        error.Canceled => return error.Canceled,
+        else => {},
+    };
 }
 
 fn selectBestPair(agent: *Agent) ?SelectedPair {
@@ -725,7 +762,7 @@ fn batchSendConnectivityCheck(agent: *Agent) !void {
     if (agent.selected_pair) |selected_pair| {
         Logger.debug("Send binding request with use candidate on pair: {f}", .{selected_pair.pair});
 
-        const transaction_id = randomNumber(u96, agent.select.io);
+        const transaction_id = randomNumber(u96, agent.io);
         const msg = try agent.buildBindingRequest(transaction_id, true, buffer);
 
         try agent.pending_requests.append(agent.allocator, .{
@@ -734,7 +771,7 @@ fn batchSendConnectivityCheck(agent: *Agent) !void {
             .target = selected_pair.pair.remote.address,
         });
 
-        try selected_pair.sendData(agent.select.io, msg);
+        try selected_pair.sendData(agent.io, msg);
     }
 
     for (agent.pairs.items) |*candidate_pair| switch (candidate_pair.status) {
@@ -745,7 +782,7 @@ fn batchSendConnectivityCheck(agent: *Agent) !void {
                 continue;
             }
 
-            const transaction_id = randomNumber(u96, agent.select.io);
+            const transaction_id = randomNumber(u96, agent.io);
             const msg = try agent.buildBindingRequest(transaction_id, false, buffer);
 
             try agent.pending_requests.append(agent.allocator, .{
@@ -756,7 +793,7 @@ fn batchSendConnectivityCheck(agent: *Agent) !void {
 
             const socket = findSocket(agent.sockets, &candidate_pair.local.base);
             Logger.debug("Send request: {f}", .{candidate_pair});
-            socket.send(agent.select.io, &candidate_pair.remote.address, msg) catch |err| {
+            socket.send(agent.io, &candidate_pair.remote.address, msg) catch |err| {
                 Logger.warn("Failed to send binding request on pair {f}: {}", .{ candidate_pair, err });
             };
         },
@@ -767,13 +804,6 @@ fn batchSendConnectivityCheck(agent: *Agent) !void {
 fn handleConnectivityCheckMessage(agent: *Agent, message: Message) !?Event {
     const data = message.incoming_message.data;
     const sender = message.incoming_message.from;
-    defer if (agent.connection_state != .completed) {
-        agent.select.concurrent(
-            .message,
-            receiveTimeout,
-            .{ agent, message.socket, .none },
-        ) catch {};
-    };
 
     if (stun.isMessage(data)) {
         defer agent.destroyPacket(data);
@@ -783,7 +813,7 @@ fn handleConnectivityCheckMessage(agent: *Agent, message: Message) !?Event {
             .request => {
                 const resp = try agent.handleRequest(&msg, message.socket.address, sender);
                 defer agent.destroyPacket(resp);
-                try message.socket.send(agent.select.io, &sender, resp);
+                try message.socket.send(agent.io, &sender, resp);
 
                 const nominated_pair: ?CandidatePair = blk: {
                     if (agent.role == .controlling or agent.nominated_pair != null) break :blk null;
@@ -804,10 +834,10 @@ fn handleConnectivityCheckMessage(agent: *Agent, message: Message) !?Event {
 
         if (agent.nominated_pair != null and agent.connection_state != .connected) {
             agent.setConnectionState(.connected);
+            const io = agent.io;
 
-            try agent.select.concurrent(.complete, Io.sleep, .{ agent.select.io, .fromSeconds(3), .awake });
-            try agent.select.concurrent(.keep_alive, Io.sleep, .{ agent.select.io, keep_alive_interval, .awake });
-            try agent.select.concurrent(.app_data, receiveTimeout, .{ agent, &agent.nominated_pair.?.socket, .{ .duration = disconnect_timeout } });
+            try agent.group.concurrent(io, markConnectionCompleted, .{ agent, .fromSeconds(3) });
+            try agent.group.concurrent(io, keepAlive, .{ agent, keep_alive_interval });
             return .{ .connection_state = agent.connection_state };
         }
     } else {
@@ -822,8 +852,8 @@ fn handleConnectivityCheckMessage(agent: *Agent, message: Message) !?Event {
     return null;
 }
 
-fn handleConsentFreshness(agent: *Agent, message: Message) !void {
-    const msg = try stun.Message.parse(message.incoming_message.data);
+fn handleConsentFreshness(agent: *Agent, incoming_message: Io.net.IncomingMessage) !void {
+    const msg = try stun.Message.parse(incoming_message.data);
     switch (msg.header.message_type.class()) {
         .request => {
             Logger.debug("Received consent freshness request", .{});
@@ -831,24 +861,31 @@ fn handleConsentFreshness(agent: *Agent, message: Message) !void {
             const buffer = try agent.createPacket();
             defer agent.destroyPacket(buffer);
 
-            const resp = try agent.buildSuccessResponse(&msg, message.incoming_message.from, buffer);
-            try message.socket.send(agent.select.io, &message.incoming_message.from, resp);
+            const resp = try agent.buildSuccessResponse(&msg, incoming_message.from, buffer);
+            try agent.nominated_pair.?.socket.send(agent.io, &incoming_message.from, resp);
         },
         else => {},
     }
 }
 
-fn markConnectionCompleted(agent: *Agent) void {
-    const addr = agent.nominated_pair.?.socket.address;
-    for (agent.sockets) |*socket| if (!socket.address.eql(&addr)) socket.close(agent.select.io);
-
-    agent.allocator.free(agent.sockets);
-    agent.sockets = &.{};
+fn markConnectionCompleted(agent: *Agent, timeout: Io.Duration) !void {
+    try agent.io.sleep(timeout, .awake);
 
     agent.remote_candidates.clearAndFree(agent.allocator);
     agent.pairs.clearAndFree(agent.allocator);
     agent.pending_requests.clearAndFree(agent.allocator);
     agent.setConnectionState(.completed);
+
+    try agent.putInQueue(.{ .connection_state = .completed });
+}
+
+const builtin = @import("builtin");
+fn logError(comptime fmt: []const u8, args: anytype) void {
+    if (!builtin.is_test) {
+        Logger.err(fmt, args);
+    } else {
+        Logger.warn(fmt, args);
+    }
 }
 
 const testing = std.testing;
@@ -1044,25 +1081,34 @@ test "close" {
     var grp: Io.Group = .init;
     defer grp.cancel(testing.io);
 
+    var close_event: Io.Event = .unset;
+
     const closeAgent = struct {
         pub fn close(a: *Agent) !void {
-            try a.select.io.sleep(.fromMilliseconds(100), .awake);
+            try a.io.sleep(.fromMilliseconds(100), .awake);
             a.close();
         }
     }.close;
 
+    const polling = struct {
+        pub fn poll(a: *Agent, event: *Io.Event) !void {
+            while (a.poll()) |ev| switch (ev) {
+                .connection_state => |state| switch (state) {
+                    .closed => event.set(a.io),
+                    else => {},
+                },
+                else => {},
+            } else |_| return;
+        }
+    }.poll;
+
+    try grp.concurrent(testing.io, polling, .{ &agent, &close_event });
     try agent.gatherCandidates();
     try agent.setRemoteCredentials(.{ .username = "user", .password = "password" });
 
     try grp.concurrent(testing.io, closeAgent, .{&agent});
 
-    while (agent.poll()) |event| switch (event) {
-        .connection_state => |state| switch (state) {
-            .closed => break,
-            else => {},
-        },
-        else => {},
-    } else |_| return error.FailedTest;
-
-    try testing.expectError(error.FailedOrClosedAgent, agent.poll());
+    close_event.waitTimeout(testing.io, .{ .duration = .{ .raw = .fromSeconds(1), .clock = .awake } }) catch {
+        return error.FailedTest;
+    };
 }
