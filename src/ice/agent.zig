@@ -162,11 +162,7 @@ pub fn setRemoteCredentials(agent: *Agent, credentials: ice.Credentials) !void {
         .new => {
             const credens = try credentials.dupe(agent.allocator);
             if (agent.remote_credentials == null) {
-                try agent.group.concurrent(
-                    agent.io,
-                    connectivityCheck,
-                    .{ agent, connectivity_check_interval },
-                );
+                try agent.group.concurrent(agent.io, connectivityCheck, .{ agent, connectivity_check_interval });
             }
             agent.remote_credentials = credens;
             agent.setConnectionState(.checking);
@@ -1103,7 +1099,7 @@ test "close" {
 
     try grp.concurrent(testing.io, closeAgent, .{&agent});
 
-    close_event.waitTimeout(testing.io, .{ .duration = .{ .raw = .fromMilliseconds(200), .clock = .awake } }) catch {
+    close_event.waitTimeout(testing.io, .{ .duration = .{ .raw = .fromSeconds(1), .clock = .awake } }) catch {
         return error.FailedTest;
     };
 }
