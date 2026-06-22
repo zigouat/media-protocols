@@ -366,7 +366,7 @@ pub const Fingerprint = union(enum) {
     pub fn write(fingeprint: *const Fingerprint, w: *std.Io.Writer) !void {
         switch (fingeprint.*) {
             .sha_256 => |hash| {
-                try w.print("sha-256 {X:>2}", .{hash[0]});
+                try w.print("sha-256 {X:0>2}", .{hash[0]});
                 for (hash[1..]) |b| try w.print(":{X:0>2}", .{b});
             },
             else => {},
@@ -810,8 +810,17 @@ test "ParsedAttribute write" {
         "a=rtpmap:0 PCMU/8000\r\n",
     );
 
-    const hash: [32]u8 = @splat(0xAB);
-    try expectWrite(&w, .{ .fingerprint = .{ .sha_256 = hash } }, "a=fingerprint:sha-256 AB" ++ (":AB" ** 31) ++ "\r\n");
+    const hash: [32]u8 = .{
+        0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
+        0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF,
+        0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
+        0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF,
+    };
+    try expectWrite(
+        &w,
+        .{ .fingerprint = .{ .sha_256 = hash } },
+        "a=fingerprint:sha-256 00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF\r\n",
+    );
     try expectWrite(&w, .{ .fingerprint = .unknown }, "a=fingerprint:\r\n");
 
     try expectWrite(&w, .ice_lite, "a=ice-lite\r\n");
