@@ -4,9 +4,10 @@ const std = @import("std");
 
 const Reader = std.Io.Reader;
 
-const reception_report_size = 24;
-const sr_base_size = 24;
-const rr_base_size = 4;
+pub const header_size = @bitSizeOf(Header) / 8;
+pub const sr_base_size = 24;
+pub const rr_base_size = 4;
+pub const reception_report_size = 24;
 
 pub const PayloadType = enum(u8) {
     sender_report = 200,
@@ -93,6 +94,15 @@ pub const SenderReport = struct {
             .report_bytes = data[24..report_offset],
             .profile_extensions = data[report_offset..],
         };
+    }
+
+    /// Serializes the base sender report (no receiver report or profile extensions) to a buffer.
+    pub fn write(sender_report: *const SenderReport, buf: *[sr_base_size]u8) void {
+        std.mem.writeInt(u32, buf[0..4], sender_report.ssrc, .big);
+        std.mem.writeInt(u64, buf[4..12], sender_report.ntp_timestamp, .big);
+        std.mem.writeInt(u32, buf[12..16], sender_report.rtp_timestamp, .big);
+        std.mem.writeInt(u32, buf[16..20], sender_report.packet_count, .big);
+        std.mem.writeInt(u32, buf[20..24], sender_report.octet_count, .big);
     }
 
     pub fn getReceptionReport(sr: *const SenderReport, index: usize) ReceptionReport {
@@ -244,17 +254,11 @@ test "SenderReport.fromSlice: report_bytes contains trailing data" {
 
 test "ReceptionReport.fromSlice: parses all fields" {
     const data = [_]u8{
-        // ssrc
         0xAB, 0xCD, 0xEF, 0x01,
-        // fraction_lost, total_lost (u24)
         0x05, 0x00, 0x00, 0x10,
-        // last_sequence_number
         0x00, 0x00, 0x12, 0x34,
-        // jitter
         0x00, 0x00, 0x00, 0x50,
-        // last_sr
         0xE8, 0xC5, 0xF7, 0x3B,
-        // delay
         0x00, 0x00, 0x01, 0x00,
     };
 
@@ -290,16 +294,16 @@ test "ReceptionReport.fromSlice: max values" {
     try testing.expectEqual(std.math.maxInt(u32), rr.delay);
 }
 
-test "SenderReport.getReceptionReport: single report" {
+test "SenderReport: parse single report" {
     const data = [_]u8{
-        // --- SenderReport body (24 bytes) ---
+        // SenderReport
         0x12, 0x34, 0x56, 0x78,
         0xE8, 0xC5, 0xF7, 0x3B,
         0x1A, 0x2B, 0x3C, 0x4D,
         0x00, 0x0D, 0xDF, 0x22,
         0x00, 0x00, 0x00, 0x64,
         0x00, 0x00, 0x27, 0x10,
-        // --- ReceptionReport[0] (24 bytes) ---
+        // ReceptionReport
         0xAB, 0xCD, 0xEF, 0x01,
         0x05, 0x00, 0x00, 0x10,
         0x00, 0x00, 0x12, 0x34,
@@ -320,7 +324,7 @@ test "SenderReport.getReceptionReport: single report" {
     try testing.expectEqual(0x00000100, rr.delay);
 }
 
-test "SenderReport.getReceptionReport: multiple reports indexed correctly" {
+test "SenderReport: parse multiple reports indexed correctly" {
     const data = [_]u8{
         // --- SenderReport body (24 bytes) ---
         0x12, 0x34, 0x56, 0x78,
@@ -356,6 +360,29 @@ test "SenderReport.getReceptionReport: multiple reports indexed correctly" {
     try testing.expectEqual(0x22222222, rr1.ssrc);
     try testing.expectEqual(0x02, rr1.fraction_lost);
     try testing.expectEqual(0x000002, rr1.total_lost);
+}
+
+test "SenderReport: write" {
+    const expected = [_]u8{
+        0x12, 0x34, 0x56, 0x78,
+        0xE8, 0xC5, 0xF7, 0x3B,
+        0x1A, 0x2B, 0x3C, 0x4D,
+        0x00, 0x0D, 0xDF, 0x22,
+        0x00, 0x00, 0x00, 0x64,
+        0x00, 0x00, 0x27, 0x10,
+    };
+
+    const sr: SenderReport = .{
+        .ssrc = 305419896,
+        .ntp_timestamp = 16773084220425452621,
+        .rtp_timestamp = 909090,
+        .packet_count = 100,
+        .octet_count = 10000,
+    };
+
+    var buffer: [sr_base_size]u8 = @splat(0);
+    sr.write(&buffer);
+    try testing.expectEqualSlices(u8, &expected, &buffer);
 }
 
 test "Packet: parse source description" {
