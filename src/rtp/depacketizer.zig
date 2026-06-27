@@ -1,3 +1,6 @@
+pub const H264 = @import("depacketizer/h264.zig");
+pub const VP8 = @import("depacketizer/vp8.zig");
+
 const std = @import("std");
 const media = @import("media");
 const Packet = @import("packet.zig");
@@ -83,4 +86,9 @@ pub fn depacketize(self: *Depacketizer, rtp: *const Packet) !?media.Packet {
     }
 
     return null;
+}
+
+test {
+    _ = @import("depacketizer/h264.zig");
+    _ = @import("depacketizer/vp8.zig");
 }
