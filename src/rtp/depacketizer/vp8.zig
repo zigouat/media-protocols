@@ -9,8 +9,6 @@ pub const Config = struct {};
 pub const Error = error{
     /// The destination buffer is too small to hold the depacketized frame.
     ShortBuffer,
-    /// The payload descriptor extension is not supported.
-    UnsupportedPayloadDescriptorExtension,
 } || std.Io.Reader.Error;
 
 const PayloadDescriptor = struct {
