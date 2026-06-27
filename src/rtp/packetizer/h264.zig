@@ -1,19 +1,10 @@
 const std = @import("std");
 const media = @import("media");
 const Packet = @import("../rtp.zig").Packet;
+const RtpConfig = @import("../packetizer.zig").RtpConfig;
 const Packetizer = @This();
 
-const max_timestamp: u64 = std.math.maxInt(u32) + 1;
-
-pub const InitConfig = struct {
-    payload_type: u7,
-    ssrc: ?u32 = null,
-    seq_number: ?u16 = null,
-};
-
-ssrc: u32,
-payload_type: u7,
-seq_number: u16,
+rtp_config: RtpConfig,
 
 const FuState = struct {
     nalu: []const u8,
@@ -49,37 +40,12 @@ const FuState = struct {
     }
 };
 
-pub fn init(io: std.Io, config: InitConfig) Packetizer {
-    const timestamp: u64 = @bitCast(std.Io.Clock.now(.awake, io).toMilliseconds());
-    var rand = std.Random.DefaultPrng.init(timestamp);
-    var r = rand.random();
-    return .{
-        .payload_type = config.payload_type,
-        .seq_number = config.seq_number orelse r.uintAtMost(u16, std.math.maxInt(u16)),
-        .ssrc = config.ssrc orelse r.uintAtMost(u32, std.math.maxInt(u32)),
-    };
+pub fn init(rtp_config: RtpConfig) Packetizer {
+    return .{ .rtp_config = rtp_config };
 }
 
 pub fn packetize(packetizer: *Packetizer, packet: *const media.Packet) Iterator {
     return .{ .packetizer = packetizer, .packet = packet };
-}
-
-fn newRtpPacket(packetizer: *Packetizer, marker: bool, timestamp: u32, payload: []const u8) Packet {
-    const seq_num = packetizer.seq_number;
-    packetizer.seq_number +%= 1;
-
-    return Packet{
-        .header = .{
-            .extension = false,
-            .marker = marker,
-            .padding = false,
-            .payload_type = packetizer.payload_type,
-            .sequence_number = seq_num,
-            .ssrc = packetizer.ssrc,
-            .timestamp = timestamp,
-        },
-        .payload = payload,
-    };
 }
 
 pub const Iterator = struct {
@@ -92,8 +58,6 @@ pub const Iterator = struct {
     pub fn next(it: *Iterator, out: []u8) !?Packet {
         if (it.marker) return null;
 
-        const timestamp: u32 = @intCast(@rem(it.packet.pts, max_timestamp));
-
         if (it.fu_state) |*fu_state| {
             const payload = fu_state.next(out);
 
@@ -102,7 +66,7 @@ pub const Iterator = struct {
                 it.marker = it.pos == it.packet.data.len;
             }
 
-            return it.packetizer.newRtpPacket(it.marker, timestamp, payload);
+            return it.packetizer.rtp_config.newRtpPacket(it.marker, it.packet.pts, payload);
         }
 
         var reader: std.Io.Reader = .fixed(it.packet.data[it.pos..]);
@@ -114,17 +78,17 @@ pub const Iterator = struct {
             // FU unit
             it.fu_state = .init(nalu);
             const payload = it.fu_state.?.next(out);
-            return it.packetizer.newRtpPacket(false, timestamp, payload);
+            return it.packetizer.rtp_config.newRtpPacket(false, it.packet.pts, payload);
         }
 
         // Single nalu
         it.marker = reader.seek == reader.end;
-        return it.packetizer.newRtpPacket(it.marker, timestamp, nalu);
+        return it.packetizer.rtp_config.newRtpPacket(it.marker, it.packet.pts, nalu);
     }
 };
 
 test "h264 packetizer: single nalu" {
-    var packetizer: Packetizer = .init(std.testing.io, .{
+    var packetizer: Packetizer = .init(.{
         .payload_type = 96,
         .ssrc = 0xDEADBEEF,
         .seq_number = 1000,
@@ -145,7 +109,7 @@ test "h264 packetizer: single nalu" {
     const first = try it.next(&out) orelse return error.TestUnexpectedNull;
     try std.testing.expectEqual(96, first.header.payload_type);
     try std.testing.expectEqual(0xDEADBEEF, first.header.ssrc);
-    try std.testing.expectEqual(1000, first.header.sequence_number);
+    try std.testing.expectEqual(1001, first.header.sequence_number);
     try std.testing.expectEqual(90000, first.header.timestamp);
     try std.testing.expect(!first.header.marker);
     try std.testing.expectEqualSlices(u8, &nalu1, first.payload);
@@ -153,18 +117,18 @@ test "h264 packetizer: single nalu" {
     const second = try it.next(&out) orelse return error.TestUnexpectedNull;
     try std.testing.expectEqual(96, second.header.payload_type);
     try std.testing.expectEqual(0xDEADBEEF, second.header.ssrc);
-    try std.testing.expectEqual(1001, second.header.sequence_number);
+    try std.testing.expectEqual(1002, second.header.sequence_number);
     try std.testing.expectEqual(90000, second.header.timestamp);
     try std.testing.expect(second.header.marker);
     try std.testing.expectEqualSlices(u8, &nalu2, second.payload);
 
-    try std.testing.expectEqual(1002, packetizer.seq_number);
+    try std.testing.expectEqual(1002, packetizer.rtp_config.seq_number);
 
     try std.testing.expectEqual(null, try it.next(&out));
 }
 
 test "h264 packetizer: fu-a fragmentation" {
-    var packetizer: Packetizer = .init(std.testing.io, .{
+    var packetizer: Packetizer = .init(.{
         .payload_type = 96,
         .ssrc = 0xCAFEBABE,
         .seq_number = 2000,
@@ -184,7 +148,7 @@ test "h264 packetizer: fu-a fragmentation" {
     var it = packetizer.packetize(&media_packet);
 
     var packet = try it.next(out[0..1400]) orelse unreachable;
-    try std.testing.expectEqual(2000, packet.header.sequence_number);
+    try std.testing.expectEqual(2001, packet.header.sequence_number);
     try std.testing.expectEqual(180_000, packet.header.timestamp);
     try std.testing.expect(!packet.header.marker);
     try std.testing.expectEqual(1400, packet.payload.len);
@@ -196,7 +160,7 @@ test "h264 packetizer: fu-a fragmentation" {
     }
 
     packet = try it.next(out[0..1350]) orelse unreachable;
-    try std.testing.expectEqual(2001, packet.header.sequence_number);
+    try std.testing.expectEqual(2002, packet.header.sequence_number);
     try std.testing.expectEqual(180_000, packet.header.timestamp);
     try std.testing.expect(!packet.header.marker);
     try std.testing.expectEqual(1350, packet.payload.len);
@@ -207,7 +171,7 @@ test "h264 packetizer: fu-a fragmentation" {
     }
 
     packet = try it.next(out[0..1000]) orelse unreachable;
-    try std.testing.expectEqual(2002, packet.header.sequence_number);
+    try std.testing.expectEqual(2003, packet.header.sequence_number);
     try std.testing.expectEqual(180_000, packet.header.timestamp);
     try std.testing.expect(packet.header.marker);
     try std.testing.expectEqual(255, packet.payload.len);
