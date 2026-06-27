@@ -203,7 +203,7 @@ pub fn sendData(agent: *const Agent, data: []const u8) Socket.SendError!void {
     }
 }
 
-pub fn createPacket(agent: *Agent) ![]u8 {
+pub fn createPacket(agent: *Agent) Allocator.Error![]u8 {
     agent.mutex.lockUncancelable(agent.io);
     defer agent.mutex.unlock(agent.io);
     return try agent.buffer_pool.create(agent.allocator);

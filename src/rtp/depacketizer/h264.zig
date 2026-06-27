@@ -1,11 +1,11 @@
 const std = @import("std");
-const h264 = @import("media").h264;
+const h264 = @import("media").codecs.h264;
 const FrameInfo = @import("frame_info.zig");
 
 const Self = @This();
 const Writer = std.Io.Writer;
 
-const annexb_start_code = @import("media").h264.annexb_start_code;
+const annexb_start_code = @import("media").codecs.h264.annexb_start_code;
 const fu_header_size: usize = 2;
 
 pub const PacketType = enum { annexb, avc };

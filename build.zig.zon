@@ -5,8 +5,8 @@
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
         .media = .{
-            .url = "git+https://github.com/zig-streaming/media.git#010b7d8e1a10282758c8a6cd54f4bd8fcec046c7",
-            .hash = "media-0.1.0-qc-dCJzsAACfvL7pUfAyRw0O16yn3G_NPSbL8NIAWSKV",
+            .url = "git+https://github.com/zigouat/media.git#266cff6c13b7b76ec8029434446de85584a97324",
+            .hash = "media-0.1.0-qc-dCM72AACZ7ozg1_Xe3GIdpc39rESjHB4cPFPpG_Lp",
         },
         .zbench = .{
             .url = "https://github.com/hendriknielaender/zBench/archive/c24d128bfa80ec6a1b495b84ec827c6a0bec7865.tar.gz",
