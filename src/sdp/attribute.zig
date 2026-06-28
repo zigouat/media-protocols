@@ -4,6 +4,7 @@ const Reader = std.Io.Reader;
 const Attribute = @This();
 
 const attribute_types_map: std.StaticStringMap(AttributeType) = .initComptime(&.{
+    .{ "bundle-only", .bundle_only },
     .{ "candidate", .candidate },
     .{ "control", .control },
     .{ "end-of-candidates", .end_of_candidates },
@@ -35,6 +36,7 @@ key: []const u8,
 value: ?[]const u8,
 
 pub const AttributeType = enum {
+    bundle_only,
     candidate,
     control,
     direction,
@@ -63,6 +65,7 @@ pub const AttributeType = enum {
 pub const Setup = enum { actpass, active, passive, holdconn };
 
 pub const ParsedAttribute = union(AttributeType) {
+    bundle_only: void,
     candidate: []const u8,
     control: []const u8,
     direction: []const u8,
@@ -89,6 +92,7 @@ pub const ParsedAttribute = union(AttributeType) {
 
     pub fn write(attr: ParsedAttribute, w: *std.Io.Writer) std.Io.Writer.Error!void {
         switch (attr) {
+            .bundle_only => try w.writeAll("a=bundle-only\r\n"),
             .control => |url| try w.print("a=control:{s}\r\n", .{url}),
             .direction => |v| try w.print("a={s}\r\n", .{v}),
             .end_of_candidates => try w.writeAll("a=end-of-candidates\r\n"),
@@ -132,6 +136,7 @@ pub fn parse(attr: *const Attribute) !ParsedAttribute {
     const value = attr.value orelse "";
 
     return switch (attr.getType()) {
+        .bundle_only => .bundle_only,
         .candidate => .{ .candidate = value },
         .control => .{ .control = value },
         .direction => .{ .direction = attr.key },
@@ -773,6 +778,11 @@ test "parse attribute" {
     }
 
     {
+        const attr = try (Attribute{ .key = "bundle-only", .value = null }).parse();
+        try std.testing.expectEqual(.bundle_only, @as(AttributeType, attr));
+    }
+
+    {
         const unknown = try (Attribute{ .key = "some-unknown-key", .value = "some-value" }).parse();
         try std.testing.expect(unknown == .unknown);
     }
@@ -790,6 +800,7 @@ test "ParsedAttribute write" {
         }
     }.f;
 
+    try expectWrite(&w, .bundle_only, "a=bundle-only\r\n");
     try expectWrite(&w, .{ .ice_ufrag = "F7gI" }, "a=ice-ufrag:F7gI\r\n");
     try expectWrite(&w, .{ .ice_pwd = "x9cml/YzichV2+XlhiMu8g" }, "a=ice-pwd:x9cml/YzichV2+XlhiMu8g\r\n");
     try expectWrite(&w, .{ .direction = "sendrecv" }, "a=sendrecv\r\n");
