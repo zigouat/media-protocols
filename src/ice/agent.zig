@@ -250,15 +250,6 @@ fn closeConnection(agent: *Agent) void {
         agent.remote_credentials = null;
     }
 
-    if (agent.nominated_pair) |*pair| {
-        if (agent.sockets.len == 0) pair.socket.close(agent.io);
-        agent.nominated_pair = null;
-    }
-
-    switch (agent.connection_state) {
-        .completed, .failed, .disconnected => {},
-        else => for (agent.sockets) |socket| socket.close(agent.io),
-    }
     allocator.free(agent.sockets);
     agent.sockets = &.{};
 
@@ -566,8 +557,16 @@ fn connectivityCheck(agent: *Agent, timeout: Io.Duration) !void {
 }
 
 fn receive(agent: *Agent, socket: *const Socket) !void {
+    agent.doReceive(socket) catch |err| switch (err) {
+        error.Canceled => return error.Canceled,
+        else => |e| logError("Error when receiving: {}", .{e}),
+    };
+}
+
+fn doReceive(agent: *Agent, socket: *const Socket) !void {
     const io = agent.io;
     const timeout: Io.Timeout = .{ .duration = .{ .clock = .awake, .raw = .fromSeconds(2) } };
+    errdefer socket.close(io);
 
     while (true) {
         switch (agent.connection_state) {
@@ -587,20 +586,14 @@ fn receive(agent: *Agent, socket: *const Socket) !void {
 
         var result: Message = .{ .socket = socket, .incoming_message = undefined };
 
-        const buffer = agent.createPacket() catch return;
-
+        const buffer = try agent.createPacket();
         result.incoming_message = socket.receiveTimeout(agent.io, buffer, timeout) catch |err| {
             agent.destroyPacket(buffer);
-
             switch (err) {
                 // We provide timeout to allow checking the agent status to close this socket
                 // if it's no longer needed
                 error.Timeout => continue,
-                error.Canceled => return error.Canceled,
-                else => |e| {
-                    logError("Error when listening: {}", .{e});
-                    return;
-                },
+                else => |e| return e,
             }
         };
 
@@ -610,6 +603,7 @@ fn receive(agent: *Agent, socket: *const Socket) !void {
 
 fn receiveAppData(agent: *Agent, socket: *const Socket) !void {
     var timeout: Io.Timeout = .{ .duration = disconnect_timeout };
+    defer socket.close(agent.io);
 
     while (true) {
         const buffer = agent.createPacket() catch return;
