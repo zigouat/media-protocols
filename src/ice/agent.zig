@@ -704,9 +704,6 @@ fn batchSendConnectivityCheck(agent: *Agent) !void {
         try selected_pair.sendData(agent.io, msg);
     }
 
-    try agent.mutex.lock(agent.io);
-    defer agent.mutex.unlock(agent.io);
-
     for (agent.pairs.items) |*candidate_pair| switch (candidate_pair.status) {
         .waiting, .in_progress => {
             candidate_pair.conn_check_count += 1;
