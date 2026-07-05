@@ -1,7 +1,8 @@
+const fb = @import("fb.zig");
 pub const SourceDescription = @import("source_description.zig");
+pub const Nack = fb.Nack;
 
 const std = @import("std");
-
 const Reader = std.Io.Reader;
 
 pub const header_size = @bitSizeOf(Header) / 8;
@@ -9,19 +10,53 @@ pub const sr_base_size = 24;
 pub const rr_base_size = 4;
 pub const reception_report_size = 24;
 
+pub const MaformedPacketError = error{MalformedPacket};
+pub const Error = MaformedPacketError || error{UnknownPayloadType};
+
+/// RTP Control Protocol (RTCP) packet types.
 pub const PayloadType = enum(u8) {
+    /// Sender Report (SR) packet type.
+    ///
+    /// The SR packet is used to provide transmission and reception statistics from active senders.
     sender_report = 200,
+    /// Receiver Report (RR) packet type.
+    ///
+    /// The RR packet is used to provide reception statistics from participants that are not active senders.
     receiver_report = 201,
+    /// Source Description (SDES) packet type.
+    ///
+    /// The SDES packet is used to convey descriptive information about the sources in an RTP session.
     source_description = 202,
+    /// Goodbye (BYE) packet type.
+    ///
+    /// The BYE packet is used to indicate that one or more sources are no longer active.
     bye = 203,
+    /// Transport layer feedback message (RFC 4585)
+    ///
+    /// The RTPFB packet is used to provide feedback on the reception quality of RTP streams, such as packet loss and jitter.
+    rtp_fb = 205,
+    /// Payload-specific feedback message (RFC 4585)
+    ///
+    /// The PSFB packet is used to provide feedback on the reception quality of specific payload types, such as video codecs.
+    ps_fb = 206,
     _,
 };
 
+/// The RTCP packet header structure as defined in RFC 3550.
 pub const Header = packed struct {
+    /// The length of the RTCP packet in 32-bit words minus one, including the header and any padding.
     length: u16,
+    /// The type of RTCP packet.
     payload_type: PayloadType,
+    /// The number of reception report blocks contained in the packet.
+    ///
+    /// In case of RTPFB and PSFB packets, this field indicates the format of the feedback message.
     rc: u5,
+    /// Indicates whether the packet contains padding bytes at the end.
+    ///
+    /// If set to `true`, the last byte of the packet contains a count of how many padding bytes should be ignored.
     padding: bool,
+    /// The version of the RTCP protocol. This field is 2 bits long and should be set to 2 for all RTCP packets.
     version: u2 = 2,
 };
 
@@ -32,16 +67,16 @@ pub const Packet = struct {
         receiver_report: ReceiverReport,
         source_description: SourceDescription,
         bye: []const u8,
+        rtp_fb: []const u8,
+        ps_fb: []const u8,
     },
-
-    pub const Error = Reader.Error || error{UnknownPayloadType};
 
     pub fn parse(data: []const u8) Error!Packet {
         var reader = Reader.fixed(data);
-        return parseFromReader(&reader);
+        return parseFromReader(&reader) catch return error.MalformedPacket;
     }
 
-    fn parseFromReader(reader: *Reader) Error!Packet {
+    fn parseFromReader(reader: *Reader) !Packet {
         var packet: Packet = undefined;
 
         packet.header = try reader.takeStruct(Header, .big);
@@ -166,9 +201,9 @@ pub const Iterator = struct {
         return .{ .reader = .fixed(rtcp) };
     }
 
-    pub fn next(it: *Iterator) Packet.Error!?Packet {
+    pub fn next(it: *Iterator) Error!?Packet {
         if (it.reader.bufferedLen() == 0) return null;
-        return try Packet.parseFromReader(&it.reader);
+        return Packet.parseFromReader(&it.reader) catch return error.MalformedPacket;
     }
 };
 
@@ -176,6 +211,7 @@ const testing = std.testing;
 
 test {
     _ = @import("source_description.zig");
+    _ = @import("fb.zig");
 }
 
 test "Header: bit size is 32" {
