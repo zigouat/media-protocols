@@ -1,17 +1,13 @@
 //! Describes the RTCP Feedback (FB) packet format as defined in RFC 4585.
 const std = @import("std");
-
-pub const Error = error{
-    /// The packet is malformed and cannot be parsed correctly.
-    MalformedPacket,
-};
+const rtcp = @import("rtcp.zig");
 
 pub const Nack = struct {
     sender_ssrc: u32,
     media_ssrc: u32,
     fci: []const u8,
 
-    pub fn parse(data: []const u8) Error!Nack {
+    pub fn parse(data: []const u8) rtcp.Error!Nack {
         if (data.len < 12 or @rem(data.len, 4) != 0) return error.MalformedPacket;
         const sender_ssrc = std.mem.readInt(u32, data[0..4], .big);
         const source_ssrc = std.mem.readInt(u32, data[4..8], .big);

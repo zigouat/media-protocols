@@ -10,7 +10,10 @@ pub const sr_base_size = 24;
 pub const rr_base_size = 4;
 pub const reception_report_size = 24;
 
-pub const Error = error{MalformedPacket};
+pub const Error = error{
+    /// The RTCP packet is malformed and cannot be parsed.
+    MalformedPacket,
+};
 
 /// RTP Control Protocol (RTCP) packet types.
 pub const PayloadType = enum(u8) {
