@@ -10,8 +10,7 @@ pub const sr_base_size = 24;
 pub const rr_base_size = 4;
 pub const reception_report_size = 24;
 
-pub const MaformedPacketError = error{MalformedPacket};
-pub const Error = MaformedPacketError || error{UnknownPayloadType};
+pub const Error = error{MalformedPacket};
 
 /// RTP Control Protocol (RTCP) packet types.
 pub const PayloadType = enum(u8) {
@@ -60,15 +59,16 @@ pub const Header = packed struct {
     version: u2 = 2,
 };
 
+/// The RTCP packet structure, which consists of a header and a payload.
 pub const Packet = struct {
     header: Header,
-    payload: union(PayloadType) {
-        sender_report: SenderReport,
-        receiver_report: ReceiverReport,
-        source_description: SourceDescription,
+    payload: union(enum(u8)) {
+        sr: SenderReport,
+        rr: ReceiverReport,
+        sdes: SourceDescription,
         bye: []const u8,
-        rtp_fb: []const u8,
-        ps_fb: []const u8,
+        nack: Nack,
+        unknown: []const u8,
     },
 
     pub fn parse(data: []const u8) Error!Packet {
@@ -85,18 +85,22 @@ pub const Packet = struct {
         switch (packet.header.payload_type) {
             .sender_report => {
                 if (payload.len < @as(usize, packet.header.rc) * reception_report_size + sr_base_size) return error.EndOfStream;
-                packet.payload = .{ .sender_report = .fromSlice(payload, packet.header.rc) };
+                packet.payload = .{ .sr = .fromSlice(payload, packet.header.rc) };
             },
             .receiver_report => {
                 if (payload.len < @as(usize, packet.header.rc) * reception_report_size + rr_base_size) return error.EndOfStream;
-                packet.payload = .{ .receiver_report = .fromSlice(payload, packet.header.rc) };
+                packet.payload = .{ .rr = .fromSlice(payload, packet.header.rc) };
             },
-            .source_description => packet.payload = .{ .source_description = .{ .chunks_bytes = payload } },
+            .source_description => packet.payload = .{ .sdes = .{ .chunks_bytes = payload } },
             .bye => {
                 if (payload.len < packet.header.rc * 4) return error.EndOfStream;
                 packet.payload = .{ .bye = payload };
             },
-            else => return error.UnknownPayloadType,
+            .rtp_fb => switch (packet.header.rc) { // FB FMT
+                1 => packet.payload = .{ .nack = try Nack.parse(payload) },
+                else => packet.payload = .{ .unknown = payload },
+            },
+            else => packet.payload = .{ .unknown = payload },
         }
 
         return packet;
@@ -108,15 +112,22 @@ pub const Packet = struct {
     }
 };
 
+/// The Sender Report (SR) packet structure, which is used to provide transmission and reception statistics from active senders in an RTP session.
 pub const SenderReport = struct {
+    /// The synchronization source identifier (SSRC) of the sender.
     ssrc: u32,
+    /// The NTP timestamp of the sender, which is a 64-bit value representing the time at which the report was generated.
     ntp_timestamp: u64,
+    /// The RTP timestamp of the sender, which is a 32-bit value representing the time at which the report was generated in RTP timestamp units.
     rtp_timestamp: u32,
+    /// The total number of RTP packets sent by the sender since the beginning of transmission.
     packet_count: u32,
+    /// The total number of RTP payload octets sent by the sender since the beginning of transmission.
     octet_count: u32,
     report_bytes: []const u8 = &.{},
     profile_extensions: []const u8 = &.{},
 
+    /// Parses a SenderReport from a byte slice, given the number of reception reports (rr_count) contained in the report.
     pub fn fromSlice(data: []const u8, rr_count: u5) SenderReport {
         const report_offset = @as(usize, reception_report_size) * rr_count + 24;
 
@@ -140,6 +151,9 @@ pub const SenderReport = struct {
         std.mem.writeInt(u32, buf[20..24], sender_report.octet_count, .big);
     }
 
+    /// Returns the reception report at the specified index.
+    ///
+    /// The total number of reception reports is determined by the `rc` field in the RTCP header.
     pub fn getReceptionReport(sr: *const SenderReport, index: usize) ReceptionReport {
         const offset = index * reception_report_size;
         std.debug.assert(offset + reception_report_size <= sr.report_bytes.len);
@@ -147,11 +161,14 @@ pub const SenderReport = struct {
     }
 };
 
+/// The Receiver Report (RR) packet structure, which is used to provide reception statistics from participants that are not active senders in an RTP session.
 pub const ReceiverReport = struct {
+    /// The synchronization source identifier (SSRC) of the receiver.
     ssrc: u32,
     report_bytes: []const u8 = &.{},
     profile_extensions: []const u8 = &.{},
 
+    /// Parses a ReceiverReport from a byte slice, given the number of reception reports (rr_count) contained in the report.
     pub fn fromSlice(data: []const u8, rr_count: u5) ReceiverReport {
         const report_offset = @as(usize, reception_report_size) * rr_count + 4;
 
@@ -162,6 +179,9 @@ pub const ReceiverReport = struct {
         };
     }
 
+    /// Returns the reception report at the specified index.
+    ///
+    /// The total number of reception reports is determined by the `rc` field in the RTCP header.
     pub fn getReceptionReport(sr: *const SenderReport, index: usize) ReceptionReport {
         const offset = index * reception_report_size;
         std.debug.assert(offset + reception_report_size <= sr.report_bytes.len);
@@ -169,15 +189,24 @@ pub const ReceiverReport = struct {
     }
 };
 
+/// The Reception Report structure, which is used to provide reception statistics for a specific source in an RTP session.
 pub const ReceptionReport = struct {
+    /// The synchronization source identifier (SSRC) of the source for which the reception report is generated.
     ssrc: u32,
+    /// The fraction of RTP data packets from the source lost since the previous SR or RR packet was sent.
     fraction_lost: u8,
+    /// The total number of RTP data packets from the source that have been lost since the beginning of reception.
     total_lost: u24,
+    /// The extended highest sequence number received from the source, which is the highest sequence number received plus the number of packets lost.
     last_sequence_number: u32,
+    /// The interarrival jitter, which is an estimate of the statistical variance of the RTP data packet interarrival time.
     jitter: u32,
+    /// The timestamp of the last SR packet received from the source, expressed in NTP format.
     last_sr: u32,
+    /// The delay since the last SR packet was received from the source, expressed in units of 1/65536 seconds.
     delay: u32,
 
+    /// Parses a ReceptionReport from a byte slice.
     pub fn fromSlice(data: []const u8) ReceptionReport {
         std.debug.assert(data.len == reception_report_size);
 
@@ -233,8 +262,8 @@ test "Packet: parse receiver report" {
 
     const packet = try Packet.parse(&data);
     try std.testing.expectEqual(PayloadType.receiver_report, packet.header.payload_type);
-    try std.testing.expectEqual(989796, packet.payload.receiver_report.ssrc);
-    try std.testing.expectEqualSlices(u8, data[32..36], packet.payload.receiver_report.profile_extensions);
+    try std.testing.expectEqual(989796, packet.payload.rr.ssrc);
+    try std.testing.expectEqualSlices(u8, data[32..36], packet.payload.rr.profile_extensions);
 }
 
 test "SenderReport.fromSlice: parses all fields" {
@@ -436,7 +465,23 @@ test "Packet: parse source description" {
 
     const packet = try Packet.parse(&data);
     try testing.expectEqual(PayloadType.source_description, packet.header.payload_type);
-    try testing.expectEqualSlices(u8, data[4..], packet.payload.source_description.chunks_bytes);
+    try testing.expectEqualSlices(u8, data[4..], packet.payload.sdes.chunks_bytes);
+}
+
+test "Packet: parse RTP-FB Nack" {
+    const data = [_]u8{
+        0x81, 0xCD, 0x00, 0x03,
+        0x12, 0x34, 0x56, 0x78,
+        0x9A, 0xBC, 0xDE, 0xF0,
+        0x03, 0xE8, 0x00, 0x05,
+    };
+
+    const packet = try Packet.parse(&data);
+    try testing.expectEqual(PayloadType.rtp_fb, packet.header.payload_type);
+    try testing.expectEqual(1, packet.header.rc);
+    try testing.expectEqual(305419896, packet.payload.nack.sender_ssrc);
+    try testing.expectEqual(2596069104, packet.payload.nack.media_ssrc);
+    try testing.expectEqualSlices(u8, data[12..], packet.payload.nack.fci);
 }
 
 test "Compound packet: iterate" {
@@ -471,7 +516,7 @@ test "Compound packet: iterate" {
     try testing.expect(packet != null);
     try testing.expectEqual(.source_description, packet.?.header.payload_type);
 
-    var sdes = packet.?.payload.source_description;
+    var sdes = packet.?.payload.sdes;
     var chunk_it = sdes.iterateChunks();
     const chunk = (try chunk_it.next()).?;
     try std.testing.expect(try chunk_it.next() == null);
