@@ -274,7 +274,7 @@ pub const AttributeIterator = struct {
             .ip6 => {
                 var ip = Io.net.IpAddress{ .ip6 = .unspecified(port) };
                 for (ip.ip6.bytes[0..4], 0..) |*b, idx| b.* = value[4 + idx] ^ cookie[idx];
-                for (ip.ip4.bytes[4..], 0..) |*b, idx| b.* = value[8 + idx] ^ tx_id[idx];
+                for (ip.ip6.bytes[4..], 0..) |*b, idx| b.* = value[8 + idx] ^ tx_id[idx];
                 break :blk ip;
             },
         };

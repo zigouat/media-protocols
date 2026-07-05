@@ -2,6 +2,7 @@ const std = @import("std");
 const stun = @import("stun");
 const ice = @import("ice.zig");
 const IfIterator = @import("if_iterator.zig");
+const Messages = @import("messages.zig");
 
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
@@ -78,14 +79,6 @@ const SelectedPair = struct {
     inline fn sendData(self: *const SelectedPair, io: Io, data: []const u8) Socket.SendError!void {
         try self.socket.send(io, &self.pair.remote.address, data);
     }
-};
-
-const StunRequest = struct {
-    username: []const u8 = &.{},
-    ice_controlled: ?u64 = null,
-    ice_controlling: ?u64 = null,
-    use_candidate: bool = false,
-    priority: u32 = 0,
 };
 
 const PendingRequest = struct {
@@ -357,7 +350,7 @@ fn handleRequest(agent: *Agent, msg: *const stun.Message, base_addr: IpAddress, 
     const buffer = try agent.createPacket();
     errdefer agent.destroyPacket(buffer);
 
-    const stun_req = agent.parseAndValidateStunRequest(msg) catch |err| switch (err) {
+    const stun_req = Messages.parseAndValidateStunRequest(msg, agent.credentials, agent.role, agent.tie_breaker) catch |err| switch (err) {
         error.RoleConflict => return try agent.buildRoleConflictErrorMessage(msg.header.transaction_id, buffer),
         else => |e| return e,
     };
@@ -408,7 +401,7 @@ fn handleSuccessResponse(agent: *Agent, msg: *const stun.Message, base_addr: IpA
     if (!pending_request.source.eql(&base_addr) or !pending_request.target.eql(&from)) return;
 
     if (agent.findCandidatePair(&base_addr, &from)) |candidate_pair| {
-        const mapped_address = try agent.parseAndValidateStunResponse(msg);
+        const mapped_address = try Messages.parseAndValidateStunResponse(msg, agent.remote_credentials.?);
 
         if (mapped_address.eql(&base_addr)) {
             candidate_pair.status = .succeeded;
@@ -449,68 +442,6 @@ fn maybeSetNominatedField(agent: *Agent, candidate_pair: *CandidatePair) void {
         agent.nominated_pair.?.pair.nominated = true;
         agent.selected_pair = null;
     }
-}
-
-fn parseAndValidateStunRequest(agent: *Agent, msg: *const stun.Message) !StunRequest {
-    var it = msg.iterateAttributes(agent.credentials.password);
-    var has_fingerprint: bool = false;
-    var has_message_integrity = false;
-    var stun_request: StunRequest = .{};
-
-    while (try it.next()) |attribute| switch (attribute) {
-        .username => |u| stun_request.username = u,
-        .ice_controlled => |v| stun_request.ice_controlled = v,
-        .ice_controlling => |v| stun_request.ice_controlling = v,
-        .use_candidate => stun_request.use_candidate = true,
-        .priority => |p| stun_request.priority = p,
-        .fingerprint => has_fingerprint = true,
-        .message_integrity => has_message_integrity = true,
-        else => {},
-    };
-
-    if (!has_fingerprint or !has_message_integrity)
-        return error.InvalidStunMessage;
-    if (stun_request.ice_controlling == null and stun_request.ice_controlled == null or
-        stun_request.ice_controlling != null and stun_request.ice_controlled != null)
-        return error.InvalidStunMessage;
-
-    if (stun_request.ice_controlled != null and agent.role == .controlled) {
-        if (agent.tie_breaker >= stun_request.ice_controlled.?)
-            return error.SwitchRole
-        else
-            return error.RoleConflict;
-    }
-
-    if (stun_request.ice_controlling != null and agent.role == .controlling) {
-        if (agent.tie_breaker >= stun_request.ice_controlling.?)
-            return error.RoleConflict
-        else
-            return error.SwitchRole;
-    }
-
-    if (stun_request.use_candidate and agent.role == .controlling)
-        return error.InvalidStunMessage;
-
-    //TODO: check username
-
-    return stun_request;
-}
-
-fn parseAndValidateStunResponse(agent: *Agent, msg: *const stun.Message) !IpAddress {
-    var it = msg.iterateAttributes(agent.remote_credentials.?.password);
-    var has_fingerprint: bool = false;
-    var has_message_integrity = false;
-    var maybe_addr: ?IpAddress = null;
-
-    while (try it.next()) |attribute| switch (attribute) {
-        .xor_mapped_address => |value| maybe_addr = value,
-        .fingerprint => has_fingerprint = true,
-        .message_integrity => has_message_integrity = true,
-        else => {},
-    };
-
-    if (!has_fingerprint or !has_message_integrity) return error.InvalidStunMessage;
-    return if (maybe_addr) |addr| addr else error.MissingMappedAddress;
 }
 
 fn buildBindingRequest(agent: *Agent, tx_id: u96, use_candidate: bool, buffer: []u8) ![]const u8 {
@@ -870,7 +801,7 @@ fn handleConsentFreshness(agent: *Agent, incoming_message: Io.net.IncomingMessag
     switch (msg.header.message_type.class()) {
         .request => {
             Logger.debug("Received consent freshness request", .{});
-            _ = try agent.parseAndValidateStunRequest(&msg);
+            _ = try Messages.parseAndValidateStunRequest(&msg, agent.credentials, agent.role, agent.tie_breaker);
             const buffer = try agent.createPacket();
             defer agent.destroyPacket(buffer);
 
@@ -901,7 +832,7 @@ fn testNewAgent() !Agent {
     return try .init(testing.io, testing.allocator, .{ .role = .controlled });
 }
 
-fn testBuildRequest(req: StunRequest, peer_password: []const u8, buffer: []u8) !stun.Message {
+fn testBuildRequest(req: Messages.StunRequest, peer_password: []const u8, buffer: []u8) !stun.Message {
     var w = stun.Writer.init(buffer, .{ .password = peer_password });
     try w.writeHeader(.{
         .message_type = .fromClassAndMethod(.request, .binding),
@@ -917,6 +848,10 @@ fn testBuildRequest(req: StunRequest, peer_password: []const u8, buffer: []u8) !
     try w.writeAttribute(.fingerprint);
 
     return try stun.Message.parse(w.final());
+}
+
+test {
+    _ = @import("messages.zig");
 }
 
 test "init agent" {
