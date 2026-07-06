@@ -1,5 +1,6 @@
 const std = @import("std");
 const Reader = std.Io.Reader;
+const Writer = std.Io.Writer;
 
 const Attribute = @This();
 
@@ -90,7 +91,7 @@ pub const ParsedAttribute = union(AttributeType) {
     ssrc_group: Group,
     unknown,
 
-    pub fn write(attr: ParsedAttribute, w: *std.Io.Writer) std.Io.Writer.Error!void {
+    pub fn write(attr: ParsedAttribute, w: *Writer) Writer.Error!void {
         switch (attr) {
             .bundle_only => try w.writeAll("a=bundle-only\r\n"),
             .control => |url| try w.print("a=control:{s}\r\n", .{url}),
@@ -112,6 +113,7 @@ pub const ParsedAttribute = union(AttributeType) {
             .ice_ufrag => |v| try w.print("a=ice-ufrag:{s}\r\n", .{v}),
             .ice_pwd => |v| try w.print("a=ice-pwd:{s}\r\n", .{v}),
             .mid => |v| try w.print("a=mid:{s}\r\n", .{v}),
+            .msid => |msid| try msid.write(w),
             .setup => |v| try w.print("a=setup:{s}\r\n", .{@tagName(v)}),
             .rtpmap => |rtpmap| try w.print("a={f}\r\n", .{rtpmap}),
             .rtcp_mux => try w.writeAll("a=rtcp-mux\r\n"),
@@ -216,7 +218,7 @@ pub const RtpMap = struct {
         };
     }
 
-    pub fn format(self: @This(), writer: *std.Io.Writer) std.Io.Writer.Error!void {
+    pub fn format(self: @This(), writer: *Writer) Writer.Error!void {
         try writer.print("rtpmap:{} {s}/{}", .{ self.payload_type, self.encoding, self.clock_rate });
         if (self.channels) |channels| try writer.print("/{}", .{channels});
     }
@@ -249,7 +251,7 @@ pub const Fmtp = struct {
                 .{ .unknown = params };
         }
 
-        pub fn format(self: @This(), writer: *std.Io.Writer) std.Io.Writer.Error!void {
+        pub fn format(self: @This(), writer: *Writer) Writer.Error!void {
             switch (self) {
                 .h264 => |params| {
                     try writer.print("packetization-mode={};level-asymmetry-allowed={};profile-level-id={x}", .{
@@ -368,7 +370,7 @@ pub const Fingerprint = union(enum) {
         return error.InvalidAttribute;
     }
 
-    pub fn write(fingeprint: *const Fingerprint, w: *std.Io.Writer) !void {
+    pub fn write(fingeprint: *const Fingerprint, w: *Writer) !void {
         switch (fingeprint.*) {
             .sha_256 => |hash| {
                 try w.print("sha-256 {X:0>2}", .{hash[0]});
@@ -388,6 +390,12 @@ pub const Msid = struct {
             .{ .id = value[0..space_idx], .app_data = value[space_idx + 1 ..] }
         else
             .{ .id = value };
+    }
+
+    fn write(msid: *const Msid, w: *Writer) Writer.Error!void {
+        try w.print("a=msid:{s}", .{msid.id});
+        if (msid.app_data) |app_data| try w.print(" {s}", .{app_data});
+        try w.writeAll("\r\n");
     }
 };
 
@@ -436,7 +444,7 @@ pub const ExtMap = struct {
         return extmap;
     }
 
-    pub fn write(extmap: *const ExtMap, w: *std.Io.Writer) !void {
+    pub fn write(extmap: *const ExtMap, w: *Writer) !void {
         try w.printInt(extmap.id, 10, .lower, .{});
         if (extmap.direction) |direction| {
             try w.writeByte('/');
@@ -788,12 +796,12 @@ test "parse attribute" {
     }
 }
 
-test "ParsedAttribute write" {
+test "ParsedAttribute: write" {
     var buffer: [256]u8 = undefined;
-    var w = std.Io.Writer.fixed(&buffer);
+    var w = Writer.fixed(&buffer);
 
     const expectWrite = struct {
-        fn f(writer: *std.Io.Writer, attr: ParsedAttribute, expected: []const u8) !void {
+        fn f(writer: *Writer, attr: ParsedAttribute, expected: []const u8) !void {
             try attr.write(writer);
             try std.testing.expectEqualStrings(expected, writer.buffered());
             _ = writer.consumeAll();
@@ -839,7 +847,6 @@ test "ParsedAttribute write" {
     try expectWrite(&w, .{ .candidate = "1 1 UDP 2130706431 192.168.1.1 54321 typ host" }, "");
     try expectWrite(&w, .{ .fmtp = .{ 96, "minptime=10" } }, "");
     try expectWrite(&w, .{ .group = .{ .semantics = .BUNDLE, .mids = "0 1" } }, "");
-    try expectWrite(&w, .{ .msid = .{ .id = "stream-id" } }, "");
     try expectWrite(&w, .{ .control = "trackID=0" }, "a=control:trackID=0\r\n");
     try expectWrite(&w, .unknown, "");
 
@@ -857,6 +864,18 @@ test "ParsedAttribute write" {
 
     try expectWrite(&w, .{ .ice_options = .{ .ice2 = true } }, "a=ice-options:ice2 \r\n");
     try expectWrite(&w, .{ .ice_options = .{ .ice2 = true, .trickle = true } }, "a=ice-options:ice2 trickle \r\n");
+
+    try expectWrite(
+        &w,
+        .{ .msid = .{ .id = "stream-id", .app_data = "track-id" } },
+        "a=msid:stream-id track-id\r\n",
+    );
+
+    try expectWrite(
+        &w,
+        .{ .msid = .{ .id = "stream-id" } },
+        "a=msid:stream-id\r\n",
+    );
 
     try expectWrite(
         &w,
