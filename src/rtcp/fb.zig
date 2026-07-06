@@ -1,13 +1,16 @@
 //! Describes the RTCP Feedback (FB) packet format as defined in RFC 4585.
 const std = @import("std");
 const rtcp = @import("rtcp.zig");
+const Io = std.Io;
+
+pub const pli_size = 8;
 
 pub const Nack = struct {
     sender_ssrc: u32,
     media_ssrc: u32,
     fci: []const u8,
 
-    pub fn parse(data: []const u8) rtcp.Error!Nack {
+    pub fn decode(data: []const u8) rtcp.Error!Nack {
         if (data.len < 12 or @rem(data.len, 4) != 0) return error.MalformedPacket;
         const sender_ssrc = std.mem.readInt(u32, data[0..4], .big);
         const source_ssrc = std.mem.readInt(u32, data[4..8], .big);
@@ -45,9 +48,39 @@ pub const Nack = struct {
     };
 };
 
-test "Nack: parse" {
+/// Describes a payload specific feedback (PSFB) packet for Picture Loss Indication (PLI) as defined in RFC 4585.
+///
+/// PLI is used by decoder to inform encoder that it has lost an undefined amount of pictures and requests a new keyframe to be sent.
+pub const PLI = struct {
+    /// The SSRC of the sender of this feedback packet.
+    sender_ssrc: u32,
+    /// The SSRC of the remote media source.
+    media_ssrc: u32,
+
+    /// Decodes a PLI packet from the given data slice.
+    pub fn decode(data: []const u8) rtcp.Error!PLI {
+        if (data.len != pli_size) return error.MalformedPacket;
+        const sender_ssrc = std.mem.readInt(u32, data[0..4], .big);
+        const source_ssrc = std.mem.readInt(u32, data[4..8], .big);
+        return PLI{ .sender_ssrc = sender_ssrc, .media_ssrc = source_ssrc };
+    }
+
+    /// Encodes a PLI packet into the given buffer.
+    pub fn encode(pli: *const PLI, buffer: *[pli_size]u8) void {
+        std.mem.writeInt(u32, buffer[0..4], pli.sender_ssrc, .big);
+        std.mem.writeInt(u32, buffer[4..8], pli.media_ssrc, .big);
+    }
+
+    /// Writes a PLI packet to the given writer.
+    pub fn writerEncode(pli: *const PLI, writer: *Io.Writer) Io.Writer.Error!void {
+        try writer.writeInt(u32, pli.sender_ssrc, .big);
+        try writer.writeInt(u32, pli.media_ssrc, .big);
+    }
+};
+
+test "Nack: decode" {
     const data = [_]u8{ 0, 1, 225, 185, 0, 1, 182, 103, 0, 100, 144, 4, 0, 117, 0, 128, 0, 153, 0, 0 };
-    const fb = try Nack.parse(&data);
+    const fb = try Nack.decode(&data);
 
     try std.testing.expectEqual(123_321, fb.sender_ssrc);
     try std.testing.expectEqual(112_231, fb.media_ssrc);
@@ -57,7 +90,7 @@ test "Nack: parse" {
 test "NACK: iterate sequence numbers" {
     // [100, 103, 113, 116, 117, 125, 153, 169, 400]
     const data = [_]u8{ 0, 1, 225, 185, 0, 1, 182, 103, 0, 100, 144, 4, 0, 117, 0, 128, 0, 153, 128, 0, 1, 144, 0, 0 };
-    const fb = try Nack.parse(&data);
+    const fb = try Nack.decode(&data);
     var it = fb.iterateSequenceNumbers();
 
     try std.testing.expectEqual(100, it.next().?);
@@ -70,4 +103,31 @@ test "NACK: iterate sequence numbers" {
     try std.testing.expectEqual(169, it.next().?);
     try std.testing.expectEqual(400, it.next().?);
     try std.testing.expect(it.next() == null);
+}
+
+test "PLI: decode" {
+    const data = [_]u8{ 0, 1, 225, 185, 0, 1, 182, 103 };
+    const fb = try PLI.decode(&data);
+
+    try std.testing.expectEqual(123_321, fb.sender_ssrc);
+    try std.testing.expectEqual(112_231, fb.media_ssrc);
+}
+
+test "PLI: encode" {
+    var expected = [_]u8{ 0, 1, 225, 185, 0, 1, 182, 103 };
+    var buffer: [pli_size]u8 = undefined;
+
+    const pli = PLI{ .sender_ssrc = 123_321, .media_ssrc = 112_231 };
+    PLI.encode(&pli, &buffer);
+    try std.testing.expectEqualSlices(u8, &expected, buffer[0..]);
+}
+
+test "PLI: writer encode" {
+    var expected = [_]u8{ 0, 1, 225, 185, 0, 1, 182, 103 };
+    var buffer: [pli_size]u8 = undefined;
+    const pli = PLI{ .sender_ssrc = 123_321, .media_ssrc = 112_231 };
+
+    var writer = Io.Writer.fixed(&buffer);
+    try PLI.writerEncode(&pli, &writer);
+    try std.testing.expectEqualSlices(u8, &expected, buffer[0..]);
 }
