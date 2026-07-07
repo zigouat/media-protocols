@@ -4,7 +4,7 @@ const std = @import("std");
 const Reader = std.Io.Reader;
 const Self = @This();
 
-pub const ParseError = error{EndOfStream};
+pub const ParseError = error{MalformedPacket};
 pub const WriteError = error{WriteFailed};
 
 /// Describes an RTP header.
@@ -248,16 +248,16 @@ pub fn parse(data: []const u8) ParseError!Self {
         .payload = &.{},
     };
 
-    packet.header = reader.takeStruct(Header, .big) catch return error.EndOfStream;
-    const csrc_count = reader.take(@as(usize, packet.header.csrc_count) * 4) catch return error.EndOfStream;
+    packet.header = reader.takeStruct(Header, .big) catch return error.MalformedPacket;
+    const csrc_count = reader.take(@as(usize, packet.header.csrc_count) * 4) catch return error.MalformedPacket;
     packet.csrc_list = std.mem.bytesAsSlice(u32, csrc_count);
 
-    if (packet.header.extension) packet.extension = Extension.parse(&reader) catch return error.EndOfStream;
+    if (packet.header.extension) packet.extension = Extension.parse(&reader) catch return error.MalformedPacket;
 
     if (packet.header.padding) {
         if (reader.seek >= data.len or data[data.len - 1] != data.len - reader.seek) {
             @branchHint(.unlikely);
-            return error.EndOfStream;
+            return error.MalformedPacket;
         }
 
         packet.padding_size = data[data.len - 1];
@@ -342,7 +342,7 @@ test "packet too short" {
     const short_packet: [10]u8 = [_]u8{ 0x80, 0xE0, 0x51, 0xA4, 0x00, 0x0D, 0xDF, 0x22, 0x54, 0xA7 };
 
     const result = Self.parse(short_packet[0..]);
-    try std.testing.expectError(ParseError.EndOfStream, result);
+    try std.testing.expectError(ParseError.MalformedPacket, result);
 }
 
 test "packet with csrc" {

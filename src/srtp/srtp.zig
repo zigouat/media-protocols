@@ -6,6 +6,9 @@ const ReplayDetector = @import("replay_detector.zig");
 
 const default_replay_detection_window = 64;
 
+pub const EncryptError = std.mem.Allocator.Error || rtp.Packet.ParseError;
+pub const DecryptError = std.mem.Allocator.Error || rtp.Packet.ParseError || ReplayDetector.Error || error{AuthenticationFailed};
+
 /// An enum describing the list of supported SRTP profiles.
 pub const Profile = enum {
     AesCm128HmacSha1_80,
@@ -141,6 +144,7 @@ const RtcpSsrcState = struct {
     }
 };
 
+/// A struct representing an SRTP session, which holds the master key, salt, cipher, and state for RTP and RTCP SSRCs.
 pub const Session = struct {
     master_key: []const u8,
     salt: []const u8,
@@ -174,11 +178,13 @@ pub const Session = struct {
         session.rtcp_ssrc_states.deinit();
     }
 
-    pub inline fn encryptRtp(session: *Session, rtp_data: []const u8, dst: []u8) ![]const u8 {
+    /// Encrypts an RTP packet using the SRTP session's cipher.
+    pub inline fn encryptRtp(session: *Session, rtp_data: []const u8, dst: []u8) EncryptError![]const u8 {
         return try processRtp(session, rtp_data, dst, true);
     }
 
-    pub fn encryptRtcp(session: *Session, rtcp_data: []const u8, dst: []u8) ![]const u8 {
+    /// Encrypts an RTCP packet using the SRTP session's cipher.
+    pub fn encryptRtcp(session: *Session, rtcp_data: []const u8, dst: []u8) std.mem.Allocator.Error![]const u8 {
         const ssrc = std.mem.readInt(u32, rtcp_data[4..8], .big);
 
         const entry = session.rtcp_ssrc_states.getPtr(ssrc);
@@ -193,7 +199,7 @@ pub const Session = struct {
 
         switch (session.cipher) {
             .AesCm128HmacSha1_80, .AesCm128HmacSha1_32 => |*c| {
-                const result = try c.encryptRtcp(rtcp_data, dst, rtcp_ssrc_state.index);
+                const result = c.encryptRtcp(rtcp_data, dst, rtcp_ssrc_state.index);
                 rtcp_ssrc_state.index +%= 1;
                 if (entry == null) {
                     @branchHint(.cold);
@@ -205,10 +211,12 @@ pub const Session = struct {
         }
     }
 
-    pub inline fn decryptRtp(session: *Session, rtp_data: []const u8, dst: []u8) ![]const u8 {
+    /// Decrypts an RTP packet using the SRTP session's cipher.
+    pub inline fn decryptRtp(session: *Session, rtp_data: []const u8, dst: []u8) DecryptError![]const u8 {
         return try processRtp(session, rtp_data, dst, false);
     }
 
+    /// Decrypts an RTCP packet using the SRTP session's cipher.
     pub fn decryptRtcp(session: *Session, rtcp_data: []const u8, dst: []u8) ![]const u8 {
         const profile = @as(Profile, session.cipher);
         const tag_size = profile.rtcpTagLength();
@@ -249,7 +257,7 @@ pub const Session = struct {
         return dst[0..];
     }
 
-    fn processRtp(session: *Session, rtp_data: []const u8, dst: []u8, encrypt: bool) ![]const u8 {
+    fn processRtp(session: *Session, rtp_data: []const u8, dst: []u8, comptime encrypt: bool) ![]const u8 {
         const rtp_packet = try rtp.Packet.parse(rtp_data);
         const header_size = rtp_data.len - rtp_packet.payload.len - rtp_packet.padding_size;
 
@@ -269,7 +277,7 @@ pub const Session = struct {
         switch (session.cipher) {
             .AesCm128HmacSha1_32, .AesCm128HmacSha1_80 => |*c| {
                 const result = if (encrypt)
-                    try c.encryptRtp(roc, header_size, rtp_data, dst)
+                    c.encryptRtp(roc, header_size, rtp_data, dst)
                 else
                     try c.decryptRtp(roc, header_size, rtp_data, dst);
                 rtp_ssrc_state.updateRolloverCount(rtp_packet.header.sequence_number, diff);
