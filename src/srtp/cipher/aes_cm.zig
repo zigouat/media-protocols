@@ -50,7 +50,7 @@ pub fn init(profile: srtp.Profile, master_key: []const u8, master_salt: []const 
     return cipher;
 }
 
-pub fn encryptRtp(cm: *AesCm, roc: u32, header_size: usize, src: []const u8, dst: []u8) Error![]const u8 {
+pub fn encryptRtp(cm: *AesCm, roc: u32, header_size: usize, src: []const u8, dst: []u8) []const u8 {
     const tag_size = cm.profile.rtpTagLength();
     const roc_bytes: [4]u8 = std.mem.toBytes(std.mem.nativeToBig(u32, roc));
 
@@ -78,7 +78,7 @@ pub fn encryptRtp(cm: *AesCm, roc: u32, header_size: usize, src: []const u8, dst
     return dst[0 .. src.len + tag_size];
 }
 
-pub fn encryptRtcp(cm: *AesCm, src: []const u8, dst: []u8, index: u32) Error![]const u8 {
+pub fn encryptRtcp(cm: *AesCm, src: []const u8, dst: []u8, index: u32) []const u8 {
     const tag_size = cm.profile.rtcpTagLength();
     std.debug.assert(dst.len >= src.len + tag_size + rtcp_index_size);
 
