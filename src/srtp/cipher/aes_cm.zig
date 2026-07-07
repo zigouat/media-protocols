@@ -194,7 +194,7 @@ test "encrypt/decrypt rtp" {
 
     var enc_dst: [200]u8 = undefined;
     var dec_dst: [200]u8 = undefined;
-    const encrypted = try cm.encryptRtp(0, 12, &plain_rtp, &enc_dst);
+    const encrypted = cm.encryptRtp(0, 12, &plain_rtp, &enc_dst);
     const decrypted = try cm.decryptRtp(0, 12, encrypted, &dec_dst);
 
     try std.testing.expectEqualSlices(u8, &plain_rtp, decrypted);
@@ -212,7 +212,7 @@ test "encrypt/decrypt rtcp" {
     var enc_dst: [200]u8 = undefined;
     var dec_dst: [200]u8 = undefined;
     for (0..1000) |idx| {
-        const encrypted = try cm.encryptRtcp(&plain_rtcp, &enc_dst, @intCast(idx));
+        const encrypted = cm.encryptRtcp(&plain_rtcp, &enc_dst, @intCast(idx));
         const decrypted = try cm.decryptRtcp(encrypted, &dec_dst, true, @intCast(idx));
 
         try std.testing.expectEqualSlices(u8, &plain_rtcp, decrypted);
