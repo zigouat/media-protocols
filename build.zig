@@ -78,7 +78,7 @@ pub fn build(b: *std.Build) void {
     });
 
     {
-        const test_filters = b.option([]const []const u8, "test-filter", "Skip tests that do not match any filter") orelse &[0][]const u8{};
+        const test_filters = b.option([]const []const u8, "test-filters", "Skip tests that do not match any filter") orelse &[0][]const u8{};
         const modules = [_]*std.Build.Module{ rtp, rtcp, sdp, rtsp, stun, ice, srtp };
         const test_step = b.step("test", "Run tests");
 
