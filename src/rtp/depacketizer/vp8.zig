@@ -1,15 +1,10 @@
 const std = @import("std");
 const vp8 = @import("media").codecs.vp8;
-const FrameInfo = @import("frame_info.zig");
+const Depacketizer = @import("../depacketizer.zig");
 
-const Depacketizer = @This();
+const VP8 = @This();
 
 pub const Config = struct {};
-
-pub const Error = error{
-    /// The destination buffer is too small to hold the depacketized frame.
-    ShortBuffer,
-} || std.Io.Reader.Error;
 
 const PayloadDescriptor = struct {
     non_reference: bool,
@@ -51,31 +46,30 @@ const PayloadDescriptor = struct {
 };
 
 /// Initializes a new VP8 depacketizer.
-pub fn init(config: Config) Depacketizer {
+pub fn init(config: Config) VP8 {
     _ = config;
     return .{};
 }
 
 /// Depacketizes a VP8 RTP packet and writes it to the destination buffer.
-pub fn depacketize(self: *Depacketizer, payload: []const u8, dest: []u8) Error!?FrameInfo {
+pub fn depacketize(self: *VP8, payload: []const u8, w: *std.Io.Writer) Depacketizer.Error!?Depacketizer.FrameInfo {
     _ = self;
     var reader = std.Io.Reader.fixed(payload);
 
-    const pd = try PayloadDescriptor.parse(&reader);
+    const pd = PayloadDescriptor.parse(&reader) catch return error.InvalidPacket;
 
-    const size = reader.bufferedLen();
     const keyframe = blk: {
         if (!pd.partition_start or pd.partition_id != 0) break :blk false;
-        break :blk ((try reader.peekByte()) & 0x1) == 0;
+        const byte = reader.peekByte() catch return error.InvalidPacket;
+        break :blk (byte & 0x1) == 0;
     };
 
-    if (size > dest.len) return Error.ShortBuffer;
-    @memcpy(dest[0..size], reader.buffered());
-    return .{ .written = size, .keyframe = keyframe };
+    try w.writeAll(reader.buffered());
+    return .{ .keyframe = keyframe };
 }
 
-test "depacketize" {
-    var depack: Depacketizer = .{};
+test "VP8 Depacktize: simple packet" {
+    var depack: VP8 = .{};
 
     const data = [_]u8{
         0x90, 0x80, 0xf4, 0xc3, 0x90, 0xd8,
@@ -85,9 +79,11 @@ test "depacketize" {
         0x61, 0x22, 0x0d,
     };
 
-    var dest: [1024]u8 = undefined;
-    const frame_info = try depack.depacketize(&data, &dest);
+    var writer_alloc = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer writer_alloc.deinit();
+
+    const frame_info = try depack.depacketize(&data, &writer_alloc.writer);
     try std.testing.expect(frame_info != null);
     try std.testing.expect(frame_info.?.keyframe);
-    try std.testing.expectEqual(23, frame_info.?.written);
+    try std.testing.expectEqual(23, writer_alloc.writer.buffered().len);
 }
