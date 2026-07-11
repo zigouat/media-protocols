@@ -51,7 +51,7 @@ pub fn init(config: Config) VP8 {
     return .{};
 }
 
-/// Depacketizes a VP8 RTP packet and writes it to the destination buffer.
+/// Depacketizes a VP8 rtp packet.
 pub fn depacketize(self: *VP8, payload: []const u8, w: *std.Io.Writer) Depacketizer.Error!?Depacketizer.FrameInfo {
     _ = self;
     var reader = std.Io.Reader.fixed(payload);
