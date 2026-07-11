@@ -43,4 +43,6 @@ pub const RtpConfig = struct {
 
 test {
     _ = @import("packetizer/h264.zig");
+    _ = @import("packetizer/vp8.zig");
+    _ = @import("packetizer/opus.zig");
 }
