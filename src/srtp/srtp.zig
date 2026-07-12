@@ -146,7 +146,7 @@ const RtcpSsrcState = struct {
 
 /// A struct representing an SRTP session, which holds the master key, salt, cipher, and state for RTP and RTCP SSRCs.
 ///
-/// This session only guards againt race condition for different ssrc, so calling encrypt/decrypt for the same ssrc and same
+/// This session only guards againt data races for different ssrc, so calling encrypt/decrypt for the same ssrc and same
 /// packet type (rtp/rtcp) from different threads is not safe.
 pub const Session = struct {
     io: std.Io,
