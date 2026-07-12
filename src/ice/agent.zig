@@ -205,11 +205,15 @@ pub fn gatherCandidates(agent: *Agent) !void {
 
 pub fn sendData(agent: *const Agent, data: []const u8) Socket.SendError!void {
     switch (agent.connection_state) {
-        .connected, .completed => try agent.nominated_pair.?.sendData(agent.io, data),
+        .connected, .completed => {
+            @branchHint(.likely);
+            try agent.nominated_pair.?.sendData(agent.io, data);
+        },
         else => Logger.warn("Agent not connected: ignore send request", .{}),
     }
 }
 
+/// Gets a buffer from the pool to be used for sending or receiving data.
 pub fn createPacket(agent: *Agent) Allocator.Error![]u8 {
     agent.mutex.lockUncancelable(agent.io);
     defer agent.mutex.unlock(agent.io);
@@ -342,7 +346,7 @@ fn handleRequest(agent: *Agent, msg: *const stun.Message, base_addr: IpAddress, 
     errdefer agent.destroyPacket(buffer);
 
     const stun_req = Messages.parseAndValidateStunRequest(msg, agent.credentials, agent.role, agent.tie_breaker) catch |err| switch (err) {
-        error.RoleConflict => return try agent.buildRoleConflictErrorMessage(msg.header.transaction_id, buffer),
+        error.RoleConflict => return try Messages.buildRoleConflictErrorMessage(msg.header.transaction_id, agent.credentials.password, buffer),
         else => |e| return e,
     };
 
@@ -371,7 +375,7 @@ fn handleRequest(agent: *Agent, msg: *const stun.Message, base_addr: IpAddress, 
         });
     }
 
-    return try agent.buildSuccessResponse(msg, from, buffer);
+    return try Messages.buildSuccessResponse(msg, agent.credentials.password, from, buffer);
 }
 
 fn handleSuccessResponse(agent: *Agent, msg: *const stun.Message, base_addr: IpAddress, from: IpAddress) !void {
@@ -455,40 +459,6 @@ fn buildBindingRequest(agent: *Agent, tx_id: u96, use_candidate: bool, buffer: [
     try w.writeAttribute(.{ .message_integrity = &.{} });
     try w.writeAttribute(.fingerprint);
 
-    return w.final();
-}
-
-fn buildSuccessResponse(
-    agent: *const Agent,
-    msg: *const stun.Message,
-    from: IpAddress,
-    buffer: []u8,
-) ![]const u8 {
-    var w = stun.Writer.init(buffer, .{ .password = agent.credentials.password });
-    try w.writeHeader(.{
-        .message_type = .fromClassAndMethod(.success_response, .binding),
-        .transaction_id = msg.header.transaction_id,
-        .message_length = 0,
-    });
-    try w.writeAttribute(.{ .xor_mapped_address = from });
-    try w.writeAttribute(.{ .message_integrity = &.{} });
-    try w.writeAttribute(.fingerprint);
-    return w.final();
-}
-
-fn buildRoleConflictErrorMessage(agent: *const Agent, transaction_id: u96, buffer: []u8) ![]const u8 {
-    var w = stun.Writer.init(buffer, .{ .password = agent.credentials.password });
-    try w.writeHeader(.{
-        .message_type = .fromClassAndMethod(.error_response, .binding),
-        .transaction_id = transaction_id,
-        .message_length = 0,
-    });
-    try w.writeAttribute(.{ .error_code = .{
-        .code = 487,
-        .reason = "Role conflict",
-    } });
-    try w.writeAttribute(.{ .message_integrity = &.{} });
-    try w.writeAttribute(.fingerprint);
     return w.final();
 }
 
@@ -737,6 +707,11 @@ fn handleConnectivityCheckMessage(agent: *Agent, message: Message) !?Event {
 
     if (stun.isMessage(data)) {
         defer agent.destroyPacket(data);
+        switch (agent.connection_state) {
+            .completed, .failed, .closed => return null, // sockets are closed
+            else => {},
+        }
+
         const msg = try stun.Message.parse(data);
 
         switch (msg.header.message_type.class()) {
@@ -796,7 +771,7 @@ fn handleConsentFreshness(agent: *Agent, incoming_message: Io.net.IncomingMessag
             const buffer = try agent.createPacket();
             defer agent.destroyPacket(buffer);
 
-            const resp = try agent.buildSuccessResponse(&msg, incoming_message.from, buffer);
+            const resp = try Messages.buildSuccessResponse(&msg, agent.credentials.password, incoming_message.from, buffer);
             try agent.nominated_pair.?.socket.send(agent.io, &incoming_message.from, resp);
         },
         else => {},

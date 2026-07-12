@@ -2,6 +2,8 @@ const std = @import("std");
 const stun = @import("stun");
 const ice = @import("ice.zig");
 
+const IpAddress = std.Io.net.IpAddress;
+
 pub const StunRequest = struct {
     tx_id: u96 = 0,
     username: []const u8 = &.{},
@@ -61,11 +63,11 @@ pub fn parseAndValidateStunRequest(
     return stun_request;
 }
 
-pub fn parseAndValidateStunResponse(msg: *const stun.Message, credentials: ice.Credentials) !std.Io.net.IpAddress {
+pub fn parseAndValidateStunResponse(msg: *const stun.Message, credentials: ice.Credentials) !IpAddress {
     var it = msg.iterateAttributes(credentials.password);
     var has_fingerprint: bool = false;
     var has_message_integrity = false;
-    var maybe_addr: ?std.Io.net.IpAddress = null;
+    var maybe_addr: ?IpAddress = null;
 
     while (try it.next()) |attribute| switch (attribute) {
         .xor_mapped_address => |value| maybe_addr = value,
@@ -76,6 +78,37 @@ pub fn parseAndValidateStunResponse(msg: *const stun.Message, credentials: ice.C
 
     if (!has_fingerprint or !has_message_integrity) return error.InvalidStunMessage;
     return if (maybe_addr) |addr| addr else error.MissingMappedAddress;
+}
+
+pub fn buildSuccessResponse(
+    msg: *const stun.Message,
+    password: []const u8,
+    from: IpAddress,
+    buffer: []u8,
+) ![]const u8 {
+    var w = stun.Writer.init(buffer, .{ .password = password });
+    try w.writeHeader(.{
+        .message_type = .fromClassAndMethod(.success_response, .binding),
+        .transaction_id = msg.header.transaction_id,
+        .message_length = 0,
+    });
+    try w.writeAttribute(.{ .xor_mapped_address = from });
+    try w.writeAttribute(.{ .message_integrity = &.{} });
+    try w.writeAttribute(.fingerprint);
+    return w.final();
+}
+
+pub fn buildRoleConflictErrorMessage(transaction_id: u96, pwd: []const u8, buffer: []u8) ![]const u8 {
+    var w = stun.Writer.init(buffer, .{ .password = pwd });
+    try w.writeHeader(.{
+        .message_type = .fromClassAndMethod(.error_response, .binding),
+        .transaction_id = transaction_id,
+        .message_length = 0,
+    });
+    try w.writeAttribute(.{ .error_code = .{ .code = 487, .reason = "Role conflict" } });
+    try w.writeAttribute(.{ .message_integrity = &.{} });
+    try w.writeAttribute(.fingerprint);
+    return w.final();
 }
 
 const testing = std.testing;
@@ -111,7 +144,7 @@ fn buildRequest(buffer: []u8, opts: RequestOptions) !stun.Message {
     return stun.Message.parse(out.final());
 }
 
-fn buildResponse(buffer: []u8, addr: ?std.Io.net.IpAddress, message_integrity: bool, fingerprint: bool) !stun.Message {
+fn buildResponse(buffer: []u8, addr: ?IpAddress, message_integrity: bool, fingerprint: bool) !stun.Message {
     var out = stun.Writer.init(buffer, .{ .password = test_password });
     try out.writeHeader(.{
         .message_type = .fromClassAndMethod(.success_response, .binding),
@@ -198,7 +231,7 @@ test "parseAndValidateStunRequest: use candidate rejected when controlling" {
 }
 
 test "parseAndValidateStunResponse: valid response" {
-    const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 192, 0, 2, 1 }, .port = 32853 } };
+    const addr = IpAddress{ .ip4 = .{ .bytes = .{ 192, 0, 2, 1 }, .port = 32853 } };
     var buffer: [256]u8 = undefined;
     const msg = try buildResponse(&buffer, addr, true, true);
 
@@ -207,14 +240,14 @@ test "parseAndValidateStunResponse: valid response" {
 }
 
 test "parseAndValidateStunResponse: missing fingerprint" {
-    const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 192, 0, 2, 1 }, .port = 32853 } };
+    const addr = IpAddress{ .ip4 = .{ .bytes = .{ 192, 0, 2, 1 }, .port = 32853 } };
     var buffer: [256]u8 = undefined;
     const msg = try buildResponse(&buffer, addr, true, false);
     try testing.expectError(error.InvalidStunMessage, parseAndValidateStunResponse(&msg, test_credentials));
 }
 
 test "parseAndValidateStunResponse: missing message integrity" {
-    const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 192, 0, 2, 1 }, .port = 32853 } };
+    const addr = IpAddress{ .ip4 = .{ .bytes = .{ 192, 0, 2, 1 }, .port = 32853 } };
     var buffer: [256]u8 = undefined;
     const msg = try buildResponse(&buffer, addr, false, true);
     try testing.expectError(error.InvalidStunMessage, parseAndValidateStunResponse(&msg, test_credentials));
