@@ -23,7 +23,7 @@ pub fn deinit(replay_detector: *ReplayDetector, allocator: std.mem.Allocator) vo
 
 pub fn check(replay_detector: *ReplayDetector, seq: u64) Error!void {
     if (seq <= replay_detector.last_seq) {
-        if (replay_detector.last_seq > seq + replay_detector.window_size) return error.TooOld;
+        if (replay_detector.last_seq >= seq + replay_detector.window_size) return error.TooOld;
         switch (replay_detector.mask.bit(replay_detector.last_seq - seq)) {
             true => return error.Replayed,
             false => {},
