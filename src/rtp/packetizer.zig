@@ -1,5 +1,6 @@
 pub const H264 = @import("packetizer/h264.zig");
 pub const VP8 = @import("packetizer/vp8.zig");
+pub const Opus = @import("packetizer/opus.zig");
 
 const std = @import("std");
 const Packet = @import("packet.zig");
