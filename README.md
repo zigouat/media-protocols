@@ -20,3 +20,23 @@ The projects is structured into modules, each module is a separate library that 
 ## Status
 
 This repo is under active development, and the implementations are not yet complete. Breaking changes may occur frequently.
+
+## Installation
+Add `media_protocols` as a dependency in your `build.zig.zon` file:
+
+```bash
+zig fetch --save git+https://github.com/zigouat/media-protocols.git#v0.1.0
+```
+
+Then, in your `build.zig` file, add the following:
+
+```zig
+const media_protocols = b.dependecy("media_protocols", .{ .target = .target, .optimize = optimize });
+
+/// You can all the whole module:
+exe.root_module.addImportPath("media_protocols", media_protocols.module("protocols"));
+
+/// Or you can import only the modules you need:
+exe.root_module.addImportPath("rtp", media_protocols.module("rtp"));
+exe.root_module.addImportPath("ice", media_protocols.module("ice"));
+```
