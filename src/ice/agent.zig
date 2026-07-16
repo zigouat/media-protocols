@@ -1,20 +1,25 @@
+//! This module implements an ICE (Interactive Connectivity Check) agent that can be used to establish a peer-to-peer connection.
+//!
+//! The implementation is based on RFC 8445.
+
 const std = @import("std");
 const stun = @import("stun");
 const ice = @import("ice.zig");
 const IfIterator = @import("if_iterator.zig");
 const Messages = @import("messages.zig");
+const CandidatePair = @import("candidate_pair.zig");
 
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
 const Socket = Io.net.Socket;
 const IpAddress = Io.net.IpAddress;
 const Candidate = ice.Candidate;
-const CandidatePair = ice.CandidatePair;
 const Agent = @This();
 const Logger = std.log.scoped(.ice);
 const Select = Io.Select(InnerEvent);
 
-const max_message_size = 1500;
+pub const max_message_size = 1500;
+
 const max_binding_requests: usize = 7;
 const connectivity_check_interval: std.Io.Duration = .fromMilliseconds(200);
 const keep_alive_interval: std.Io.Duration = .fromSeconds(4);
