@@ -158,6 +158,7 @@ pub fn poll(agent: *Agent) !Event {
 
             return .{ .connection_state = .completed };
         },
+        .close_sockets => for (agent.sockets) |*socket| socket.close(io),
     } else |err| return err;
 }
 
@@ -198,13 +199,11 @@ pub fn gatherCandidates(agent: *Agent) !void {
     agent.gathering_state = .gathering;
     try agent.gatherLocalHostsAndInitSockets();
 
-    for (agent.candidates.items) |candidate|
+    for (agent.candidates.items) |candidate| {
         try agent.queue.putOne(agent.io, .{ .candidate = candidate });
-    try agent.queue.putOne(agent.io, .{ .candidate = null });
-
-    for (agent.sockets) |*socket| {
-        try agent.group.concurrent(agent.io, receive, .{ agent, socket });
     }
+    try agent.queue.putOne(agent.io, .{ .candidate = null });
+    try agent.group.concurrent(agent.io, receive, .{agent});
     agent.gathering_state = .complete;
 }
 
@@ -517,6 +516,7 @@ const InnerEvent = union(enum) {
     close: void,
     complete: void,
     connection_state: ice.ConnectionState,
+    close_sockets: void,
 };
 
 fn connectivityCheck(agent: *Agent, timeout: Io.Duration) !void {
@@ -531,48 +531,84 @@ fn connectivityCheck(agent: *Agent, timeout: Io.Duration) !void {
     }
 }
 
-fn receive(agent: *Agent, socket: *const Socket) !void {
-    agent.doReceive(socket) catch |err| switch (err) {
+const LocalMessage = struct {
+    buffer: []u8,
+    incoming_message: Io.net.IncomingMessage,
+
+    fn toNetReceive(self: *LocalMessage, socket: *const Socket) Io.Operation {
+        return .{ .net_receive = .{
+            .socket_handle = socket.handle,
+            .data_buffer = self.buffer,
+            .message_buffer = (&self.incoming_message)[0..1],
+            .flags = .{},
+        } };
+    }
+};
+
+fn receive(agent: *Agent) !void {
+    agent.doReceive() catch |err| switch (err) {
         error.Canceled => return error.Canceled,
         else => |e| logError("Error when receiving: {}", .{e}),
     };
 }
 
-fn doReceive(agent: *Agent, socket: *const Socket) !void {
+fn doReceive(agent: *Agent) !void {
     const io = agent.io;
-    const timeout: Io.Timeout = .{ .duration = .{ .clock = .awake, .raw = .fromSeconds(2) } };
-    errdefer socket.close(io);
+
+    const storage = try agent.allocator.alloc(Io.Operation.Storage, agent.sockets.len);
+    defer agent.allocator.free(storage);
+
+    var messages = try agent.allocator.alloc(LocalMessage, agent.sockets.len);
+    for (messages) |*local_msg| local_msg.* = .{ .buffer = &.{}, .incoming_message = undefined };
+    defer {
+        for (messages) |local_msg| if (local_msg.buffer.len != 0) agent.destroyPacket(local_msg.buffer);
+        agent.allocator.free(messages);
+    }
+
+    var batch = Io.Batch.init(storage);
+    errdefer if (agent.nominated_pair) |pair| pair.socket.close(io);
+    defer {
+        batch.cancel(io); // we're not interested in the remaining messages.
+        for (agent.sockets) |*s| {
+            if (agent.nominated_pair) |pair| if (s.address.eql(&pair.socket.address)) continue;
+            s.close(io);
+        }
+    }
+
+    for (agent.sockets, 0..) |*socket, idx| {
+        messages[idx].buffer = try agent.createPacket();
+        batch.addAt(@intCast(idx), messages[idx].toNetReceive(socket));
+    }
 
     while (true) {
-        switch (agent.connection_state) {
-            .completed => {
-                if (agent.nominated_pair.?.socket.address.eql(&socket.address))
-                    agent.group.concurrent(io, receiveAppData, .{ agent, socket }) catch return
-                else
-                    socket.close(io);
-                return;
-            },
-            .failed, .closed => {
-                socket.close(io);
-                return;
-            },
-            else => {},
-        }
+        try batch.awaitConcurrent(io, .none);
+        while (batch.next()) |c| {
+            const socket = &agent.sockets[c.index];
+            const local_msg = &messages[c.index];
 
-        var result: Message = .{ .socket = socket, .incoming_message = undefined };
+            if (c.result.net_receive.@"0") |_| continue;
 
-        const buffer = try agent.createPacket();
-        result.incoming_message = socket.receiveTimeout(agent.io, buffer, timeout) catch |err| {
-            agent.destroyPacket(buffer);
-            switch (err) {
-                // We provide timeout to allow checking the agent status to close this socket
-                // if it's no longer needed
-                error.Timeout => continue,
-                else => |e| return e,
+            try agent.putInQueue(.{
+                .message = .{
+                    .socket = &agent.sockets[c.index],
+                    .incoming_message = local_msg.incoming_message,
+                },
+            });
+            local_msg.buffer = &.{};
+
+            switch (agent.connection_state) {
+                .completed => {
+                    const nominated_socket = &agent.nominated_pair.?.socket;
+                    try agent.group.concurrent(io, receiveAppData, .{ agent, nominated_socket });
+                    return;
+                },
+                .failed, .closed => return error.FailedOrClosedAgent,
+                else => {},
             }
-        };
 
-        try agent.putInQueue(.{ .message = result });
+            local_msg.buffer = try agent.createPacket();
+            batch.addAt(c.index, local_msg.toNetReceive(socket));
+        }
     }
 }
 
@@ -821,6 +857,10 @@ fn testBuildRequest(req: Messages.StunRequest, peer_password: []const u8, buffer
     return try stun.Message.parse(w.final());
 }
 
+fn testBindLoopback(io: Io) !Io.net.Socket {
+    return (IpAddress{ .ip4 = .loopback(0) }).bind(io, .{ .mode = .dgram });
+}
+
 test {
     _ = @import("messages.zig");
 }
@@ -1024,4 +1064,82 @@ test "close" {
     close_event.waitTimeout(testing.io, .{ .duration = .{ .raw = .fromSeconds(1), .clock = .awake } }) catch {
         return error.FailedTest;
     };
+}
+
+test "doReceive: forwards a received datagram to the queue" {
+    const io = testing.io;
+
+    var agent = try testNewAgent();
+    defer agent.deinit();
+
+    agent.sockets = try testing.allocator.alloc(Io.net.Socket, 2);
+    agent.sockets[0] = try testBindLoopback(io);
+    agent.sockets[1] = try testBindLoopback(io);
+    const dst1 = agent.sockets[0].address;
+    const dst2 = agent.sockets[1].address;
+
+    var grp: Io.Group = .init;
+    defer grp.cancel(io);
+    try grp.concurrent(io, receive, .{&agent});
+
+    var sender = try testBindLoopback(io);
+    defer sender.close(io);
+
+    // Bug in std.Io.Batch fast path: if data are already available,
+    // Batch doesn't evict the operation from the submitted ones
+
+    const msg = "hello";
+    for (0..3) |idx| {
+        try io.sleep(.fromMilliseconds(5), .awake);
+        try sender.send(io, if (idx % 2 == 0) &dst1 else &dst2, msg);
+        const event = try agent.queue.getOne(io);
+        try testing.expect(event == .message);
+        if (idx % 2 == 0) try testing.expect(event.message.socket.address.eql(&dst1));
+        if (idx % 2 == 1) try testing.expect(event.message.socket.address.eql(&dst2));
+        try testing.expectEqualStrings(msg, event.message.incoming_message.data);
+        agent.destroyPacket(event.message.incoming_message.data);
+    }
+}
+
+test "doReceive: on completed starts the app-data receiver on the nominated socket" {
+    const io = testing.io;
+
+    var agent = try testNewAgent();
+    defer agent.deinit();
+
+    agent.sockets = try testing.allocator.alloc(Io.net.Socket, 2);
+    agent.sockets[0] = try testBindLoopback(io);
+    agent.sockets[1] = try testBindLoopback(io);
+
+    const other_addr = agent.sockets[0].address;
+    const nominated_addr = agent.sockets[1].address;
+
+    agent.nominated_pair = .{
+        .pair = .{
+            .local = .initHost(nominated_addr),
+            .remote = .initHost(nominated_addr),
+            .priority = 0,
+        },
+        .socket = agent.sockets[1],
+    };
+    agent.connection_state = .completed;
+
+    var grp: Io.Group = .init;
+    defer grp.cancel(io);
+    try grp.concurrent(io, receive, .{&agent});
+
+    var sender = try testBindLoopback(io);
+    defer sender.close(io);
+
+    try io.sleep(.fromMilliseconds(5), .awake);
+    try sender.send(io, &other_addr, "trigger");
+    const first = try agent.queue.getOne(io);
+    try testing.expect(first == .message);
+    agent.destroyPacket(first.message.incoming_message.data);
+
+    try sender.send(io, &nominated_addr, "appdata");
+    const second = try agent.queue.getOne(io);
+    try testing.expect(second == .app_data);
+    try testing.expectEqualStrings("appdata", second.app_data);
+    agent.destroyPacket(second.app_data);
 }
