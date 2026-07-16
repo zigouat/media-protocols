@@ -292,39 +292,8 @@ pub const Credentials = struct {
     }
 };
 
-pub const CandidatePair = struct {
-    pub const Status = enum(u2) { waiting, in_progress, failed, succeeded };
-
-    local: Candidate,
-    remote: Candidate,
-    priority: u64,
-    status: Status = .waiting,
-    nominated: bool = false,
-    nominate_on_binding: bool = false,
-
-    /// private field: The number of connectivity checks sent so far.
-    conn_check_count: u8 = 0,
-
-    pub fn compare(_: void, lhs: CandidatePair, rhs: CandidatePair) bool {
-        return lhs.priority > rhs.priority;
-    }
-
-    pub fn eql(a: *const CandidatePair, b: *const CandidatePair) bool {
-        return a.local.base.eql(&b.local.base) and a.local.address.eql(&b.local.address) and a.remote.address.eql(&b.remote.address);
-    }
-
-    pub fn format(self: CandidatePair, writer: *std.Io.Writer) std.Io.Writer.Error!void {
-        try writer.print("{f}({}) <=> {f}({})[{}]", .{
-            self.local.address,
-            self.local.candidate_type,
-            self.remote.address,
-            self.remote.candidate_type,
-            self.priority,
-        });
-    }
-};
-
 test {
     std.testing.refAllDecls(@This());
     _ = @import("agent.zig");
+    _ = @import("candidate_pair.zig");
 }
