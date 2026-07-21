@@ -295,5 +295,6 @@ pub const Credentials = struct {
 test {
     std.testing.refAllDecls(@This());
     _ = @import("agent.zig");
+    _ = @import("core.zig");
     _ = @import("candidate_pair.zig");
 }
