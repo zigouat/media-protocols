@@ -3,6 +3,12 @@ pub const Agent = @import("agent.zig");
 const std = @import("std");
 const Io = std.Io;
 
+pub const IceServer = struct {
+    url: []const u8,
+    username: []const u8 = &.{},
+    credential: []const u8 = &.{},
+};
+
 pub const ConnectionState = enum { new, checking, connected, completed, disconnected, failed, closed };
 
 pub const GatheringState = enum { new, gathering, complete };
@@ -75,6 +81,17 @@ pub const Candidate = struct {
             .base = base,
             .address = address,
             .priority = CandidateType.prflx.priority(),
+        };
+        candidate.calculateFoundation();
+        return candidate;
+    }
+
+    pub fn initServerReflexive(base: Io.net.IpAddress, address: Io.net.IpAddress) Candidate {
+        var candidate: Candidate = .{
+            .candidate_type = .srflx,
+            .base = base,
+            .address = address,
+            .priority = CandidateType.srflx.priority(),
         };
         candidate.calculateFoundation();
         return candidate;

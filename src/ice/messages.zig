@@ -13,6 +13,16 @@ pub const StunRequest = struct {
     priority: u32 = 0,
 };
 
+pub fn builUnauthenticatedBindingRequest(buffer: []u8, tx_id: u96) ![]const u8 {
+    var w = stun.Writer.init(buffer, .{ .password = &.{} });
+    try w.writeHeader(.{
+        .message_type = .fromClassAndMethod(.request, .binding),
+        .transaction_id = tx_id,
+        .message_length = 0,
+    });
+    return w.final();
+}
+
 pub fn parseAndValidateStunRequest(
     msg: *const stun.Message,
     credentials: ice.Credentials,
@@ -109,6 +119,24 @@ pub fn buildRoleConflictErrorMessage(transaction_id: u96, pwd: []const u8, buffe
     try w.writeAttribute(.{ .message_integrity = &.{} });
     try w.writeAttribute(.fingerprint);
     return w.final();
+}
+
+pub fn getMappedAddress(resp: []const u8, tx_id: u96) !IpAddress {
+    const msg = try stun.Message.parse(resp);
+    if (msg.header.transaction_id != tx_id) return error.TransactionIdMismatch;
+
+    switch (msg.header.message_type.class()) {
+        .success_response => {
+            var it = msg.iterateAttributes(&.{});
+            while (try it.next()) |attr| switch (attr) {
+                .mapped_address, .xor_mapped_address => |addr| return addr,
+                else => {},
+            };
+
+            return error.MissingMappedAddress;
+        },
+        else => return error.InvalidStunMessage,
+    }
 }
 
 const testing = std.testing;

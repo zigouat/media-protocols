@@ -136,23 +136,16 @@ pub fn onComplete(core: *Core) void {
     core.pending_requests.clearAndFree(core.allocator);
 }
 
-pub fn addHostCandidate(core: *Core, addr: std.Io.net.IpAddress) !usize {
+pub fn addHostCandidate(core: *Core, addr: std.Io.net.IpAddress) !Candidate {
     const candidate = Candidate.initHost(addr);
-    try core.candidates.append(core.allocator, candidate);
+    try core.addLocalCandidate(candidate);
+    return candidate;
+}
 
-    outer_loop: for (core.remote_candidates.items) |remote_candidate| {
-        for (core.pairs.items) |*pair|
-            if (pair.local.base.eql(&candidate.base) and pair.remote.address.eql(&remote_candidate.address))
-                continue :outer_loop;
-
-        try core.pairs.append(core.allocator, .{
-            .local = candidate,
-            .remote = remote_candidate,
-            .priority = calculatePairPriority(candidate.priority, remote_candidate.priority, core.role),
-        });
-    }
-
-    return core.candidates.items.len - 1;
+pub fn addServerReflexiveCandidate(core: *Core, base: IpAddress, mapped: IpAddress) !Candidate {
+    const candidate = Candidate.initServerReflexive(base, mapped);
+    try core.addLocalCandidate(candidate);
+    return candidate;
 }
 
 pub fn handleConsentFreshness(core: *Core, message: std.Io.net.IncomingMessage, buffer: []u8) !?[]const u8 {
@@ -177,6 +170,22 @@ pub fn addRemoteCandidate(core: *Core, remote_candidate: Candidate) std.mem.Allo
     try core.remote_candidates.append(core.allocator, remote_candidate);
 
     outer_loop: for (core.candidates.items) |candidate| {
+        for (core.pairs.items) |*pair|
+            if (pair.local.base.eql(&candidate.base) and pair.remote.address.eql(&remote_candidate.address))
+                continue :outer_loop;
+
+        try core.pairs.append(core.allocator, .{
+            .local = candidate,
+            .remote = remote_candidate,
+            .priority = calculatePairPriority(candidate.priority, remote_candidate.priority, core.role),
+        });
+    }
+}
+
+pub fn addLocalCandidate(core: *Core, candidate: Candidate) !void {
+    try core.candidates.append(core.allocator, candidate);
+
+    outer_loop: for (core.remote_candidates.items) |remote_candidate| {
         for (core.pairs.items) |*pair|
             if (pair.local.base.eql(&candidate.base) and pair.remote.address.eql(&remote_candidate.address))
                 continue :outer_loop;
@@ -412,7 +421,7 @@ fn testBuildRequest(req: Messages.StunRequest, peer_password: []const u8, buffer
     return try stun.Message.parse(w.final());
 }
 
-test "handle request: generate success response" {
+test "handleRequest: generate success response" {
     var core = try testNewCore(.controlled);
     defer core.deinit();
 
@@ -447,7 +456,7 @@ test "handle request: generate success response" {
     try testing.expectEqual(null, try it.next());
 }
 
-test "handle request: create peer reflexive candidate" {
+test "handleRequest: create peer reflexive candidate" {
     var core = try testNewCore(.controlled);
     defer core.deinit();
 
@@ -476,7 +485,7 @@ test "handle request: create peer reflexive candidate" {
     try testing.expectEqual(1, core.pairs.items.len); // no new peer is created
 }
 
-test "handle request: nominate peer" {
+test "handleRequest: nominate peer" {
     var core = try testNewCore(.controlled);
     defer core.deinit();
 
@@ -511,7 +520,7 @@ test "handle request: nominate peer" {
     try testing.expect(candidate_pair.nominated);
 }
 
-test "handle request: role conflict" {
+test "handleRequest: role conflict" {
     var core = try testNewCore(.controlled);
     defer core.deinit();
 
@@ -551,4 +560,47 @@ test "handle request: role conflict" {
 
         try testing.expectError(error.SwitchRole, core.handleRequest(&msg, base_addr, from, &resp_buffer));
     }
+}
+
+test "addLocalCandidate: forms pairs with existing remote candidates" {
+    var core = try testNewCore(.controlling);
+    defer core.deinit();
+
+    try core.addRemoteCandidate(Candidate.initHost(try IpAddress.parse("192.168.1.10", 1000)));
+    try core.addRemoteCandidate(Candidate.initHost(try IpAddress.parse("192.168.1.11", 1001)));
+
+    try testing.expectEqual(2, core.remote_candidates.items.len);
+    try testing.expectEqual(0, core.pairs.items.len);
+
+    const local = try IpAddress.parse("10.0.0.1", 2000);
+    _ = try core.addHostCandidate(local);
+
+    try testing.expectEqual(1, core.candidates.items.len);
+    try testing.expectEqual(2, core.pairs.items.len);
+    for (core.pairs.items) |pair| try testing.expect(pair.local.base.eql(&local));
+
+    // Re-adding the same local candidate does not duplicate pairs.
+    _ = try core.addHostCandidate(local);
+    try testing.expectEqual(2, core.pairs.items.len);
+}
+
+test "addRemoteCandidate: forms pairs with existing local candidates" {
+    var core = try testNewCore(.controlling);
+    defer core.deinit();
+
+    _ = try core.addHostCandidate(try IpAddress.parse("10.0.0.1", 2000));
+    _ = try core.addHostCandidate(try IpAddress.parse("10.0.0.2", 2001));
+
+    try testing.expectEqual(2, core.candidates.items.len);
+    try testing.expectEqual(0, core.pairs.items.len);
+
+    const remote = try IpAddress.parse("192.168.1.10", 1000);
+    try core.addRemoteCandidate(Candidate.initHost(remote));
+
+    try testing.expectEqual(1, core.remote_candidates.items.len);
+    try testing.expectEqual(2, core.pairs.items.len);
+    for (core.pairs.items) |pair| try testing.expect(pair.remote.address.eql(&remote));
+
+    try core.addRemoteCandidate(Candidate.initHost(remote));
+    try testing.expectEqual(2, core.pairs.items.len);
 }
