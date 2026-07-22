@@ -136,16 +136,17 @@ pub fn onComplete(core: *Core) void {
     core.pending_requests.clearAndFree(core.allocator);
 }
 
-pub fn addHostCandidate(core: *Core, addr: std.Io.net.IpAddress) !Candidate {
+pub fn addHostCandidate(core: *Core, addr: std.Io.net.IpAddress) !?Candidate {
     const candidate = Candidate.initHost(addr);
-    try core.addLocalCandidate(candidate);
-    return candidate;
+    return if (try core.addLocalCandidate(candidate)) candidate else null;
 }
 
-pub fn addServerReflexiveCandidate(core: *Core, base: IpAddress, mapped: IpAddress) !Candidate {
+pub fn addServerReflexiveCandidate(core: *Core, base: IpAddress, mapped: IpAddress) !?Candidate {
+    for (core.candidates.items) |candidate|
+        if (candidate.candidate_type == .host and ipEql(&candidate.base, &mapped)) return null;
+
     const candidate = Candidate.initServerReflexive(base, mapped);
-    try core.addLocalCandidate(candidate);
-    return candidate;
+    return if (try core.addLocalCandidate(candidate)) candidate else null;
 }
 
 pub fn handleConsentFreshness(core: *Core, message: std.Io.net.IncomingMessage, buffer: []u8) !?[]const u8 {
@@ -182,7 +183,10 @@ pub fn addRemoteCandidate(core: *Core, remote_candidate: Candidate) std.mem.Allo
     }
 }
 
-pub fn addLocalCandidate(core: *Core, candidate: Candidate) !void {
+/// Returns `false` if an identical candidate already exists.
+pub fn addLocalCandidate(core: *Core, candidate: Candidate) std.mem.Allocator.Error!bool {
+    for (core.candidates.items) |*existing| if (existing.eql(&candidate)) return false;
+
     try core.candidates.append(core.allocator, candidate);
 
     outer_loop: for (core.remote_candidates.items) |remote_candidate| {
@@ -196,17 +200,22 @@ pub fn addLocalCandidate(core: *Core, candidate: Candidate) !void {
             .priority = calculatePairPriority(candidate.priority, remote_candidate.priority, core.role),
         });
     }
+
+    return true;
 }
 
-pub fn selectBestPair(core: *Core) ?CandidatePair {
-    var selected_pair: ?CandidatePair = null;
-    for (core.pairs.items) |candidate_pair| if (candidate_pair.status == .succeeded) {
-        if (selected_pair == null or candidate_pair.priority > selected_pair.?.priority) {
-            selected_pair = candidate_pair;
-        }
+/// Compare addresses by IP only, ignoring port.
+fn ipEql(a: *const IpAddress, b: *const IpAddress) bool {
+    return switch (a.*) {
+        .ip4 => |a_ip4| switch (b.*) {
+            .ip4 => |b_ip4| std.mem.eql(u8, &a_ip4.bytes, &b_ip4.bytes),
+            else => false,
+        },
+        .ip6 => |a_ip6| switch (b.*) {
+            .ip6 => |b_ip6| std.mem.eql(u8, &a_ip6.bytes, &b_ip6.bytes),
+            else => false,
+        },
     };
-
-    return selected_pair;
 }
 
 /// Begin a connectivity-check round. Returns null when a pair is already
@@ -359,6 +368,17 @@ fn calculatePairPriority(l: u32, r: u32, role: ice.Role) u64 {
 
     const last_part: u8 = if (g > d) 1 else 0;
     return (@as(u64, 1) << 32) * @min(g, d) + 2 * @max(g, d) + last_part;
+}
+
+fn selectBestPair(core: *Core) ?CandidatePair {
+    var selected_pair: ?CandidatePair = null;
+    for (core.pairs.items) |candidate_pair| if (candidate_pair.status == .succeeded) {
+        if (selected_pair == null or candidate_pair.priority > selected_pair.?.priority) {
+            selected_pair = candidate_pair;
+        }
+    };
+
+    return selected_pair;
 }
 
 fn findCandidatePair(core: *Core, local: *const IpAddress, remote: *const IpAddress) ?*CandidatePair {
@@ -579,7 +599,6 @@ test "addLocalCandidate: forms pairs with existing remote candidates" {
     try testing.expectEqual(2, core.pairs.items.len);
     for (core.pairs.items) |pair| try testing.expect(pair.local.base.eql(&local));
 
-    // Re-adding the same local candidate does not duplicate pairs.
     _ = try core.addHostCandidate(local);
     try testing.expectEqual(2, core.pairs.items.len);
 }
@@ -603,4 +622,34 @@ test "addRemoteCandidate: forms pairs with existing local candidates" {
 
     try core.addRemoteCandidate(Candidate.initHost(remote));
     try testing.expectEqual(2, core.pairs.items.len);
+}
+
+test "addLocalCandidate: reports whether the candidate was added" {
+    var core = try testNewCore(.controlling);
+    defer core.deinit();
+
+    const candidate = Candidate.initHost(try IpAddress.parse("10.0.0.1", 2000));
+    try testing.expect(try core.addLocalCandidate(candidate));
+    try testing.expect(!try core.addLocalCandidate(candidate));
+    try testing.expectEqual(1, core.candidates.items.len);
+}
+
+test "addServerReflexiveCandidate: skips candidate redundant with host" {
+    var core = try testNewCore(.controlling);
+    defer core.deinit();
+
+    const base = try IpAddress.parse("10.0.0.1", 2000);
+    _ = try core.addHostCandidate(base);
+
+    try testing.expectEqual(null, try core.addServerReflexiveCandidate(base, try IpAddress.parse("10.0.0.1", 3000)));
+    try testing.expectEqual(1, core.candidates.items.len);
+
+    const mapped = try IpAddress.parse("203.0.113.5", 3000);
+    const srflx = try core.addServerReflexiveCandidate(base, mapped);
+    try testing.expect(srflx != null);
+    try testing.expect(srflx.?.address.eql(&mapped));
+    try testing.expectEqual(2, core.candidates.items.len);
+
+    try testing.expectEqual(null, try core.addServerReflexiveCandidate(base, mapped));
+    try testing.expectEqual(2, core.candidates.items.len);
 }

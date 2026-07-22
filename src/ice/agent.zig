@@ -397,6 +397,9 @@ fn sendBindingRequest(agent: *Agent, dest: IpAddress) !void {
                 socket.close(agent.io);
                 return;
             };
+        } orelse {
+            socket.close(agent.io);
+            return;
         };
         try agent.putInQueue(.{ .add_socket = socket });
         try agent.putInQueue(.{ .candidate = candidate });
