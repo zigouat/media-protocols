@@ -43,6 +43,7 @@ const InnerEvent = union(enum) {
     close: void,
     complete: void,
     connection_state: ice.ConnectionState,
+    gathering_state: ice.GatheringState,
 };
 
 io: Io,
@@ -75,6 +76,8 @@ pub const AgentConfig = struct {
 pub const Event = union(enum) {
     /// Event describing a connection state change
     connection_state: ice.ConnectionState,
+    /// Event describing a change in the gathering state of the agent
+    gathering_state: ice.GatheringState,
     /// Event describing a new candidate discovered by the agent
     candidate: ?Candidate,
     /// Event describing a connectivity check message received by the agent.
@@ -140,6 +143,10 @@ pub fn poll(agent: *Agent) !Event {
         },
         .app_data => |data| return .{ .data = data },
         .connection_state => |state| return .{ .connection_state = state },
+        .gathering_state => |state| {
+            agent.core.gathering_state = state;
+            return .{ .gathering_state = state };
+        },
         .close => {
             agent.closeConnection();
             return .{ .connection_state = .closed };
@@ -190,6 +197,14 @@ pub fn localCandidates(agent: *const Agent) []Candidate {
     return agent.core.candidates.items;
 }
 
+pub fn gatheringState(agent: *const Agent) ice.GatheringState {
+    return agent.core.gathering_state;
+}
+
+pub fn connectionState(agent: *const Agent) ice.ConnectionState {
+    return agent.core.connection_state;
+}
+
 pub fn addRemoteCandidate(agent: *Agent, remote_candidate: Candidate) !void {
     switch (agent.core.connection_state) {
         .new, .checking, .connected => {
@@ -206,7 +221,7 @@ pub fn addRemoteCandidate(agent: *Agent, remote_candidate: Candidate) !void {
 /// This function should be called first before starting the event loop so local sockets are
 /// available to listen on.
 pub fn gatherCandidates(agent: *Agent) !void {
-    agent.core.gathering_state = .gathering;
+    try agent.putInQueue(.{ .gathering_state = .gathering });
     try agent.gatherLocalHostsAndInitSockets();
 
     for (agent.core.candidates.items) |candidate| {
@@ -221,7 +236,7 @@ pub fn gatherCandidates(agent: *Agent) !void {
         try agent.group.concurrent(agent.io, gatherServerReflexiveCandidates, .{agent});
     } else {
         try agent.queue.putOne(agent.io, .{ .candidate = null });
-        agent.core.gathering_state = .complete;
+        try agent.putInQueue(.{ .gathering_state = .complete });
     }
 }
 
@@ -335,7 +350,7 @@ fn doGatherServerReflexiveCandidates(agent: *Agent) !void {
 
     try grp.await(io);
     try agent.putInQueue(.{ .candidate = null });
-    agent.core.gathering_state = .complete;
+    try agent.putInQueue(.{ .gathering_state = .complete });
 }
 
 fn parseIceServerUrl(url: []const u8) !struct { []const u8, u16 } {
@@ -641,10 +656,6 @@ const testing = std.testing;
 
 fn testNewAgent() !Agent {
     return try .init(testing.io, testing.allocator, .{ .role = .controlled });
-}
-
-test {
-    _ = @import("messages.zig");
 }
 
 test "init agent" {

@@ -314,4 +314,5 @@ test {
     _ = @import("agent.zig");
     _ = @import("core.zig");
     _ = @import("candidate_pair.zig");
+    _ = @import("messages.zig");
 }
