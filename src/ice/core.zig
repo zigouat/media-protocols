@@ -136,23 +136,17 @@ pub fn onComplete(core: *Core) void {
     core.pending_requests.clearAndFree(core.allocator);
 }
 
-pub fn addHostCandidate(core: *Core, addr: std.Io.net.IpAddress) !usize {
+pub fn addHostCandidate(core: *Core, addr: std.Io.net.IpAddress) !?Candidate {
     const candidate = Candidate.initHost(addr);
-    try core.candidates.append(core.allocator, candidate);
+    return if (try core.addLocalCandidate(candidate)) candidate else null;
+}
 
-    outer_loop: for (core.remote_candidates.items) |remote_candidate| {
-        for (core.pairs.items) |*pair|
-            if (pair.local.base.eql(&candidate.base) and pair.remote.address.eql(&remote_candidate.address))
-                continue :outer_loop;
+pub fn addServerReflexiveCandidate(core: *Core, base: IpAddress, mapped: IpAddress) !?Candidate {
+    for (core.candidates.items) |candidate|
+        if (candidate.candidate_type == .host and ipEql(&candidate.base, &mapped)) return null;
 
-        try core.pairs.append(core.allocator, .{
-            .local = candidate,
-            .remote = remote_candidate,
-            .priority = calculatePairPriority(candidate.priority, remote_candidate.priority, core.role),
-        });
-    }
-
-    return core.candidates.items.len - 1;
+    const candidate = Candidate.initServerReflexive(base, mapped);
+    return if (try core.addLocalCandidate(candidate)) candidate else null;
 }
 
 pub fn handleConsentFreshness(core: *Core, message: std.Io.net.IncomingMessage, buffer: []u8) !?[]const u8 {
@@ -189,15 +183,39 @@ pub fn addRemoteCandidate(core: *Core, remote_candidate: Candidate) std.mem.Allo
     }
 }
 
-pub fn selectBestPair(core: *Core) ?CandidatePair {
-    var selected_pair: ?CandidatePair = null;
-    for (core.pairs.items) |candidate_pair| if (candidate_pair.status == .succeeded) {
-        if (selected_pair == null or candidate_pair.priority > selected_pair.?.priority) {
-            selected_pair = candidate_pair;
-        }
-    };
+/// Returns `false` if an identical candidate already exists.
+pub fn addLocalCandidate(core: *Core, candidate: Candidate) std.mem.Allocator.Error!bool {
+    for (core.candidates.items) |*existing| if (existing.eql(&candidate)) return false;
 
-    return selected_pair;
+    try core.candidates.append(core.allocator, candidate);
+
+    outer_loop: for (core.remote_candidates.items) |remote_candidate| {
+        for (core.pairs.items) |*pair|
+            if (pair.local.base.eql(&candidate.base) and pair.remote.address.eql(&remote_candidate.address))
+                continue :outer_loop;
+
+        try core.pairs.append(core.allocator, .{
+            .local = candidate,
+            .remote = remote_candidate,
+            .priority = calculatePairPriority(candidate.priority, remote_candidate.priority, core.role),
+        });
+    }
+
+    return true;
+}
+
+/// Compare addresses by IP only, ignoring port.
+fn ipEql(a: *const IpAddress, b: *const IpAddress) bool {
+    return switch (a.*) {
+        .ip4 => |a_ip4| switch (b.*) {
+            .ip4 => |b_ip4| std.mem.eql(u8, &a_ip4.bytes, &b_ip4.bytes),
+            else => false,
+        },
+        .ip6 => |a_ip6| switch (b.*) {
+            .ip6 => |b_ip6| std.mem.eql(u8, &a_ip6.bytes, &b_ip6.bytes),
+            else => false,
+        },
+    };
 }
 
 /// Begin a connectivity-check round. Returns null when a pair is already
@@ -352,6 +370,17 @@ fn calculatePairPriority(l: u32, r: u32, role: ice.Role) u64 {
     return (@as(u64, 1) << 32) * @min(g, d) + 2 * @max(g, d) + last_part;
 }
 
+fn selectBestPair(core: *Core) ?CandidatePair {
+    var selected_pair: ?CandidatePair = null;
+    for (core.pairs.items) |candidate_pair| if (candidate_pair.status == .succeeded) {
+        if (selected_pair == null or candidate_pair.priority > selected_pair.?.priority) {
+            selected_pair = candidate_pair;
+        }
+    };
+
+    return selected_pair;
+}
+
 fn findCandidatePair(core: *Core, local: *const IpAddress, remote: *const IpAddress) ?*CandidatePair {
     var pair: ?*CandidatePair = null;
 
@@ -412,7 +441,7 @@ fn testBuildRequest(req: Messages.StunRequest, peer_password: []const u8, buffer
     return try stun.Message.parse(w.final());
 }
 
-test "handle request: generate success response" {
+test "handleRequest: generate success response" {
     var core = try testNewCore(.controlled);
     defer core.deinit();
 
@@ -447,7 +476,7 @@ test "handle request: generate success response" {
     try testing.expectEqual(null, try it.next());
 }
 
-test "handle request: create peer reflexive candidate" {
+test "handleRequest: create peer reflexive candidate" {
     var core = try testNewCore(.controlled);
     defer core.deinit();
 
@@ -476,7 +505,7 @@ test "handle request: create peer reflexive candidate" {
     try testing.expectEqual(1, core.pairs.items.len); // no new peer is created
 }
 
-test "handle request: nominate peer" {
+test "handleRequest: nominate peer" {
     var core = try testNewCore(.controlled);
     defer core.deinit();
 
@@ -511,7 +540,7 @@ test "handle request: nominate peer" {
     try testing.expect(candidate_pair.nominated);
 }
 
-test "handle request: role conflict" {
+test "handleRequest: role conflict" {
     var core = try testNewCore(.controlled);
     defer core.deinit();
 
@@ -551,4 +580,76 @@ test "handle request: role conflict" {
 
         try testing.expectError(error.SwitchRole, core.handleRequest(&msg, base_addr, from, &resp_buffer));
     }
+}
+
+test "addLocalCandidate: forms pairs with existing remote candidates" {
+    var core = try testNewCore(.controlling);
+    defer core.deinit();
+
+    try core.addRemoteCandidate(Candidate.initHost(try IpAddress.parse("192.168.1.10", 1000)));
+    try core.addRemoteCandidate(Candidate.initHost(try IpAddress.parse("192.168.1.11", 1001)));
+
+    try testing.expectEqual(2, core.remote_candidates.items.len);
+    try testing.expectEqual(0, core.pairs.items.len);
+
+    const local = try IpAddress.parse("10.0.0.1", 2000);
+    _ = try core.addHostCandidate(local);
+
+    try testing.expectEqual(1, core.candidates.items.len);
+    try testing.expectEqual(2, core.pairs.items.len);
+    for (core.pairs.items) |pair| try testing.expect(pair.local.base.eql(&local));
+
+    _ = try core.addHostCandidate(local);
+    try testing.expectEqual(2, core.pairs.items.len);
+}
+
+test "addRemoteCandidate: forms pairs with existing local candidates" {
+    var core = try testNewCore(.controlling);
+    defer core.deinit();
+
+    _ = try core.addHostCandidate(try IpAddress.parse("10.0.0.1", 2000));
+    _ = try core.addHostCandidate(try IpAddress.parse("10.0.0.2", 2001));
+
+    try testing.expectEqual(2, core.candidates.items.len);
+    try testing.expectEqual(0, core.pairs.items.len);
+
+    const remote = try IpAddress.parse("192.168.1.10", 1000);
+    try core.addRemoteCandidate(Candidate.initHost(remote));
+
+    try testing.expectEqual(1, core.remote_candidates.items.len);
+    try testing.expectEqual(2, core.pairs.items.len);
+    for (core.pairs.items) |pair| try testing.expect(pair.remote.address.eql(&remote));
+
+    try core.addRemoteCandidate(Candidate.initHost(remote));
+    try testing.expectEqual(2, core.pairs.items.len);
+}
+
+test "addLocalCandidate: reports whether the candidate was added" {
+    var core = try testNewCore(.controlling);
+    defer core.deinit();
+
+    const candidate = Candidate.initHost(try IpAddress.parse("10.0.0.1", 2000));
+    try testing.expect(try core.addLocalCandidate(candidate));
+    try testing.expect(!try core.addLocalCandidate(candidate));
+    try testing.expectEqual(1, core.candidates.items.len);
+}
+
+test "addServerReflexiveCandidate: skips candidate redundant with host" {
+    var core = try testNewCore(.controlling);
+    defer core.deinit();
+
+    const base = try IpAddress.parse("10.0.0.1", 2000);
+    _ = try core.addHostCandidate(base);
+
+    try testing.expectEqual(null, try core.addServerReflexiveCandidate(base, try IpAddress.parse("10.0.0.1", 3000)));
+    try testing.expectEqual(1, core.candidates.items.len);
+
+    const mapped = try IpAddress.parse("203.0.113.5", 3000);
+    const srflx = try core.addServerReflexiveCandidate(base, mapped);
+    try testing.expect(srflx != null);
+    try testing.expect(srflx.?.address.eql(&mapped));
+    try testing.expectEqual(2, core.candidates.items.len);
+
+    try testing.expectEqual(null, try core.addServerReflexiveCandidate(base, mapped));
+    try testing.expectEqual(2, core.candidates.items.len);
 }
