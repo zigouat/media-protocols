@@ -244,7 +244,8 @@ pub fn sendData(agent: *const Agent, data: []const u8) Socket.SendError!void {
     switch (agent.core.connection_state) {
         .connected, .completed => {
             @branchHint(.likely);
-            try agent.nominated_socket.?.send(agent.io, &agent.core.nominated_pair.?.remote.address, data);
+            const dest = &agent.core.nominated_pair.?.remote;
+            try agent.nominated_socket.?.send(agent.io, &dest.address, data);
         },
         else => Logger.warn("Agent not connected: ignore send request", .{}),
     }
@@ -540,8 +541,8 @@ fn sendConsentFreshness(agent: *Agent) !void {
     defer agent.destroyPacket(buffer);
 
     const req = try agent.core.buildBindingRequest(randomNumber(u96, agent.io), false, buffer);
-    const selected_pair = &agent.core.nominated_pair.?;
-    try agent.nominated_socket.?.send(agent.io, &selected_pair.remote.address, req);
+    const remote_candidate = &agent.core.nominated_pair.?.remote;
+    try agent.nominated_socket.?.send(agent.io, &remote_candidate.address, req);
 }
 
 fn putInQueue(agent: *Agent, event: InnerEvent) !void {
@@ -616,7 +617,8 @@ fn handleConnectivityCheckMessage(agent: *Agent, message: Message) !?Event {
             .connected, .completed => return .{ .data = data },
             else => {
                 for (agent.core.pairs.items) |*candidate_pair| {
-                    if (candidate_pair.remote.address.eql(&sender)) return .{ .data = data };
+                    const remote = &agent.core.remote_candidates.items[candidate_pair.remote];
+                    if (remote.address.eql(&sender)) return .{ .data = data };
                 } else {
                     agent.destroyPacket(data);
                     Logger.warn("Drop non stun message from unknown remote candidate: {f}", .{sender});
