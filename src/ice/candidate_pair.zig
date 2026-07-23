@@ -1,6 +1,3 @@
-const std = @import("std");
-
-const Candidate = @import("ice.zig").Candidate;
 const CandidatePair = @This();
 
 /// Enum describing the status of a candidate pair in the ICE process.
@@ -15,8 +12,8 @@ pub const Status = enum(u2) {
     succeeded,
 };
 
-local: Candidate,
-remote: Candidate,
+local: u32,
+remote: u32,
 /// The priority of the candidate pair, calculated based on the priority of the local and remote candidates.
 priority: u64,
 status: Status = .waiting,
@@ -34,18 +31,4 @@ conn_check_count: u8 = 0,
 
 pub fn compare(_: void, lhs: CandidatePair, rhs: CandidatePair) bool {
     return lhs.priority > rhs.priority;
-}
-
-pub fn eql(a: *const CandidatePair, b: *const CandidatePair) bool {
-    return a.local.base.eql(&b.local.base) and a.local.address.eql(&b.local.address) and a.remote.address.eql(&b.remote.address);
-}
-
-pub fn format(self: CandidatePair, writer: *std.Io.Writer) std.Io.Writer.Error!void {
-    try writer.print("{f}({}) <=> {f}({})[{}]", .{
-        self.local.address,
-        self.local.candidate_type,
-        self.remote.address,
-        self.remote.candidate_type,
-        self.priority,
-    });
 }
