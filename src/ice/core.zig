@@ -8,6 +8,12 @@ const Core = @This();
 const Candidate = ice.Candidate;
 const IpAddress = std.Io.net.IpAddress;
 
+const SelectedPair = struct {
+    pair: CandidatePair,
+    local: Candidate,
+    remote: Candidate,
+};
+
 /// The maximum number of binding requests sent on a pair before it is
 /// considered failed.
 pub const max_binding_requests: usize = 7;
@@ -28,9 +34,9 @@ pairs: std.ArrayList(CandidatePair) = .empty,
 pending_requests: std.ArrayList(PendingRequest) = .empty,
 // This is a peer for which a use-candidate request is sent, but we didn't
 // receive response yet.
-selected_pair: ?CandidatePair = null,
+selected_pair: ?SelectedPair = null,
 // This the final pair selected by this agent or the remote one.
-nominated_pair: ?CandidatePair = null,
+nominated_pair: ?SelectedPair = null,
 
 const PendingRequest = struct {
     transaction_id: u96,
@@ -82,15 +88,18 @@ pub const ConnectivityChecks = struct {
                         continue;
                     }
                     const payload = try core.buildBindingRequest(tx_id, false, buffer);
+                    const local = core.getPairLocal(pair);
+                    const remote = core.getPairRemote(pair);
+
                     try core.pending_requests.append(core.allocator, .{
                         .transaction_id = tx_id,
-                        .source = pair.local.base,
-                        .target = pair.remote.address,
+                        .source = local.base,
+                        .target = remote.address,
                     });
                     return .{
                         .payload = payload,
-                        .from_base = pair.local.base,
-                        .to = pair.remote.address,
+                        .from_base = local.base,
+                        .to = remote.address,
                         .use_candidate = false,
                     };
                 },
@@ -169,15 +178,19 @@ pub fn handleConsentFreshness(core: *Core, message: std.Io.net.IncomingMessage, 
 
 pub fn addRemoteCandidate(core: *Core, remote_candidate: Candidate) std.mem.Allocator.Error!void {
     try core.remote_candidates.append(core.allocator, remote_candidate);
+    const remote_idx = core.remote_candidates.items.len - 1;
 
-    outer_loop: for (core.candidates.items) |candidate| {
-        for (core.pairs.items) |*pair|
-            if (pair.local.base.eql(&candidate.base) and pair.remote.address.eql(&remote_candidate.address))
+    outer_loop: for (core.candidates.items, 0..) |candidate, local_idx| {
+        for (core.pairs.items) |*pair| {
+            const local = core.getPairLocal(pair);
+            const remote = core.getPairRemote(pair);
+            if (local.base.eql(&candidate.base) and remote.address.eql(&remote_candidate.address))
                 continue :outer_loop;
+        }
 
         try core.pairs.append(core.allocator, .{
-            .local = candidate,
-            .remote = remote_candidate,
+            .local = @intCast(local_idx),
+            .remote = @intCast(remote_idx),
             .priority = calculatePairPriority(candidate.priority, remote_candidate.priority, core.role),
         });
     }
@@ -188,15 +201,19 @@ pub fn addLocalCandidate(core: *Core, candidate: Candidate) std.mem.Allocator.Er
     for (core.candidates.items) |*existing| if (existing.eql(&candidate)) return false;
 
     try core.candidates.append(core.allocator, candidate);
+    const idx = core.candidates.items.len - 1;
 
-    outer_loop: for (core.remote_candidates.items) |remote_candidate| {
-        for (core.pairs.items) |*pair|
-            if (pair.local.base.eql(&candidate.base) and pair.remote.address.eql(&remote_candidate.address))
+    outer_loop: for (core.remote_candidates.items, 0..) |remote_candidate, remote_idx| {
+        for (core.pairs.items) |*pair| {
+            const local = core.getPairLocal(pair);
+            const remote = core.getPairRemote(pair);
+            if (local.base.eql(&candidate.base) and remote.address.eql(&remote_candidate.address))
                 continue :outer_loop;
+        }
 
         try core.pairs.append(core.allocator, .{
-            .local = candidate,
-            .remote = remote_candidate,
+            .local = @intCast(idx),
+            .remote = @intCast(remote_idx),
             .priority = calculatePairPriority(candidate.priority, remote_candidate.priority, core.role),
         });
     }
@@ -230,7 +247,11 @@ pub fn beginConnectivityChecks(core: *Core) ?ConnectivityChecks {
 pub fn detectNominatedPair(core: *Core) ?CandidatePair {
     if (core.role == .controlling or core.nominated_pair != null) return null;
     for (core.pairs.items) |pair| if (pair.nominated) {
-        core.nominated_pair = pair;
+        core.nominated_pair = .{
+            .pair = pair,
+            .local = core.getPairLocal(&pair).*,
+            .remote = core.getPairRemote(&pair).*,
+        };
         return pair;
     };
     return null;
@@ -293,18 +314,24 @@ pub fn handleRequest(core: *Core, msg: *const stun.Message, base_addr: IpAddress
             else => candidate_pair.nominate_on_binding |= stun_req.use_candidate,
         }
     } else {
-        const local: Candidate = .initHost(base_addr);
-        const remote: Candidate = .{
-            .base = from,
-            .address = from,
-            .candidate_type = .prflx,
-            .priority = stun_req.priority,
+        const local_idx = core.findLocalCandidate(&base_addr, &base_addr).?;
+        const local_candidate = core.candidates.items[local_idx];
+
+        const remote_idx: u32 = core.findRemoteCandidate(&from) orelse blk: {
+            const candidate = Candidate{
+                .base = from,
+                .address = from,
+                .candidate_type = .prflx,
+                .priority = stun_req.priority,
+            };
+            try core.remote_candidates.append(core.allocator, candidate);
+            break :blk @intCast(core.remote_candidates.items.len - 1);
         };
 
         try core.pairs.append(core.allocator, .{
-            .local = local,
-            .remote = remote,
-            .priority = calculatePairPriority(local.priority, remote.priority, core.role),
+            .local = local_idx,
+            .remote = remote_idx,
+            .priority = calculatePairPriority(local_candidate.priority, stun_req.priority, core.role),
             .status = .in_progress,
             .nominate_on_binding = stun_req.use_candidate,
         });
@@ -340,11 +367,13 @@ pub fn handleSuccessResponse(core: *Core, msg: *const stun.Message, base_addr: I
         }
         candidate_pair.status = .failed;
 
-        const local_candidate = core.findLocalCandidate(&base_addr, &mapped_address) orelse blk: {
+        const local_idx: u32 = core.findLocalCandidate(&base_addr, &mapped_address) orelse blk: {
             const prflx_candidate: Candidate = .initPeerReflexive(base_addr, mapped_address);
             try core.candidates.append(core.allocator, prflx_candidate);
-            break :blk prflx_candidate;
+            break :blk @intCast(core.candidates.items.len - 1);
         };
+        const local_candidate = core.candidates.items[local_idx];
+        const remote_candidate = core.getPairRemote(candidate_pair);
 
         if (core.findCandidatePairByLocalAndRemote(&local_candidate, &from)) |existing_candidate_pair| {
             existing_candidate_pair.status = .succeeded;
@@ -353,12 +382,23 @@ pub fn handleSuccessResponse(core: *Core, msg: *const stun.Message, base_addr: I
         }
 
         try core.pairs.append(core.allocator, .{
-            .local = local_candidate,
+            .local = local_idx,
             .remote = candidate_pair.remote,
-            .priority = calculatePairPriority(local_candidate.priority, candidate_pair.remote.priority, core.role),
+            .priority = calculatePairPriority(local_candidate.priority, remote_candidate.priority, core.role),
             .status = .succeeded,
         });
     }
+}
+
+pub fn pairsEql(core: *Core, pair1: *const CandidatePair, pair2: *const CandidatePair) bool {
+    const local1 = core.getPairLocal(pair1);
+    const remote1 = core.getPairRemote(pair1);
+
+    const local2 = core.getPairLocal(pair2);
+    const remote2 = core.getPairRemote(pair2);
+
+    return local1.base.eql(&local2.base) and local1.address.eql(&local2.address) and
+        remote1.address.eql(&remote2.address);
 }
 
 fn calculatePairPriority(l: u32, r: u32, role: ice.Role) u64 {
@@ -370,7 +410,7 @@ fn calculatePairPriority(l: u32, r: u32, role: ice.Role) u64 {
     return (@as(u64, 1) << 32) * @min(g, d) + 2 * @max(g, d) + last_part;
 }
 
-fn selectBestPair(core: *Core) ?CandidatePair {
+fn selectBestPair(core: *Core) ?SelectedPair {
     var selected_pair: ?CandidatePair = null;
     for (core.pairs.items) |candidate_pair| if (candidate_pair.status == .succeeded) {
         if (selected_pair == null or candidate_pair.priority > selected_pair.?.priority) {
@@ -378,15 +418,22 @@ fn selectBestPair(core: *Core) ?CandidatePair {
         }
     };
 
-    return selected_pair;
+    return if (selected_pair) |pair| .{
+        .pair = pair,
+        .local = core.getPairLocal(&pair).*,
+        .remote = core.getPairRemote(&pair).*,
+    } else null;
 }
 
 fn findCandidatePair(core: *Core, local: *const IpAddress, remote: *const IpAddress) ?*CandidatePair {
     var pair: ?*CandidatePair = null;
-
-    for (core.pairs.items) |*candidate| if (candidate.local.base.eql(local) and candidate.remote.address.eql(remote)) {
-        if (pair == null or candidate.status != .failed and pair.?.status == .failed) pair = candidate;
-    };
+    for (core.pairs.items) |*candidate| {
+        const local_c = core.getPairLocal(candidate);
+        const remote_c = core.getPairRemote(candidate);
+        if (local_c.base.eql(local) and remote_c.address.eql(remote)) {
+            if (pair == null or candidate.status != .failed and pair.?.status == .failed) pair = candidate;
+        }
+    }
 
     return pair;
 }
@@ -395,22 +442,39 @@ fn maybeSetNominatedField(core: *Core, candidate_pair: *CandidatePair) void {
     if (candidate_pair.nominate_on_binding) {
         candidate_pair.nominate_on_binding = false;
         candidate_pair.nominated = true;
-    } else if (core.selected_pair != null and core.selected_pair.?.eql(candidate_pair)) {
+    } else if (core.selected_pair != null and core.pairsEql(&core.selected_pair.?.pair, candidate_pair)) {
         core.nominated_pair = core.selected_pair;
-        core.nominated_pair.?.nominated = true;
+        core.nominated_pair.?.pair.nominated = true;
         core.selected_pair = null;
     }
 }
 
-fn findLocalCandidate(core: *Core, base: *const IpAddress, addr: *const IpAddress) ?Candidate {
-    for (core.candidates.items) |candidate| if (candidate.base.eql(base) and candidate.address.eql(addr)) return candidate;
+fn findLocalCandidate(core: *Core, base: *const IpAddress, addr: *const IpAddress) ?u32 {
+    for (core.candidates.items, 0..) |candidate, idx| {
+        if (candidate.base.eql(base) and candidate.address.eql(addr)) return @intCast(idx);
+    }
+    return null;
+}
+
+fn findRemoteCandidate(core: *Core, addr: *const IpAddress) ?u32 {
+    for (core.remote_candidates.items, 0..) |candidate, idx| if (candidate.address.eql(addr)) return @intCast(idx);
     return null;
 }
 
 fn findCandidatePairByLocalAndRemote(core: *Core, local: *const Candidate, remote: *const IpAddress) ?*CandidatePair {
-    for (core.pairs.items) |*candidate| if (candidate.local.eql(local) and candidate.remote.address.eql(remote))
-        return candidate;
+    for (core.pairs.items) |*candidate| {
+        if (core.getPairLocal(candidate).eql(local) and core.getPairRemote(candidate).address.eql(remote))
+            return candidate;
+    }
     return null;
+}
+
+fn getPairLocal(core: *Core, pair: *const CandidatePair) *const Candidate {
+    return &core.candidates.items[pair.local];
+}
+
+fn getPairRemote(core: *Core, pair: *const CandidatePair) *const Candidate {
+    return &core.remote_candidates.items[pair.remote];
 }
 
 const testing = std.testing;
@@ -451,6 +515,8 @@ test "handleRequest: generate success response" {
     const base_addr = try IpAddress.parse("192.168.1.100", 1000);
     const from = try IpAddress.parse("192.168.1.120", 2000);
 
+    _ = try core.addHostCandidate(base_addr);
+
     const msg = try testBuildRequest(.{
         .ice_controlling = 0x10000,
         .priority = 0x9090,
@@ -486,6 +552,8 @@ test "handleRequest: create peer reflexive candidate" {
     const base_addr = try IpAddress.parse("192.168.1.100", 1000);
     const from = try IpAddress.parse("192.168.1.120", 2000);
 
+    _ = try core.addHostCandidate(base_addr);
+
     const msg = try testBuildRequest(.{
         .ice_controlling = 0x10000,
         .priority = 0x9090,
@@ -497,8 +565,9 @@ test "handleRequest: create peer reflexive candidate" {
     try testing.expectEqual(1, core.pairs.items.len);
 
     const candidate_pair = core.pairs.items[0];
-    try testing.expect(candidate_pair.remote.address.eql(&from));
-    try testing.expectEqual(candidate_pair.remote.priority, 0x9090);
+    const remote = core.remote_candidates.items[candidate_pair.remote];
+    try testing.expect(remote.address.eql(&from));
+    try testing.expectEqual(remote.priority, 0x9090);
 
     // Send request again
     _ = try core.handleRequest(&msg, base_addr, from, &resp_buffer);
@@ -515,9 +584,11 @@ test "handleRequest: nominate peer" {
     const base_addr = try IpAddress.parse("192.168.1.100", 1000);
     const from = try IpAddress.parse("192.168.1.120", 2000);
 
+    try core.candidates.append(testing.allocator, .initHost(base_addr));
+    try core.remote_candidates.append(testing.allocator, .initHost(from));
     try core.pairs.append(testing.allocator, .{
-        .local = .initHost(base_addr),
-        .remote = .initHost(from),
+        .local = 0,
+        .remote = 0,
         .status = .in_progress,
         .priority = 0,
     });
@@ -597,7 +668,7 @@ test "addLocalCandidate: forms pairs with existing remote candidates" {
 
     try testing.expectEqual(1, core.candidates.items.len);
     try testing.expectEqual(2, core.pairs.items.len);
-    for (core.pairs.items) |pair| try testing.expect(pair.local.base.eql(&local));
+    for (core.pairs.items) |pair| try testing.expect(core.candidates.items[pair.local].base.eql(&local));
 
     _ = try core.addHostCandidate(local);
     try testing.expectEqual(2, core.pairs.items.len);
@@ -618,7 +689,7 @@ test "addRemoteCandidate: forms pairs with existing local candidates" {
 
     try testing.expectEqual(1, core.remote_candidates.items.len);
     try testing.expectEqual(2, core.pairs.items.len);
-    for (core.pairs.items) |pair| try testing.expect(pair.remote.address.eql(&remote));
+    for (core.pairs.items) |pair| try testing.expect(core.remote_candidates.items[pair.remote].address.eql(&remote));
 
     try core.addRemoteCandidate(Candidate.initHost(remote));
     try testing.expectEqual(2, core.pairs.items.len);
