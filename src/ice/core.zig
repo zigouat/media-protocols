@@ -221,20 +221,6 @@ pub fn addLocalCandidate(core: *Core, candidate: Candidate) std.mem.Allocator.Er
     return true;
 }
 
-/// Compare addresses by IP only, ignoring port.
-fn ipEql(a: *const IpAddress, b: *const IpAddress) bool {
-    return switch (a.*) {
-        .ip4 => |a_ip4| switch (b.*) {
-            .ip4 => |b_ip4| std.mem.eql(u8, &a_ip4.bytes, &b_ip4.bytes),
-            else => false,
-        },
-        .ip6 => |a_ip6| switch (b.*) {
-            .ip6 => |b_ip6| std.mem.eql(u8, &a_ip6.bytes, &b_ip6.bytes),
-            else => false,
-        },
-    };
-}
-
 /// Begin a connectivity-check round. Returns null when a pair is already
 /// nominated (nothing to do). Performs the controlling-side best-pair selection.
 pub fn beginConnectivityChecks(core: *Core) ?ConnectivityChecks {
@@ -390,7 +376,7 @@ pub fn handleSuccessResponse(core: *Core, msg: *const stun.Message, base_addr: I
     }
 }
 
-pub fn pairsEql(core: *Core, pair1: *const CandidatePair, pair2: *const CandidatePair) bool {
+fn pairsEql(core: *Core, pair1: *const CandidatePair, pair2: *const CandidatePair) bool {
     const local1 = core.getPairLocal(pair1);
     const remote1 = core.getPairRemote(pair1);
 
@@ -399,6 +385,20 @@ pub fn pairsEql(core: *Core, pair1: *const CandidatePair, pair2: *const Candidat
 
     return local1.base.eql(&local2.base) and local1.address.eql(&local2.address) and
         remote1.address.eql(&remote2.address);
+}
+
+/// Compare addresses by IP only, ignoring port.
+fn ipEql(a: *const IpAddress, b: *const IpAddress) bool {
+    return switch (a.*) {
+        .ip4 => |a_ip4| switch (b.*) {
+            .ip4 => |b_ip4| std.mem.eql(u8, &a_ip4.bytes, &b_ip4.bytes),
+            else => false,
+        },
+        .ip6 => |a_ip6| switch (b.*) {
+            .ip6 => |b_ip6| std.mem.eql(u8, &a_ip6.bytes, &b_ip6.bytes),
+            else => false,
+        },
+    };
 }
 
 fn calculatePairPriority(l: u32, r: u32, role: ice.Role) u64 {

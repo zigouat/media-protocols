@@ -11,6 +11,26 @@ pub fn isMessage(msg: []const u8) bool {
     return msg.len >= header_size and std.mem.readInt(u32, msg[4..8], .big) == magic_cookie;
 }
 
+/// Computes the long-term credentials key for STUN/TURN authentication.
+pub fn longTermCredentialsKey(
+    hasher: type,
+    username: []const u8,
+    realm: []const u8,
+    password: []const u8,
+) [hasher.digest_length]u8 {
+    var hash: [hasher.digest_length]u8 = undefined;
+    var h = hasher.init(.{});
+
+    h.update(username);
+    h.update(":");
+    h.update(realm);
+    h.update(":");
+    h.update(password);
+    h.final(&hash);
+
+    return hash;
+}
+
 /// Describes the class of a Stun message.
 pub const Class = enum(u2) {
     request,
@@ -22,6 +42,7 @@ pub const Class = enum(u2) {
 /// Describes the method of a Stun message within a class.
 pub const Method = enum(u12) {
     binding = 1,
+    allocate = 3,
     _,
 };
 
@@ -121,6 +142,9 @@ pub const AttributeType = enum(u16) {
     username = 0x0006,
     message_integrity = 0x0008,
     error_code = 0x0009,
+    realm = 0x0014,
+    nonce = 0x0015,
+    requested_transport = 0x0019,
     xor_mapped_address = 0x0020,
     use_candidate = 0x0025,
     userhash = 0x001E,
@@ -142,6 +166,11 @@ pub const Attribute = union(AttributeType) {
     /// The MESSAGE-INTEGRITY attribute is used to provide integrity protection for STUN messages.
     message_integrity: []const u8,
     error_code: StunError,
+    /// The REALM value used in long-term credential authentication in STUN.
+    realm: []const u8,
+    /// The NONCE value used in long-term credential authentication in STUN.
+    nonce: []const u8,
+    requested_transport: enum(u8) { tcp = 6, udp = 17, _ },
     /// The XOR-MAPPED-ADDRESS attribute is used to convey the mapped IP address and port of the client as seen by the server,
     /// but with an additional layer of obfuscation.
     xor_mapped_address: Io.net.IpAddress,
@@ -169,11 +198,12 @@ pub const Attribute = union(AttributeType) {
             .ice_controlled, .ice_controlling => 8,
             .message_integrity => 20,
             .use_candidate => 0,
-            .software, .username, .userhash => |slice| @intCast(slice.len),
+            .software, .username, .userhash, .nonce, .realm => |slice| @intCast(slice.len),
             .mapped_address, .xor_mapped_address => |ip| switch (ip) {
                 .ip4 => 8,
                 .ip6 => 20,
             },
+            .requested_transport => 4,
             .error_code => |err| @intCast(err.reason.len + 4),
             else => 0,
         };
@@ -208,6 +238,8 @@ pub const AttributeIterator = struct {
             .xor_mapped_address => try parseXorMappedAddress(attr_value, it.reader.buffer[8..20]),
             .username => .{ .username = attr_value[0..attr_len] },
             .software => .{ .software = attr_value[0..attr_len] },
+            .realm => .{ .realm = attr_value[0..attr_len] },
+            .nonce => .{ .nonce = attr_value[0..attr_len] },
             .error_code => blk: {
                 if (attr_value.len < 4) return error.InvalidAttribute;
                 const class = attr_value[2] & 0x07;
@@ -216,6 +248,10 @@ pub const AttributeIterator = struct {
                     .code = @as(u16, class) * 100 + attr_value[3],
                     .reason = attr_value[4..attr_len],
                 } };
+            },
+            .requested_transport => blk: {
+                if (attr_len != 4) return error.InvalidAttribute;
+                break :blk .{ .requested_transport = @enumFromInt(attr_value[0]) };
             },
             .userhash => blk: {
                 if (attr_len != 32) break :blk error.InvalidAttribute;
@@ -390,13 +426,14 @@ pub const Writer = struct {
             .use_candidate => {},
             .message_integrity => try msg_writer.writeMessageIntegrity(),
             .fingerprint => try writeFingerprint(&msg_writer.writer),
-            .software, .username, .userhash => |slice| try out.writeAll(slice),
+            .software, .username, .userhash, .realm, .nonce => |slice| try out.writeAll(slice),
             .mapped_address => |addr| try msg_writer.writeIpAddress(addr, false),
             .xor_mapped_address => |addr| try msg_writer.writeIpAddress(addr, true),
             .error_code => |err| {
                 try msg_writer.writer.writeInt(u32, @as(u32, err.code / 100) << 8 | (err.code % 100), .big);
                 try msg_writer.writer.writeAll(err.reason);
             },
+            .requested_transport => |transport| try out.writeAll(&[_]u8{ @intFromEnum(transport), 0, 0, 0 }),
             else => return error.UnknownAttribute,
         }
 
@@ -735,4 +772,189 @@ test "Writer: write mapped and xor mapped addresses" {
     try writer.writeAttribute(.{ .mapped_address = ipv6 });
     try writer.writeAttribute(.{ .xor_mapped_address = ipv4 });
     try testing.expectEqualSlices(u8, &expected, writer.final());
+}
+
+test "MessageType: round-trip" {
+    const classes = [_]Class{ .request, .indication, .success_response, .error_response };
+    const methods = [_]Method{ .binding, .allocate };
+
+    for (classes) |c| for (methods) |m| {
+        const mt = MessageType.fromClassAndMethod(c, m);
+        try testing.expectEqual(c, mt.class());
+        try testing.expectEqual(m, mt.method());
+    };
+}
+
+test "Attribute: size" {
+    const ipv4 = Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 192, 0, 2, 1 }, .port = 32853 } };
+    const ipv6 = Io.net.IpAddress{ .ip6 = .unspecified(32853) };
+
+    try testing.expectEqual(8, Attribute.size(.{ .mapped_address = ipv4 }));
+    try testing.expectEqual(20, Attribute.size(.{ .mapped_address = ipv6 }));
+    try testing.expectEqual(8, Attribute.size(.{ .xor_mapped_address = ipv4 }));
+    try testing.expectEqual(20, Attribute.size(.{ .xor_mapped_address = ipv6 }));
+    try testing.expectEqual(9, Attribute.size(.{ .username = "evtj:h6vY" }));
+    try testing.expectEqual(20, Attribute.size(.{ .message_integrity = &.{} }));
+    try testing.expectEqual(16, Attribute.size(.{ .error_code = .{ .code = 401, .reason = "Unauthorized" } }));
+    try testing.expectEqual(11, Attribute.size(.{ .realm = "example.org" }));
+    try testing.expectEqual(16, Attribute.size(.{ .nonce = "f//499k954d6OL34" }));
+    try testing.expectEqual(4, Attribute.size(.{ .requested_transport = .udp }));
+    try testing.expectEqual(0, Attribute.size(.use_candidate));
+    try testing.expectEqual(32, Attribute.size(.{ .userhash = &[_]u8{0} ** 32 }));
+    try testing.expectEqual(4, Attribute.size(.{ .priority = 0x6E0001FF }));
+    try testing.expectEqual(16, Attribute.size(.{ .software = "STUN test client" }));
+    try testing.expectEqual(4, Attribute.size(.fingerprint));
+    try testing.expectEqual(8, Attribute.size(.{ .ice_controlled = 0x932FF9B151263B36 }));
+    try testing.expectEqual(8, Attribute.size(.{ .ice_controlling = 0x932FF9B151263B36 }));
+    try testing.expectEqual(0, Attribute.size(.{ .unknown = .{ @enumFromInt(0x8000), "data" } }));
+}
+
+const allocate_request = [_]u8{
+    0x00, 0x03, 0x00, 0x2C,
+    0x21, 0x12, 0xA4, 0x42,
+    0x00, 0x01, 0x02, 0x03,
+    0x04, 0x05, 0x06, 0x07,
+    0x08, 0x09, 0x0A, 0x0B,
+    // REALM
+    0x00, 0x14, 0x00, 0x0B,
+    'e',  'x',  'a',  'm',
+    'p',  'l',  'e',  '.',
+    'o',  'r',  'g',  0x00,
+    // NONCE
+    0x00, 0x15, 0x00, 0x10,
+    'f',  '/',  '/',  '4',
+    '9',  '9',  'k',  '9',
+    '5',  '4',  'd',  '6',
+    'O',  'L',  '3',  '4',
+    // REQUESTED-TRANSPORT
+    0x00, 0x19, 0x00, 0x04,
+    0x11, 0x00, 0x00, 0x00,
+};
+
+test "Writer: write allocate request attributes" {
+    var buffer: [1024]u8 = undefined;
+    var out = Writer.init(&buffer, .{});
+
+    try out.writeHeader(.{
+        .message_type = .fromClassAndMethod(.request, .allocate),
+        .transaction_id = std.mem.readInt(u96, allocate_request[8..20], .big),
+        .message_length = 0,
+    });
+
+    try out.writeAttribute(.{ .realm = "example.org" });
+    try out.writeAttribute(.{ .nonce = "f//499k954d6OL34" });
+    try out.writeAttribute(.{ .requested_transport = .udp });
+
+    try testing.expectEqualSlices(u8, &allocate_request, out.final());
+}
+
+test "Message.iterateAttributes: realm, nonce and requested transport" {
+    const message = try Message.parse(&allocate_request);
+    try testing.expectEqual(.request, message.header.message_type.class());
+    try testing.expectEqual(.allocate, message.header.message_type.method());
+
+    var it = message.iterateAttributes(&.{});
+
+    var attribute = try it.next() orelse return error.ExpectedAttribute;
+    try testing.expectEqualStrings("example.org", attribute.realm);
+
+    attribute = try it.next() orelse return error.ExpectedAttribute;
+    try testing.expectEqualStrings("f//499k954d6OL34", attribute.nonce);
+
+    attribute = try it.next() orelse return error.ExpectedAttribute;
+    try testing.expectEqual(.udp, attribute.requested_transport);
+
+    try testing.expectEqual(null, try it.next());
+}
+
+test "Writer: write requested transport tcp" {
+    var buffer: [header_size + 8]u8 = undefined;
+    var out = Writer.init(&buffer, .{});
+
+    try out.writeHeader(.{
+        .message_type = .fromClassAndMethod(.request, .allocate),
+        .transaction_id = 0,
+        .message_length = 0,
+    });
+    try out.writeAttribute(.{ .requested_transport = .tcp });
+
+    try testing.expectEqualSlices(u8, &.{ 0x00, 0x19, 0x00, 0x04, 0x06, 0x00, 0x00, 0x00 }, out.final()[header_size..]);
+}
+
+test "Message.iterateAttributes: invalid requested transport length" {
+    const bytes = [_]u8{
+        0x00, 0x03, 0x00, 0x08,
+        0x21, 0x12, 0xA4, 0x42,
+        0x00, 0x01, 0x02, 0x03,
+        0x04, 0x05, 0x06, 0x07,
+        0x08, 0x09, 0x0A, 0x0B,
+        0x00, 0x19, 0x00, 0x01,
+        0x11, 0x00, 0x00, 0x00,
+    };
+
+    const message = try Message.parse(&bytes);
+    var it = message.iterateAttributes(&.{});
+    try testing.expectError(error.InvalidAttribute, it.next());
+}
+
+test "Writer: allocate request with long-term credentials" {
+    const username = "user";
+    const realm = "example.org";
+    const nonce = "f//499k954d6OL34";
+
+    var key = longTermCredentialsKey(std.crypto.hash.Md5, username, realm, "TheMatrIX");
+
+    var buffer: [1024]u8 = undefined;
+    var out = Writer.init(&buffer, .{ .password = &key });
+
+    try out.writeHeader(.{
+        .message_type = .fromClassAndMethod(.request, .allocate),
+        .transaction_id = std.mem.readInt(u96, allocate_request[8..20], .big),
+        .message_length = 0,
+    });
+
+    try out.writeAttribute(.{ .requested_transport = .udp });
+    try out.writeAttribute(.{ .username = username });
+    try out.writeAttribute(.{ .realm = realm });
+    try out.writeAttribute(.{ .nonce = nonce });
+    try out.writeAttribute(.{ .message_integrity = &.{} });
+    try out.writeAttribute(.fingerprint);
+
+    const message = try Message.parse(out.final());
+    var it = message.iterateAttributes(&key);
+
+    var attribute = try it.next() orelse return error.ExpectedAttribute;
+    try testing.expectEqual(.udp, attribute.requested_transport);
+
+    attribute = try it.next() orelse return error.ExpectedAttribute;
+    try testing.expectEqualStrings(username, attribute.username);
+
+    attribute = try it.next() orelse return error.ExpectedAttribute;
+    try testing.expectEqualStrings(realm, attribute.realm);
+
+    attribute = try it.next() orelse return error.ExpectedAttribute;
+    try testing.expectEqualStrings(nonce, attribute.nonce);
+
+    _ = try it.next() orelse return error.ExpectedAttribute; // Message Integrity
+    _ = try it.next() orelse return error.ExpectedAttribute; // Fingerprint
+    try testing.expectEqual(null, try it.next());
+}
+
+test "Message.iterateAttributes: wrong long-term credentials" {
+    var buffer: [1024]u8 = undefined;
+    var out = Writer.init(&buffer, .{ .password = "key" });
+
+    try out.writeHeader(.{
+        .message_type = .fromClassAndMethod(.request, .allocate),
+        .transaction_id = std.mem.readInt(u96, allocate_request[8..20], .big),
+        .message_length = 0,
+    });
+
+    try out.writeAttribute(.{ .realm = "example.org" });
+    try out.writeAttribute(.{ .message_integrity = &.{} });
+
+    const message = try Message.parse(out.final());
+    var it = message.iterateAttributes("other key");
+    _ = try it.next() orelse return error.ExpectedAttribute;
+    try testing.expectError(error.MessageIntegrityCheckFailed, it.next());
 }

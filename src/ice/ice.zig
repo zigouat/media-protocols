@@ -9,16 +9,52 @@ pub const IceServer = struct {
     credential: []const u8 = &.{},
 };
 
-pub const ConnectionState = enum { new, checking, connected, completed, disconnected, failed, closed };
+/// ConnectionState represents the state of the ICE connection process.
+pub const ConnectionState = enum {
+    /// The ICE agent is in the initial state, before any connectivity checks have been performed.
+    new,
+    /// The ICE agent is in the process of performing connectivity checks to determine the best candidate pair for communication.
+    checking,
+    /// The ICE agent has successfully established a connection with a remote peer and has selected a candidate pair for communication.
+    connected,
+    /// The ICE agent has completed the connectivity checks and no more checks are sent or answered.
+    completed,
+    /// The ICE agent has lost the connection with the remote peer.
+    disconnected,
+    /// The ICE agent has failed to establish or timeed out after establishing a connection with the remote peer.
+    failed,
+    /// The ICE agent has closed the connection.
+    closed,
+};
 
-pub const GatheringState = enum { new, gathering, complete };
+/// GatheringState represents the state of the ICE candidate gathering process.
+pub const GatheringState = enum {
+    /// The ICE agent is in the initial state, before any candidate gathering has been performed.
+    new,
+    /// The ICE agent is in the process of gathering candidates from local interfaces and STUN/TURN servers.
+    gathering,
+    /// The ICE agent has completed the candidate gathering process and has gathered all available candidates.
+    complete,
+};
 
-pub const Role = enum { controlling, controlled };
+/// Role represents the role of the ICE agent in the ICE negotiation process.
+pub const Role = enum {
+    /// The ICE agent is in the controlling role, responsible for making the decision about the final candidate pair to use
+    /// for sending data.
+    controlling,
+    /// The ICE agent is in the controlled role.
+    controlled,
+};
 
+/// CandidateType represents the type of ICE candidate.
 pub const CandidateType = enum {
+    /// A host candidate is a candidate that represents a local network interface on the host machine.
     host,
+    /// A server reflexive candidate is a candidate that represents a public IP address and port as seen in public internet.
     srflx,
+    /// A peer reflexive candidate is a candidate that represents a public IP address and port as seen by a remote peer.
     prflx,
+    /// A relay candidate is a candidate that represents a public IP address and port as seen by a relay server, such as a TURN server.
     relay,
 
     pub fn typePreference(self: CandidateType) u8 {
