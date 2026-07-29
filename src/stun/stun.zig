@@ -43,6 +43,11 @@ pub const Class = enum(u2) {
 pub const Method = enum(u12) {
     binding = 1,
     allocate = 3,
+    refresh = 4,
+    send = 6,
+    data = 7,
+    create_permission = 8,
+    channel_bind = 9,
     _,
 };
 
@@ -132,9 +137,41 @@ pub const Message = struct {
     }
 };
 
+pub const StunErrorCode = enum(u16) {
+    bad_request = 400,
+    unauthorized = 401,
+    forbidden = 403,
+    unknown_attribute = 420,
+    allocation_mismatch = 437,
+    stale_nonce = 438,
+    address_family_not_supported = 440,
+    wrong_credentials = 441,
+    unsupported_transport_protocol = 442,
+    allocation_quota_reached = 486,
+    role_conflict = 487,
+    server_error = 500,
+    insufficient_capacity = 508,
+    _,
+};
+
 pub const StunError = struct {
-    code: u16,
+    code: StunErrorCode,
     reason: []const u8,
+};
+
+/// The reason a server didn't allocate the requested address family.
+pub const AddressError = struct {
+    family: Io.net.IpAddress.Family,
+    code: StunErrorCode,
+    reason: []const u8,
+};
+
+/// The Icmp type, code and error data as reported by a Turn server.
+pub const Icmp = struct {
+    type: u8,
+    code: u8,
+    /// Set to the MTU of the next-hop link for "packet too big" errors, zero otherwise.
+    error_data: u32,
 };
 
 pub const AttributeType = enum(u16) {
@@ -142,13 +179,25 @@ pub const AttributeType = enum(u16) {
     username = 0x0006,
     message_integrity = 0x0008,
     error_code = 0x0009,
+    channel_number = 0x000C,
+    lifetime = 0x000D,
+    xor_peer_address = 0x0012,
+    data = 0x0013,
     realm = 0x0014,
     nonce = 0x0015,
+    xor_relayed_address = 0x0016,
+    requested_address_family = 0x0017,
+    even_port = 0x0018,
     requested_transport = 0x0019,
+    dont_fragment = 0x001A,
     xor_mapped_address = 0x0020,
+    reservation_token = 0x0022,
     use_candidate = 0x0025,
     userhash = 0x001E,
     priority = 0x0024,
+    additional_address_family = 0x8000,
+    address_error_code = 0x8001,
+    icmp = 0x8004,
     software = 0x8022,
     fingerprint = 0x8028,
     ice_controlled = 0x8029,
@@ -166,14 +215,33 @@ pub const Attribute = union(AttributeType) {
     /// The MESSAGE-INTEGRITY attribute is used to provide integrity protection for STUN messages.
     message_integrity: []const u8,
     error_code: StunError,
+    /// The CHANNEL-NUMBER attribute conveys the number of the channel bound to a peer.
+    channel_number: u16,
+    /// The LIFETIME attribute conveys the number of seconds remaining until an allocation expires.
+    lifetime: u32,
+    /// The XOR-PEER-ADDRESS attribute conveys the address and port of the peer as seen by the Turn server.
+    xor_peer_address: Io.net.IpAddress,
+    /// The DATA attribute carries the application data relayed by the Turn server.
+    data: []const u8,
     /// The REALM value used in long-term credential authentication in STUN.
     realm: []const u8,
     /// The NONCE value used in long-term credential authentication in STUN.
     nonce: []const u8,
+    /// The XOR-RELAYED-ADDRESS attribute conveys the address and port the Turn server allocated to the client.
+    xor_relayed_address: Io.net.IpAddress,
+    /// The REQUESTED-ADDRESS-FAMILY attribute conveys the address family the client asks the Turn server to allocate.
+    requested_address_family: Io.net.IpAddress.Family,
+    /// The EVEN-PORT attribute asks for an even relayed port, the payload is the R bit
+    /// requesting the reservation of the next-higher port number.
+    even_port: bool,
     requested_transport: enum(u8) { tcp = 6, udp = 17, _ },
+    /// The DONT-FRAGMENT attribute asks the Turn server to set the DF bit when relaying data to a peer.
+    dont_fragment: void,
     /// The XOR-MAPPED-ADDRESS attribute is used to convey the mapped IP address and port of the client as seen by the server,
     /// but with an additional layer of obfuscation.
     xor_mapped_address: Io.net.IpAddress,
+    /// The RESERVATION-TOKEN attribute identifies a relayed transport address held in reserve by the Turn server.
+    reservation_token: u64,
     /// The USE-CANDIDATE attribute is introduced in the Interactive Connectivity Establishment (ICE) protocol.
     /// When a client includes this attribute in a STUN Binding Request, it indicates to the server that the client is
     /// ready to use the candidate (IP address and port) associated with the request for media communication.
@@ -181,6 +249,10 @@ pub const Attribute = union(AttributeType) {
     userhash: []const u8,
     /// The PRIORITY attribute is used in the Interactive Connectivity Establishment (ICE) protocol to convey the priority of a candidate.
     priority: u32,
+    /// The ADDITIONAL-ADDRESS-FAMILY attribute asks the Turn server for an allocation of both address families.
+    additional_address_family: Io.net.IpAddress.Family,
+    address_error_code: AddressError,
+    icmp: Icmp,
     software: []const u8,
     /// The FINGERPRINT attribute is used to provide a checksum of the STUN message for error detection.
     fingerprint: void,
@@ -194,17 +266,25 @@ pub const Attribute = union(AttributeType) {
 
     pub fn size(attribute: Attribute) u16 {
         return switch (attribute) {
-            .priority, .fingerprint => 4,
-            .ice_controlled, .ice_controlling => 8,
+            .priority,
+            .fingerprint,
+            .channel_number,
+            .lifetime,
+            .requested_address_family,
+            .requested_transport,
+            .additional_address_family,
+            => 4,
+            .even_port => 1,
+            .ice_controlled, .ice_controlling, .reservation_token, .icmp => 8,
             .message_integrity => 20,
-            .use_candidate => 0,
-            .software, .username, .userhash, .nonce, .realm => |slice| @intCast(slice.len),
-            .mapped_address, .xor_mapped_address => |ip| switch (ip) {
+            .use_candidate, .dont_fragment => 0,
+            .software, .username, .userhash, .nonce, .realm, .data => |slice| @intCast(slice.len),
+            .mapped_address, .xor_mapped_address, .xor_peer_address, .xor_relayed_address => |ip| switch (ip) {
                 .ip4 => 8,
                 .ip6 => 20,
             },
-            .requested_transport => 4,
             .error_code => |err| @intCast(err.reason.len + 4),
+            .address_error_code => |err| @intCast(err.reason.len + 4),
             else => 0,
         };
     }
@@ -234,24 +314,73 @@ pub const AttributeIterator = struct {
         const attr_value = it.reader.take(attr_len + padding) catch return error.InvalidAttribute;
 
         return switch (attr_type) {
-            .mapped_address => try parseMappedAddress(attr_value),
-            .xor_mapped_address => try parseXorMappedAddress(attr_value, it.reader.buffer[8..20]),
+            .mapped_address => .{ .mapped_address = try parseAddress(attr_value) },
+            .xor_mapped_address => .{ .xor_mapped_address = try parseXorAddress(attr_value, it.reader.buffer[8..20]) },
+            .xor_peer_address => .{ .xor_peer_address = try parseXorAddress(attr_value, it.reader.buffer[8..20]) },
+            .xor_relayed_address => .{ .xor_relayed_address = try parseXorAddress(attr_value, it.reader.buffer[8..20]) },
             .username => .{ .username = attr_value[0..attr_len] },
             .software => .{ .software = attr_value[0..attr_len] },
             .realm => .{ .realm = attr_value[0..attr_len] },
             .nonce => .{ .nonce = attr_value[0..attr_len] },
+            .data => .{ .data = attr_value[0..attr_len] },
             .error_code => blk: {
                 if (attr_value.len < 4) return error.InvalidAttribute;
                 const class = attr_value[2] & 0x07;
                 if (class < 3 or class > 6 or attr_value[3] > 99) return error.InvalidAttribute;
                 break :blk .{ .error_code = .{
-                    .code = @as(u16, class) * 100 + attr_value[3],
+                    .code = @enumFromInt(@as(u16, class) * 100 + attr_value[3]),
                     .reason = attr_value[4..attr_len],
                 } };
+            },
+            .address_error_code => blk: {
+                if (attr_len < 4) return error.InvalidAttribute;
+                const class = attr_value[2] & 0x07;
+                if (class < 3 or class > 6 or attr_value[3] > 99) return error.InvalidAttribute;
+                break :blk .{ .address_error_code = .{
+                    .family = try parseFamily(attr_value[0]),
+                    .code = @enumFromInt(@as(u16, class) * 100 + attr_value[3]),
+                    .reason = attr_value[4..attr_len],
+                } };
+            },
+            .channel_number => blk: {
+                if (attr_len != 4) return error.InvalidAttribute;
+                break :blk .{ .channel_number = std.mem.readInt(u16, attr_value[0..2], .big) };
+            },
+            .lifetime => blk: {
+                if (attr_len != 4) return error.InvalidAttribute;
+                break :blk .{ .lifetime = std.mem.readInt(u32, attr_value[0..4], .big) };
+            },
+            .requested_address_family, .additional_address_family => blk: {
+                if (attr_len != 4) return error.InvalidAttribute;
+                const family = try parseFamily(attr_value[0]);
+                break :blk if (attr_type == .requested_address_family)
+                    .{ .requested_address_family = family }
+                else
+                    .{ .additional_address_family = family };
+            },
+            .even_port => blk: {
+                if (attr_len != 1) return error.InvalidAttribute;
+                break :blk .{ .even_port = attr_value[0] & 0x80 != 0 };
             },
             .requested_transport => blk: {
                 if (attr_len != 4) return error.InvalidAttribute;
                 break :blk .{ .requested_transport = @enumFromInt(attr_value[0]) };
+            },
+            .dont_fragment => blk: {
+                if (attr_len != 0) return error.InvalidAttribute;
+                break :blk .dont_fragment;
+            },
+            .reservation_token => blk: {
+                if (attr_len != 8) return error.InvalidAttribute;
+                break :blk .{ .reservation_token = std.mem.readInt(u64, attr_value[0..8], .big) };
+            },
+            .icmp => blk: {
+                if (attr_len != 8) return error.InvalidAttribute;
+                break :blk .{ .icmp = .{
+                    .type = attr_value[2],
+                    .code = attr_value[3],
+                    .error_data = std.mem.readInt(u32, attr_value[4..8], .big),
+                } };
             },
             .userhash => blk: {
                 if (attr_len != 32) break :blk error.InvalidAttribute;
@@ -285,14 +414,18 @@ pub const AttributeIterator = struct {
         };
     }
 
-    fn parseMappedAddress(value: []const u8) !Attribute {
+    fn parseFamily(value: u8) !Io.net.IpAddress.Family {
+        return switch (value) {
+            1 => .ip4,
+            2 => .ip6,
+            else => error.InvalidAttribute,
+        };
+    }
+
+    fn parseAddress(value: []const u8) !Io.net.IpAddress {
         if (value.len < 8) return error.InvalidAttribute;
 
-        const family = switch (value[1]) {
-            1 => Io.net.IpAddress.Family.ip4,
-            2 => Io.net.IpAddress.Family.ip6,
-            else => return error.InvalidAttribute,
-        };
+        const family = try parseFamily(value[1]);
 
         if (family == .ip4 and value.len != 8 or family == .ip6 and value.len != 20) {
             return error.InvalidAttribute;
@@ -312,16 +445,12 @@ pub const AttributeIterator = struct {
             },
         };
 
-        return .{ .mapped_address = ip };
+        return ip;
     }
 
-    fn parseXorMappedAddress(value: []const u8, tx_id: []const u8) !Attribute {
+    fn parseXorAddress(value: []const u8, tx_id: []const u8) !Io.net.IpAddress {
         if (value.len < 8) return error.InvalidAttribute;
-        const family = switch (value[1]) {
-            1 => Io.net.IpAddress.Family.ip4,
-            2 => Io.net.IpAddress.Family.ip6,
-            else => return error.InvalidAttribute,
-        };
+        const family = try parseFamily(value[1]);
 
         if (family == .ip4 and value.len != 8 or family == .ip6 and value.len != 20) {
             return error.InvalidAttribute;
@@ -343,7 +472,7 @@ pub const AttributeIterator = struct {
             },
         };
 
-        return .{ .xor_mapped_address = ip };
+        return ip;
     }
 
     fn verifyMessageIntegrity(it: *const AttributeIterator, expected_hash: []u8) !void {
@@ -426,14 +555,36 @@ pub const Writer = struct {
             .use_candidate => {},
             .message_integrity => try msg_writer.writeMessageIntegrity(),
             .fingerprint => try writeFingerprint(&msg_writer.writer),
-            .software, .username, .userhash, .realm, .nonce => |slice| try out.writeAll(slice),
+            .software, .username, .userhash, .realm, .nonce, .data => |slice| try out.writeAll(slice),
             .mapped_address => |addr| try msg_writer.writeIpAddress(addr, false),
-            .xor_mapped_address => |addr| try msg_writer.writeIpAddress(addr, true),
+            .xor_mapped_address, .xor_peer_address, .xor_relayed_address => |addr| try msg_writer.writeIpAddress(addr, true),
             .error_code => |err| {
-                try msg_writer.writer.writeInt(u32, @as(u32, err.code / 100) << 8 | (err.code % 100), .big);
+                const code = @intFromEnum(err.code);
+                try msg_writer.writer.writeInt(u32, @as(u32, code / 100) << 8 | (code % 100), .big);
                 try msg_writer.writer.writeAll(err.reason);
             },
+            .address_error_code => |err| {
+                const code = @intFromEnum(err.code);
+                try out.writeAll(&[_]u8{ familyByte(err.family), 0 });
+                try out.writeInt(u16, @as(u16, code / 100) << 8 | (code % 100), .big);
+                try out.writeAll(err.reason);
+            },
             .requested_transport => |transport| try out.writeAll(&[_]u8{ @intFromEnum(transport), 0, 0, 0 }),
+            .channel_number => |ch| {
+                try out.writeInt(u16, ch, .big);
+                try out.writeAll(&[_]u8{ 0, 0 });
+            },
+            .lifetime => |seconds| try out.writeInt(u32, seconds, .big),
+            .requested_address_family, .additional_address_family => |family| {
+                try out.writeAll(&[_]u8{ familyByte(family), 0, 0, 0 });
+            },
+            .even_port => |reserve| try out.writeByte(if (reserve) 0x80 else 0),
+            .dont_fragment => {},
+            .reservation_token => |token| try out.writeInt(u64, token, .big),
+            .icmp => |icmp| {
+                try out.writeAll(&[_]u8{ 0, 0, icmp.type, icmp.code });
+                try out.writeInt(u32, icmp.error_data, .big);
+            },
             else => return error.UnknownAttribute,
         }
 
@@ -477,6 +628,13 @@ pub const Writer = struct {
         try w.writeInt(u32, hasher.final() ^ fingerprint_xor, .big);
     }
 
+    fn familyByte(family: Io.net.IpAddress.Family) u8 {
+        return switch (family) {
+            .ip4 => 1,
+            .ip6 => 2,
+        };
+    }
+
     fn writeIpAddress(msg_writer: *Writer, addr: Io.net.IpAddress, xor: bool) Io.Writer.Error!void {
         var out = &msg_writer.writer;
         const cookie = std.mem.toBytes(std.mem.nativeToBig(u32, magic_cookie));
@@ -516,13 +674,15 @@ pub const Writer = struct {
 
 const testing = std.testing;
 
-test "MessageType: round-trip all classes" {
+test "MessageType: round-trip" {
     const classes = [_]Class{ .request, .indication, .success_response, .error_response };
-    for (classes) |c| {
-        const mt = MessageType.fromClassAndMethod(c, .binding);
+    const methods = [_]Method{ .binding, .allocate, .refresh, .send, .data, .create_permission, .channel_bind };
+
+    for (classes) |c| for (methods) |m| {
+        const mt = MessageType.fromClassAndMethod(c, m);
         try testing.expectEqual(c, mt.class());
-        try testing.expectEqual(Method.binding, mt.method());
-    }
+        try testing.expectEqual(m, mt.method());
+    };
 }
 
 test "Header: size matches STUN spec" {
@@ -774,17 +934,6 @@ test "Writer: write mapped and xor mapped addresses" {
     try testing.expectEqualSlices(u8, &expected, writer.final());
 }
 
-test "MessageType: round-trip" {
-    const classes = [_]Class{ .request, .indication, .success_response, .error_response };
-    const methods = [_]Method{ .binding, .allocate };
-
-    for (classes) |c| for (methods) |m| {
-        const mt = MessageType.fromClassAndMethod(c, m);
-        try testing.expectEqual(c, mt.class());
-        try testing.expectEqual(m, mt.method());
-    };
-}
-
 test "Attribute: size" {
     const ipv4 = Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 192, 0, 2, 1 }, .port = 32853 } };
     const ipv6 = Io.net.IpAddress{ .ip6 = .unspecified(32853) };
@@ -795,10 +944,28 @@ test "Attribute: size" {
     try testing.expectEqual(20, Attribute.size(.{ .xor_mapped_address = ipv6 }));
     try testing.expectEqual(9, Attribute.size(.{ .username = "evtj:h6vY" }));
     try testing.expectEqual(20, Attribute.size(.{ .message_integrity = &.{} }));
-    try testing.expectEqual(16, Attribute.size(.{ .error_code = .{ .code = 401, .reason = "Unauthorized" } }));
+    try testing.expectEqual(16, Attribute.size(.{ .error_code = .{ .code = .unauthorized, .reason = "Unauthorized" } }));
     try testing.expectEqual(11, Attribute.size(.{ .realm = "example.org" }));
     try testing.expectEqual(16, Attribute.size(.{ .nonce = "f//499k954d6OL34" }));
     try testing.expectEqual(4, Attribute.size(.{ .requested_transport = .udp }));
+    try testing.expectEqual(4, Attribute.size(.{ .channel_number = 0x4000 }));
+    try testing.expectEqual(4, Attribute.size(.{ .lifetime = 600 }));
+    try testing.expectEqual(8, Attribute.size(.{ .xor_peer_address = ipv4 }));
+    try testing.expectEqual(20, Attribute.size(.{ .xor_peer_address = ipv6 }));
+    try testing.expectEqual(8, Attribute.size(.{ .xor_relayed_address = ipv4 }));
+    try testing.expectEqual(20, Attribute.size(.{ .xor_relayed_address = ipv6 }));
+    try testing.expectEqual(5, Attribute.size(.{ .data = "hello" }));
+    try testing.expectEqual(4, Attribute.size(.{ .requested_address_family = .ip4 }));
+    try testing.expectEqual(4, Attribute.size(.{ .additional_address_family = .ip6 }));
+    try testing.expectEqual(1, Attribute.size(.{ .even_port = true }));
+    try testing.expectEqual(0, Attribute.size(.dont_fragment));
+    try testing.expectEqual(8, Attribute.size(.{ .reservation_token = 0x0102030405060708 }));
+    try testing.expectEqual(8, Attribute.size(.{ .icmp = .{ .type = 3, .code = 4, .error_data = 1500 } }));
+    try testing.expectEqual(17, Attribute.size(.{ .address_error_code = .{
+        .family = .ip6,
+        .code = .address_family_not_supported,
+        .reason = "Not Supported",
+    } }));
     try testing.expectEqual(0, Attribute.size(.use_candidate));
     try testing.expectEqual(32, Attribute.size(.{ .userhash = &[_]u8{0} ** 32 }));
     try testing.expectEqual(4, Attribute.size(.{ .priority = 0x6E0001FF }));
@@ -895,6 +1062,297 @@ test "Message.iterateAttributes: invalid requested transport length" {
     const message = try Message.parse(&bytes);
     var it = message.iterateAttributes(&.{});
     try testing.expectError(error.InvalidAttribute, it.next());
+}
+
+const turn_allocate_request = [_]u8{
+    0x00, 0x03, 0x00, 0x1C,
+    0x21, 0x12, 0xA4, 0x42,
+    0x00, 0x01, 0x02, 0x03,
+    0x04, 0x05, 0x06, 0x07,
+    0x08, 0x09, 0x0A, 0x0B,
+    // LIFETIME
+    0x00, 0x0D, 0x00, 0x04,
+    0x00, 0x00, 0x02, 0x58,
+    // REQUESTED-ADDRESS-FAMILY
+    0x00, 0x17, 0x00, 0x04,
+    0x01, 0x00, 0x00, 0x00,
+    // EVEN-PORT
+    0x00, 0x18, 0x00, 0x01,
+    0x80, 0x00, 0x00, 0x00,
+    // DONT-FRAGMENT
+    0x00, 0x1A, 0x00, 0x00,
+};
+
+test "Writer: write allocate request turn attributes" {
+    var buffer: [1024]u8 = undefined;
+    var out = Writer.init(&buffer, .{});
+
+    try out.writeHeader(.{
+        .message_type = .fromClassAndMethod(.request, .allocate),
+        .transaction_id = std.mem.readInt(u96, turn_allocate_request[8..20], .big),
+        .message_length = 0,
+    });
+
+    try out.writeAttribute(.{ .lifetime = 600 });
+    try out.writeAttribute(.{ .requested_address_family = .ip4 });
+    try out.writeAttribute(.{ .even_port = true });
+    try out.writeAttribute(.dont_fragment);
+
+    try testing.expectEqualSlices(u8, &turn_allocate_request, out.final());
+}
+
+test "Message.iterateAttributes: allocate request turn attributes" {
+    const message = try Message.parse(&turn_allocate_request);
+    var it = message.iterateAttributes(&.{});
+
+    var attribute = try it.next() orelse return error.ExpectedAttribute;
+    try testing.expectEqual(600, attribute.lifetime);
+
+    attribute = try it.next() orelse return error.ExpectedAttribute;
+    try testing.expectEqual(.ip4, attribute.requested_address_family);
+
+    attribute = try it.next() orelse return error.ExpectedAttribute;
+    try testing.expectEqual(true, attribute.even_port);
+
+    attribute = try it.next() orelse return error.ExpectedAttribute;
+    try testing.expectEqual(.dont_fragment, @as(AttributeType, attribute));
+
+    try testing.expectEqual(null, try it.next());
+}
+
+const turn_allocate_response = [_]u8{
+    0x01, 0x03, 0x00, 0x2C,
+    0x21, 0x12, 0xA4, 0x42,
+    0x00, 0x01, 0x02, 0x03,
+    0x04, 0x05, 0x06, 0x07,
+    0x08, 0x09, 0x0A, 0x0B,
+    // LIFETIME
+    0x00, 0x0D, 0x00, 0x04,
+    0x00, 0x00, 0x02, 0x58,
+    // XOR-RELAYED-ADDRESS
+    0x00, 0x16, 0x00, 0x08,
+    0x00, 0x01, 0xA1, 0x47,
+    0xE1, 0x12, 0xA6, 0x43,
+    // XOR-MAPPED-ADDRESS
+    0x00, 0x20, 0x00, 0x08,
+    0x00, 0x01, 0xA1, 0x47,
+    0xE1, 0x12, 0xA6, 0x43,
+    // RESERVATION-TOKEN
+    0x00, 0x22, 0x00, 0x08,
+    0x01, 0x02, 0x03, 0x04,
+    0x05, 0x06, 0x07, 0x08,
+};
+
+test "Writer: write allocate success response" {
+    const relayed = Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 192, 0, 2, 1 }, .port = 32853 } };
+
+    var buffer: [1024]u8 = undefined;
+    var out = Writer.init(&buffer, .{});
+
+    try out.writeHeader(.{
+        .message_type = .fromClassAndMethod(.success_response, .allocate),
+        .transaction_id = std.mem.readInt(u96, turn_allocate_response[8..20], .big),
+        .message_length = 0,
+    });
+
+    try out.writeAttribute(.{ .lifetime = 600 });
+    try out.writeAttribute(.{ .xor_relayed_address = relayed });
+    try out.writeAttribute(.{ .xor_mapped_address = relayed });
+    try out.writeAttribute(.{ .reservation_token = 0x0102030405060708 });
+
+    try testing.expectEqualSlices(u8, &turn_allocate_response, out.final());
+}
+
+test "Message.iterateAttributes: allocate success response" {
+    const relayed = Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 192, 0, 2, 1 }, .port = 32853 } };
+
+    const message = try Message.parse(&turn_allocate_response);
+    try testing.expectEqual(.success_response, message.header.message_type.class());
+    try testing.expectEqual(.allocate, message.header.message_type.method());
+
+    var it = message.iterateAttributes(&.{});
+
+    var attribute = try it.next() orelse return error.ExpectedAttribute;
+    try testing.expectEqual(600, attribute.lifetime);
+
+    attribute = try it.next() orelse return error.ExpectedAttribute;
+    try testing.expect(attribute.xor_relayed_address.eql(&relayed));
+
+    attribute = try it.next() orelse return error.ExpectedAttribute;
+    try testing.expect(attribute.xor_mapped_address.eql(&relayed));
+
+    attribute = try it.next() orelse return error.ExpectedAttribute;
+    try testing.expectEqual(0x0102030405060708, attribute.reservation_token);
+
+    try testing.expectEqual(null, try it.next());
+}
+
+const send_indication = [_]u8{
+    0x00, 0x16, 0x00, 0x18,
+    0x21, 0x12, 0xA4, 0x42,
+    0x00, 0x01, 0x02, 0x03,
+    0x04, 0x05, 0x06, 0x07,
+    0x08, 0x09, 0x0A, 0x0B,
+    // XOR-PEER-ADDRESS
+    0x00, 0x12, 0x00, 0x08,
+    0x00, 0x01, 0xA1, 0x47,
+    0xE1, 0x12, 0xA6, 0x43,
+    // DATA
+    0x00, 0x13, 0x00, 0x05,
+    'h',  'e',  'l',  'l',
+    'o',  0x00, 0x00, 0x00,
+};
+
+test "Writer: write send indication" {
+    const peer = Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 192, 0, 2, 1 }, .port = 32853 } };
+
+    var buffer: [1024]u8 = undefined;
+    var out = Writer.init(&buffer, .{});
+
+    try out.writeHeader(.{
+        .message_type = .fromClassAndMethod(.indication, .send),
+        .transaction_id = std.mem.readInt(u96, send_indication[8..20], .big),
+        .message_length = 0,
+    });
+
+    try out.writeAttribute(.{ .xor_peer_address = peer });
+    try out.writeAttribute(.{ .data = "hello" });
+
+    try testing.expectEqualSlices(u8, &send_indication, out.final());
+}
+
+test "Message.iterateAttributes: send indication" {
+    const peer = Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 192, 0, 2, 1 }, .port = 32853 } };
+
+    const message = try Message.parse(&send_indication);
+    try testing.expectEqual(.indication, message.header.message_type.class());
+    try testing.expectEqual(.send, message.header.message_type.method());
+
+    var it = message.iterateAttributes(&.{});
+
+    var attribute = try it.next() orelse return error.ExpectedAttribute;
+    try testing.expect(attribute.xor_peer_address.eql(&peer));
+
+    attribute = try it.next() orelse return error.ExpectedAttribute;
+    try testing.expectEqualStrings("hello", attribute.data);
+
+    try testing.expectEqual(null, try it.next());
+}
+
+test "Writer: write channel bind request" {
+    const expected = [_]u8{
+        0x00, 0x09, 0x00, 0x14,
+        0x21, 0x12, 0xA4, 0x42,
+        0x00, 0x01, 0x02, 0x03,
+        0x04, 0x05, 0x06, 0x07,
+        0x08, 0x09, 0x0A, 0x0B,
+        // CHANNEL-NUMBER
+        0x00, 0x0C, 0x00, 0x04,
+        0x40, 0x00, 0x00, 0x00,
+        // XOR-PEER-ADDRESS
+        0x00, 0x12, 0x00, 0x08,
+        0x00, 0x01, 0xA1, 0x47,
+        0xE1, 0x12, 0xA6, 0x43,
+    };
+
+    const peer = Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 192, 0, 2, 1 }, .port = 32853 } };
+
+    var buffer: [1024]u8 = undefined;
+    var out = Writer.init(&buffer, .{});
+
+    try out.writeHeader(.{
+        .message_type = .fromClassAndMethod(.request, .channel_bind),
+        .transaction_id = std.mem.readInt(u96, expected[8..20], .big),
+        .message_length = 0,
+    });
+
+    try out.writeAttribute(.{ .channel_number = 0x4000 });
+    try out.writeAttribute(.{ .xor_peer_address = peer });
+
+    try testing.expectEqualSlices(u8, &expected, out.final());
+
+    const message = try Message.parse(out.final());
+    var it = message.iterateAttributes(&.{});
+
+    var attribute = try it.next() orelse return error.ExpectedAttribute;
+    try testing.expectEqual(0x4000, attribute.channel_number);
+
+    attribute = try it.next() orelse return error.ExpectedAttribute;
+    try testing.expect(attribute.xor_peer_address.eql(&peer));
+}
+
+test "Writer: write address error code and icmp" {
+    const expected_icmp = [_]u8{
+        0x80, 0x04, 0x00, 0x08,
+        0x00, 0x00, 0x03, 0x04,
+        0x00, 0x00, 0x05, 0xDC,
+    };
+
+    var buffer: [1024]u8 = undefined;
+    var out = Writer.init(&buffer, .{});
+
+    try out.writeHeader(.{
+        .message_type = .fromClassAndMethod(.error_response, .allocate),
+        .transaction_id = 0,
+        .message_length = 0,
+    });
+
+    try out.writeAttribute(.{ .address_error_code = .{
+        .family = .ip6,
+        .code = .address_family_not_supported,
+        .reason = "Address Family not Supported",
+    } });
+    try out.writeAttribute(.{ .icmp = .{ .type = 3, .code = 4, .error_data = 1500 } });
+
+    const bytes = out.final();
+    try testing.expectEqualSlices(u8, &.{ 0x80, 0x01, 0x00, 0x20, 0x02, 0x00, 0x04, 0x28 }, bytes[header_size..][0..8]);
+    try testing.expectEqualSlices(u8, &expected_icmp, bytes[bytes.len - expected_icmp.len ..]);
+
+    const message = try Message.parse(bytes);
+    try testing.expectEqual(.error_response, message.header.message_type.class());
+
+    var it = message.iterateAttributes(&.{});
+
+    var attribute = try it.next() orelse return error.ExpectedAttribute;
+    try testing.expectEqual(.ip6, attribute.address_error_code.family);
+    try testing.expectEqual(.address_family_not_supported, attribute.address_error_code.code);
+    try testing.expectEqualStrings("Address Family not Supported", attribute.address_error_code.reason);
+
+    attribute = try it.next() orelse return error.ExpectedAttribute;
+    try testing.expectEqual(Icmp{ .type = 3, .code = 4, .error_data = 1500 }, attribute.icmp);
+
+    try testing.expectEqual(null, try it.next());
+}
+
+test "Message.iterateAttributes: invalid turn attributes" {
+    const invalid = [_][]const u8{
+        &.{ 0x00, 0x0C, 0x00, 0x02, 0x40, 0x00, 0x00, 0x00 }, // CHANNEL-NUMBER
+        &.{ 0x00, 0x0D, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00 }, // LIFETIME
+        &.{ 0x00, 0x17, 0x00, 0x04, 0x03, 0x00, 0x00, 0x00 }, // REQUESTED-ADDRESS-FAMILY, unknown family
+        &.{ 0x80, 0x00, 0x00, 0x01, 0x02, 0x00, 0x00, 0x00 }, // ADDITIONAL-ADDRESS-FAMILY
+        &.{ 0x00, 0x18, 0x00, 0x04, 0x80, 0x00, 0x00, 0x00 }, // EVEN-PORT
+        &.{ 0x00, 0x1A, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00 }, // DONT-FRAGMENT
+        &.{ 0x00, 0x22, 0x00, 0x04, 0x01, 0x02, 0x03, 0x04 }, // RESERVATION-TOKEN
+        &.{ 0x80, 0x04, 0x00, 0x04, 0x00, 0x00, 0x03, 0x04 }, // ICMP
+        &.{ 0x80, 0x01, 0x00, 0x04, 0x02, 0x00, 0x09, 0x28 }, // ADDRESS-ERROR-CODE, invalid class
+        &.{ 0x00, 0x12, 0x00, 0x04, 0x00, 0x01, 0xA1, 0x47 }, // XOR-PEER-ADDRESS
+        &.{ 0x00, 0x16, 0x00, 0x08, 0x00, 0x03, 0xA1, 0x47, 0xE1, 0x12, 0xA6, 0x43 }, // XOR-RELAYED-ADDRESS
+    };
+
+    var buffer: [64]u8 = undefined;
+    for (invalid) |attribute| {
+        var out = Writer.init(&buffer, .{});
+        try out.writeHeader(.{
+            .message_type = .fromClassAndMethod(.request, .allocate),
+            .transaction_id = 0,
+            .message_length = 0,
+        });
+        try out.writer.writeAll(attribute);
+
+        const message = try Message.parse(out.final());
+        var it = message.iterateAttributes(&.{});
+        try testing.expectError(error.InvalidAttribute, it.next());
+    }
 }
 
 test "Writer: allocate request with long-term credentials" {
