@@ -638,7 +638,7 @@ test "handleRequest: role conflict" {
         var it = resp_msg.iterateAttributes(core.credentials.password);
         const attr = (try it.next()).?;
         try testing.expectEqual(.error_code, @as(stun.AttributeType, attr));
-        try testing.expectEqual(487, attr.error_code.code);
+        try testing.expectEqual(.role_conflict, attr.error_code.code);
         try testing.expectEqualStrings("Role conflict", attr.error_code.reason);
     }
 
