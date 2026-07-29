@@ -115,7 +115,7 @@ pub fn buildRoleConflictErrorMessage(transaction_id: u96, pwd: []const u8, buffe
         .transaction_id = transaction_id,
         .message_length = 0,
     });
-    try w.writeAttribute(.{ .error_code = .{ .code = 487, .reason = "Role conflict" } });
+    try w.writeAttribute(.{ .error_code = .{ .code = .role_conflict, .reason = "Role conflict" } });
     try w.writeAttribute(.{ .message_integrity = &.{} });
     try w.writeAttribute(.fingerprint);
     return w.final();
