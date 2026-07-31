@@ -7,6 +7,7 @@ const stun = @import("stun");
 const ice = @import("ice.zig");
 const IfIterator = @import("if_iterator.zig");
 const Messages = @import("messages.zig");
+const ParsedServerUrl = @import("parsed_server_url.zig");
 
 const Core = @import("core.zig");
 
@@ -322,19 +323,19 @@ fn doGatherServerReflexiveCandidates(agent: *Agent) !void {
 
     for (agent.ice_servers) |ice_server| {
         var q = Io.Queue(HostName.LookupResult).init(&q_buffer);
-        const host, const port = parseIceServerUrl(ice_server.url) catch {
-            Logger.warn("Invalid ice server url: {s}", .{ice_server.url});
+        const parsed = ParsedServerUrl.parse(ice_server.url) catch |err| {
+            Logger.warn("Invalid ice server url: {s}, err: {}", .{ ice_server.url, err });
             continue;
         };
 
-        if (std.Io.net.IpAddress.resolve(io, host, port)) |addr| {
+        if (std.Io.net.IpAddress.resolve(io, parsed.host, parsed.port)) |addr| {
             try q.putOne(io, .{ .address = addr });
         } else |_| {
-            var hostname = HostName.init(host) catch continue;
-            hostname.lookup(io, &q, .{ .port = port }) catch |err| switch (err) {
+            var hostname = HostName.init(parsed.host) catch continue;
+            hostname.lookup(io, &q, .{ .port = parsed.port }) catch |err| switch (err) {
                 error.Canceled => return error.Canceled,
                 else => {
-                    Logger.warn("Failed to resolve ice server hostname: {s}", .{host});
+                    Logger.warn("Failed to resolve ice server hostname: {s}", .{parsed.host});
                     continue;
                 },
             };
@@ -352,20 +353,6 @@ fn doGatherServerReflexiveCandidates(agent: *Agent) !void {
     try grp.await(io);
     try agent.putInQueue(.{ .candidate = null });
     try agent.putInQueue(.{ .gathering_state = .complete });
-}
-
-fn parseIceServerUrl(url: []const u8) !struct { []const u8, u16 } {
-    var it = std.mem.splitScalar(u8, url, ':');
-    const scheme = it.next() orelse return error.InvalidUrl;
-    if (!std.ascii.eqlIgnoreCase("stun", scheme)) return error.InvalidUrl;
-
-    const host = it.next() orelse return error.InvalidUrl;
-    const port: u16 = blk: {
-        const port_str = it.next() orelse break :blk 3478;
-        break :blk std.fmt.parseInt(u16, port_str, 10) catch return error.InvalidUrl;
-    };
-
-    return .{ host, port };
 }
 
 fn sendBindingRequest(agent: *Agent, dest: IpAddress) !void {
