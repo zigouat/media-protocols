@@ -3,6 +3,10 @@ const stun = @import("stun");
 
 const Client = @This();
 const Io = std.Io;
+const testing = std.testing;
+
+const refresh_margin_seconds: u32 = 60;
+const refresh_permissions_interval_seconds: u32 = 120;
 
 pub const ClientConfig = struct {
     server: Io.net.IpAddress,
@@ -10,10 +14,67 @@ pub const ClientConfig = struct {
     password: []const u8,
 };
 
-pub const Allocation = struct {
+pub const AllocationResult = struct {
     relayed_address: Io.net.IpAddress,
     mapped_address: Io.net.IpAddress,
     lifetime: u32,
+};
+
+const Allocation = struct {
+    relayed_address: Io.net.IpAddress,
+    mapped_address: Io.net.IpAddress,
+    lifetime: u32,
+    permissions: std.ArrayList(Io.net.IpAddress) = .empty,
+
+    fn trackPermission(allocation: *Allocation, allocator: std.mem.Allocator, peer: Io.net.IpAddress) !void {
+        for (allocation.permissions.items) |existing| {
+            if (sameIp(existing, peer)) return;
+        }
+        try allocation.permissions.append(allocator, peer);
+    }
+
+    fn sameIp(a: Io.net.IpAddress, b: Io.net.IpAddress) bool {
+        return switch (a) {
+            .ip4 => |a4| switch (b) {
+                .ip4 => |b4| std.mem.eql(u8, &a4.bytes, &b4.bytes),
+                .ip6 => false,
+            },
+            .ip6 => |a6| switch (b) {
+                .ip6 => |b6| std.mem.eql(u8, &a6.bytes, &b6.bytes),
+                .ip4 => false,
+            },
+        };
+    }
+
+    test "Allocation.trackPermission: dedups same ip, different port" {
+        var allocation = Allocation{ .relayed_address = undefined, .mapped_address = undefined, .lifetime = 600 };
+        defer allocation.permissions.deinit(testing.allocator);
+
+        const peer_a: Io.net.IpAddress = .{ .ip4 = .{ .bytes = .{ 192, 0, 2, 1 }, .port = 1000 } };
+        const peer_a_other_port: Io.net.IpAddress = .{ .ip4 = .{ .bytes = .{ 192, 0, 2, 1 }, .port = 2000 } };
+        const peer_b: Io.net.IpAddress = .{ .ip4 = .{ .bytes = .{ 192, 0, 2, 2 }, .port = 1000 } };
+
+        try allocation.trackPermission(testing.allocator, peer_a);
+        try allocation.trackPermission(testing.allocator, peer_a_other_port);
+        try allocation.trackPermission(testing.allocator, peer_b);
+
+        try testing.expectEqual(2, allocation.permissions.items.len);
+    }
+
+    test "Allocation.sameIp: ip4 and ip6 never match" {
+        const ip4: Io.net.IpAddress = .{ .ip4 = .{ .bytes = .{ 1, 2, 3, 4 }, .port = 1 } };
+        const ip6: Io.net.IpAddress = .{ .ip6 = .unspecified(1) };
+        try testing.expect(!Allocation.sameIp(ip4, ip6));
+    }
+
+    test "Allocation.sameIp: compares address bytes, ignores port" {
+        const a: Io.net.IpAddress = .{ .ip4 = .{ .bytes = .{ 10, 0, 0, 1 }, .port = 100 } };
+        const b: Io.net.IpAddress = .{ .ip4 = .{ .bytes = .{ 10, 0, 0, 1 }, .port = 200 } };
+        const c: Io.net.IpAddress = .{ .ip4 = .{ .bytes = .{ 10, 0, 0, 2 }, .port = 100 } };
+
+        try testing.expect(Allocation.sameIp(a, b));
+        try testing.expect(!Allocation.sameIp(a, c));
+    }
 };
 
 const Transaction = struct {
@@ -43,6 +104,8 @@ nonce: []const u8,
 realm: []const u8,
 key: []const u8,
 
+allocation: ?Allocation = null,
+
 transactions: std.AutoHashMap(u96, *Transaction),
 tr_mutex: Io.Mutex = .init,
 
@@ -70,14 +133,15 @@ pub fn deinit(client: *Client, io: Io) void {
     client.allocator.free(client.realm);
     client.allocator.free(client.nonce);
     client.allocator.free(client.key);
+    if (client.allocation) |*allocation| allocation.permissions.deinit(client.allocator);
 }
 
 pub fn handleData(client: *Client, io: Io) !void {
     try client.group.concurrent(io, handleReceivedData, .{ client, io });
 }
 
-/// Creates an allocation on the TURN server.
-pub fn createAllocation(client: *Client, io: Io, buffer: []u8) !Allocation {
+/// Creates an allocation on the TURN server
+pub fn createAllocation(client: *Client, io: Io, buffer: []u8) !AllocationResult {
     const first = try client.sendAllocateRequest(io, buffer, false);
     var msg = try stun.Message.parse(first);
 
@@ -88,7 +152,16 @@ pub fn createAllocation(client: *Client, io: Io, buffer: []u8) !Allocation {
         msg = try stun.Message.parse(second);
     }
 
-    return client.parseAllocation(&msg);
+    const result = try client.parseAllocation(&msg);
+    client.allocation = .{
+        .relayed_address = result.relayed_address,
+        .mapped_address = result.mapped_address,
+        .lifetime = result.lifetime,
+    };
+    try client.group.concurrent(io, maintainAllocation, .{ client, io });
+    try client.group.concurrent(io, maintainPermissions, .{ client, io });
+
+    return result;
 }
 
 /// Refreshes the client's allocation, extending its lifetime. Pass `lifetime = 0` to
@@ -112,6 +185,10 @@ pub fn refreshAllocation(client: *Client, io: Io, buffer: []u8, lifetime: u32) !
 /// `peers` is any type exposing `next(peers: *T) ?Io.net.IpAddress`, e.g. a slice-backed
 /// iterator. See `createPermissionsSlice` for a plain `[]const Io.net.IpAddress` overload.
 pub fn createPermissions(client: *Client, io: Io, buffer: []u8, peers: anytype) !void {
+    const allocation = if (client.allocation) |*a| a else return error.NoAllocation;
+    const previous_len = allocation.permissions.items.len;
+    errdefer allocation.permissions.shrinkRetainingCapacity(previous_len);
+
     const tx_id = newTransactionId(io);
 
     var w = stun.Writer.init(buffer, .{ .password = client.key });
@@ -120,6 +197,7 @@ pub fn createPermissions(client: *Client, io: Io, buffer: []u8, peers: anytype) 
     var peer_count: usize = 0;
     while (peers.next()) |peer| : (peer_count += 1) {
         try w.writeAttribute(.{ .xor_peer_address = peer });
+        try allocation.trackPermission(client.allocator, peer);
     }
     if (peer_count == 0) return error.NoPeerAddresses;
 
@@ -255,6 +333,46 @@ fn sendRefreshRequest(client: *Client, io: Io, buffer: []u8, lifetime: u32) ![]c
     return client.performTransaction(io, &tr);
 }
 
+fn maintainAllocation(client: *Client, io: Io) !void {
+    var buffer: [1500]u8 = undefined;
+
+    while (true) {
+        const lifetime = (client.allocation orelse return).lifetime;
+        if (lifetime == 0) return;
+
+        const sleep_seconds = if (lifetime > refresh_margin_seconds) lifetime - refresh_margin_seconds else lifetime;
+        try io.sleep(.fromSeconds(sleep_seconds), .awake);
+
+        const new_lifetime = client.refreshAllocation(io, &buffer, lifetime) catch |err| switch (err) {
+            error.Canceled => return error.Canceled,
+            else => {
+                std.log.warn("Failed to refresh TURN allocation: {}", .{err});
+                return;
+            },
+        };
+
+        if (client.allocation) |*allocation| allocation.lifetime = new_lifetime;
+        if (new_lifetime == 0) return;
+    }
+}
+
+fn maintainPermissions(client: *Client, io: Io) !void {
+    var buffer: [1500]u8 = undefined;
+
+    while (true) {
+        try io.sleep(.fromSeconds(refresh_permissions_interval_seconds), .awake);
+
+        const allocation = client.allocation orelse return;
+        if (allocation.permissions.items.len == 0) continue;
+
+        // Every peer here is already tracked, so this can't grow the list mid-iteration.
+        client.createPermissionsSlice(io, &buffer, allocation.permissions.items) catch |err| switch (err) {
+            error.Canceled => return error.Canceled,
+            else => std.log.warn("Failed to refresh TURN permissions: {}", .{err}),
+        };
+    }
+}
+
 /// Extracts REALM/NONCE from a 401/438 error response and derives the long-term credentials key.
 fn applyChallenge(client: *Client, msg: *const stun.Message) !void {
     var realm: ?[]const u8 = null;
@@ -285,7 +403,7 @@ fn applyChallenge(client: *Client, msg: *const stun.Message) !void {
     client.key = try client.allocator.dupe(u8, &digest);
 }
 
-fn parseAllocation(client: *Client, msg: *const stun.Message) !Allocation {
+fn parseAllocation(client: *Client, msg: *const stun.Message) !AllocationResult {
     var relayed_address: ?Io.net.IpAddress = null;
     var mapped_address: ?Io.net.IpAddress = null;
     var lifetime: ?u32 = null;
@@ -417,4 +535,8 @@ fn retry(client: *Client, io: Io, tr: *Transaction) !void {
 
     tr.err = error.Timeout;
     tr.done.set(io);
+}
+
+test {
+    testing.refAllDecls(@This());
 }
