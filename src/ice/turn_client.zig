@@ -7,11 +7,19 @@ const testing = std.testing;
 
 const refresh_margin_seconds: u32 = 60;
 const refresh_permissions_interval_seconds: u32 = 120;
+const rto_base_ms: u32 = 200;
+const rto_max_ms: u32 = 1600;
 
 pub const ClientConfig = struct {
+    socket: Io.net.Socket,
     server: Io.net.IpAddress,
     username: []const u8,
     password: []const u8,
+};
+
+pub const ReceivedData = struct {
+    from: Io.net.IpAddress,
+    data: []const u8,
 };
 
 pub const AllocationResult = struct {
@@ -109,12 +117,10 @@ allocation: ?Allocation = null,
 transactions: std.AutoHashMap(u96, *Transaction),
 tr_mutex: Io.Mutex = .init,
 
-pub fn init(allocator: std.mem.Allocator, io: Io, config: ClientConfig) !Client {
-    const socket = try (std.Io.net.IpAddress{ .ip4 = .unspecified(0) }).bind(io, .{ .mode = .dgram });
-
+pub fn init(allocator: std.mem.Allocator, config: ClientConfig) !Client {
     return Client{
         .allocator = allocator,
-        .socket = socket,
+        .socket = config.socket,
         .group = .init,
         .server = config.server,
         .username = config.username,
@@ -134,10 +140,6 @@ pub fn deinit(client: *Client, io: Io) void {
     client.allocator.free(client.nonce);
     client.allocator.free(client.key);
     if (client.allocation) |*allocation| allocation.permissions.deinit(client.allocator);
-}
-
-pub fn handleData(client: *Client, io: Io) !void {
-    try client.group.concurrent(io, handleReceivedData, .{ client, io });
 }
 
 /// Creates an allocation on the TURN server
@@ -178,6 +180,15 @@ pub fn refreshAllocation(client: *Client, io: Io, buffer: []u8, lifetime: u32) !
     }
 
     return client.parseRefresh(&msg);
+}
+
+/// Whether a permission is already installed for `peer`'s IP (port is ignored).
+pub fn hasPermission(client: *Client, peer: Io.net.IpAddress) bool {
+    const allocation = client.allocation orelse return false;
+    for (allocation.permissions.items) |existing| {
+        if (Allocation.sameIp(existing, peer)) return true;
+    }
+    return false;
 }
 
 /// Creates permissions for one or more peer addresses on the client's allocation.
@@ -461,48 +472,53 @@ fn errorFromCode(code: stun.StunErrorCode) anyerror {
     };
 }
 
-fn handleReceivedData(client: *Client, io: Io) !void {
-    std.log.debug("Listening for messages", .{});
-    var buffer: [1500]u8 = undefined;
-
+pub fn receive(client: *Client, io: Io, buffer: []u8) !ReceivedData {
     while (true) {
-        const message = client.socket.receive(io, &buffer) catch |err| switch (err) {
-            error.Canceled => return error.Canceled,
-            else => {
-                std.log.debug("Error receiving message: {}", .{err});
-                continue;
+        const message = try client.socket.receive(io, buffer);
+        if (!stun.isMessage(message.data)) continue;
+
+        const s = stun.Message.parse(message.data) catch continue;
+        switch (s.header.message_type.class()) {
+            .request => continue,
+            .indication => {
+                if (s.header.message_type.method() != .data) continue;
+                if (client.parseDataIndication(&s)) |received| return received;
             },
-        };
+            else => {
+                try client.tr_mutex.lock(io);
+                defer client.tr_mutex.unlock(io);
+                const entry = client.transactions.fetchRemove(s.header.transaction_id) orelse continue;
 
-        if (stun.isMessage(message.data)) {
-            const s = stun.Message.parse(message.data) catch continue;
-            switch (s.header.message_type.class()) {
-                .request => continue,
-                .indication => {},
-                else => {
-                    if (s.header.message_type.class() == .request) continue;
-                    try client.tr_mutex.lock(io);
-                    defer client.tr_mutex.unlock(io);
-                    const entry = client.transactions.fetchRemove(s.header.transaction_id) orelse continue;
-
-                    try entry.value.mutex.lock(io);
-                    defer entry.value.mutex.unlock(io);
-                    if (message.data.len > entry.value.buffer.len) {
-                        entry.value.err = error.BufferTooShort;
-                        entry.value.done.set(io);
-                        continue;
-                    }
-
-                    // Already timed out
-                    if (entry.value.done.isSet()) continue;
-
-                    @memcpy(entry.value.buffer[0..message.data.len], message.data);
-                    entry.value.resp = entry.value.buffer[0..message.data.len];
+                try entry.value.mutex.lock(io);
+                defer entry.value.mutex.unlock(io);
+                if (message.data.len > entry.value.buffer.len) {
+                    entry.value.err = error.BufferTooShort;
                     entry.value.done.set(io);
-                },
-            }
+                    continue;
+                }
+
+                if (entry.value.done.isSet()) continue;
+
+                @memcpy(entry.value.buffer[0..message.data.len], message.data);
+                entry.value.resp = entry.value.buffer[0..message.data.len];
+                entry.value.done.set(io);
+            },
         }
     }
+}
+
+fn parseDataIndication(client: *Client, msg: *const stun.Message) ?ReceivedData {
+    var from: ?Io.net.IpAddress = null;
+    var data: ?[]const u8 = null;
+
+    var it = msg.iterateAttributes(client.key);
+    while ((it.next() catch return null)) |attr| switch (attr) {
+        .xor_peer_address => from = attr.xor_peer_address,
+        .data => data = attr.data,
+        else => {},
+    };
+
+    return .{ .from = from orelse return null, .data = data orelse return null };
 }
 
 fn performTransaction(client: *Client, io: Io, tr: *Transaction) ![]const u8 {
@@ -513,7 +529,7 @@ fn performTransaction(client: *Client, io: Io, tr: *Transaction) ![]const u8 {
 
 fn retry(client: *Client, io: Io, tr: *Transaction) !void {
     var max_retries: u8 = 5;
-    var rto: u32 = 500;
+    var rto: u32 = rto_base_ms;
     while (max_retries > 0) : (max_retries -= 1) {
         try io.sleep(.fromMilliseconds(rto), .awake);
         try tr.mutex.lock(io);
@@ -526,7 +542,7 @@ fn retry(client: *Client, io: Io, tr: *Transaction) !void {
             else => return,
         };
 
-        rto = rto * 2 + 500;
+        rto = @min(rto * 2, rto_max_ms);
     }
 
     try tr.mutex.lock(io);

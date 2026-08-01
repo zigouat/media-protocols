@@ -133,6 +133,17 @@ pub const Candidate = struct {
         return candidate;
     }
 
+    pub fn initRelay(base: Io.net.IpAddress, address: Io.net.IpAddress) Candidate {
+        var candidate: Candidate = .{
+            .candidate_type = .relay,
+            .base = base,
+            .address = address,
+            .priority = CandidateType.relay.priority(),
+        };
+        candidate.calculateFoundation();
+        return candidate;
+    }
+
     pub fn parse(value: []const u8) !Candidate {
         var it = std.mem.tokenizeScalar(u8, value, ' ');
 

@@ -8,6 +8,7 @@ const ice = @import("ice.zig");
 const IfIterator = @import("if_iterator.zig");
 const Messages = @import("messages.zig");
 const ParsedServerUrl = @import("parsed_server_url.zig");
+const TurnClient = @import("turn_client.zig");
 
 const Core = @import("core.zig");
 
@@ -27,8 +28,31 @@ const keep_alive_interval: std.Io.Duration = .fromSeconds(4);
 const disconnect_timeout: Io.Clock.Duration = .{ .clock = .awake, .raw = .fromSeconds(5) };
 const failing_timeout: Io.Clock.Duration = .{ .clock = .awake, .raw = .fromSeconds(25) };
 
+const Channel = union(enum) {
+    socket: Socket,
+    relay: *TurnClient,
+
+    fn address(channel: Channel) IpAddress {
+        return switch (channel) {
+            .socket => |s| s.address,
+            .relay => |c| c.socket.address,
+        };
+    }
+
+    fn send(channel: Channel, agent: *Agent, dest: *const IpAddress, data: []const u8) !void {
+        switch (channel) {
+            .socket => |s| try s.send(agent.io, dest, data),
+            .relay => |c| {
+                const buffer = try agent.createPacket();
+                defer agent.destroyPacket(buffer);
+                try c.sendIndication(agent.io, buffer, dest.*, data);
+            },
+        }
+    }
+};
+
 const Message = struct {
-    socket: *const Socket,
+    channel: Channel,
     incoming_message: Io.net.IncomingMessage,
 };
 
@@ -52,12 +76,13 @@ core: Core,
 ice_servers: []const ice.IceServer = &.{},
 buffer_pool: std.heap.MemoryPool([max_message_size]u8),
 sockets: std.ArrayList(Socket) = .empty,
+relay_clients: std.ArrayList(*TurnClient) = .empty,
 
 mutex: Io.Mutex = .init,
 group: Io.Group = .init,
 queue_buffer: []InnerEvent,
 queue: Io.Queue(InnerEvent),
-nominated_socket: ?Socket = null,
+nominated_channel: ?Channel = null,
 
 /// Struct describing the configuration of the agent
 pub const AgentConfig = struct {
@@ -241,12 +266,12 @@ pub fn gatherCandidates(agent: *Agent) !void {
     }
 }
 
-pub fn sendData(agent: *const Agent, data: []const u8) Socket.SendError!void {
+pub fn sendData(agent: *Agent, data: []const u8) !void {
     switch (agent.core.connection_state) {
         .connected, .completed => {
             @branchHint(.likely);
             const dest = &agent.core.nominated_pair.?.remote;
-            try agent.nominated_socket.?.send(agent.io, &dest.address, data);
+            try agent.nominated_channel.?.send(agent, &dest.address, data);
         },
         else => Logger.warn("Agent not connected: ignore send request", .{}),
     }
@@ -284,6 +309,13 @@ fn closeConnection(agent: *Agent) void {
     _ = agent.buffer_pool.reset(allocator, .free_all);
 
     agent.sockets.clearAndFree(allocator);
+
+    for (agent.relay_clients.items) |client| {
+        client.deinit(agent.io);
+        allocator.destroy(client);
+    }
+    agent.relay_clients.clearAndFree(allocator);
+
     agent.setConnectionState(.closed);
 }
 
@@ -345,6 +377,9 @@ fn doGatherServerReflexiveCandidates(agent: *Agent) !void {
             .address => |addr| {
                 if (std.meta.activeTag(addr) == .ip6) continue;
                 try grp.concurrent(io, sendBindingRequest, .{ agent, addr });
+                if (parsed.scheme == .turn) {
+                    try grp.concurrent(io, trunAllocate, .{ agent, addr, ice_server.username, ice_server.credential });
+                }
             },
             else => {},
         } else |_| {}
@@ -410,6 +445,85 @@ fn sendBindingRequest(agent: *Agent, dest: IpAddress) !void {
     }
 }
 
+fn trunAllocate(agent: *Agent, dest: IpAddress, username: []const u8, pass: []const u8) !void {
+    agent.doTrunAllocate(dest, username, pass) catch |err| switch (err) {
+        error.Canceled => return error.Canceled,
+        else => {
+            Logger.warn("Failed to allocate turn relay: {}", .{err});
+            return;
+        },
+    };
+}
+
+fn doTrunAllocate(agent: *Agent, dest: IpAddress, username: []const u8, pass: []const u8) !void {
+    const io = agent.io;
+    const allocator = agent.core.allocator;
+
+    const client: *TurnClient = blk: {
+        const socket = try (IpAddress{ .ip4 = .unspecified(0) }).bind(io, .{ .mode = .dgram });
+        errdefer socket.close(io);
+
+        const client = try allocator.create(TurnClient);
+        errdefer allocator.destroy(client);
+
+        client.* = try TurnClient.init(allocator, .{
+            .socket = socket,
+            .server = dest,
+            .username = username,
+            .password = pass,
+        });
+        break :blk client;
+    };
+    errdefer client.deinit(io);
+
+    try client.group.concurrent(io, relayReceive, .{ agent, client, io });
+
+    const buffer = try agent.createPacket();
+    defer agent.destroyPacket(buffer);
+
+    std.log.debug("Create allocation: {f}", .{dest});
+    const allocation_result = try client.createAllocation(io, buffer);
+    const candidate = ice.Candidate.initRelay(client.socket.address, allocation_result.relayed_address);
+
+    {
+        agent.mutex.lockUncancelable(io);
+        defer agent.mutex.unlock(io);
+        _ = try agent.core.addLocalCandidate(candidate);
+    }
+    try agent.putInQueue(.{ .candidate = candidate });
+
+    agent.mutex.lockUncancelable(io);
+    defer agent.mutex.unlock(io);
+    try agent.relay_clients.append(allocator, client);
+}
+
+fn relayReceive(agent: *Agent, client: *TurnClient, io: Io) !void {
+    agent.doRelayReceive(client, io) catch |err| switch (err) {
+        error.Canceled => return error.Canceled,
+        else => |e| logError("Error when receiving from turn client: {}", .{e}),
+    };
+}
+
+fn doRelayReceive(agent: *Agent, client: *TurnClient, io: Io) !void {
+    while (true) {
+        const buffer = try agent.createPacket();
+        errdefer agent.destroyPacket(buffer);
+
+        const received = try client.receive(io, buffer);
+
+        @memmove(buffer[0..received.data.len], received.data);
+        try agent.putInQueue(.{ .message = .{
+            .channel = .{ .relay = client },
+            .incoming_message = .{
+                .from = received.from,
+                .data = buffer[0..received.data.len],
+                .control = &.{},
+                .flags = @bitCast(@as(u8, 0)),
+            },
+        } });
+    }
+}
+
 fn randomNumber(T: type, io: Io) T {
     var bytes: [@typeInfo(T).int.bits / 8]u8 = undefined;
     io.random(&bytes);
@@ -419,6 +533,16 @@ fn randomNumber(T: type, io: Io) T {
 fn findSocket(agent: *Agent, addr: *const IpAddress) ?*Io.net.Socket {
     for (agent.sockets.items) |*socket| if (socket.address.eql(addr)) return socket;
     return null;
+}
+
+fn findRelayClient(agent: *Agent, addr: *const IpAddress) ?*TurnClient {
+    for (agent.relay_clients.items) |client| if (client.socket.address.eql(addr)) return client;
+    return null;
+}
+
+fn ensurePermission(agent: *Agent, client: *TurnClient, peer: IpAddress, buffer: []u8) !void {
+    if (client.hasPermission(peer)) return;
+    try client.createPermissionsSlice(agent.io, buffer, &.{peer});
 }
 
 fn setConnectionState(agent: *Agent, new_state: ice.ConnectionState) void {
@@ -452,7 +576,11 @@ fn doReceive(agent: *Agent, socket: *const Socket) !void {
     while (true) {
         switch (agent.core.connection_state) {
             .completed => {
-                if (agent.nominated_socket.?.address.eql(&socket.address))
+                const is_nominated = switch (agent.nominated_channel.?) {
+                    .socket => |s| s.address.eql(&socket.address),
+                    .relay => false,
+                };
+                if (is_nominated)
                     try agent.group.concurrent(io, receiveAppData, .{ agent, socket.* })
                 else
                     socket.close(io);
@@ -465,7 +593,7 @@ fn doReceive(agent: *Agent, socket: *const Socket) !void {
             else => {},
         }
 
-        var result: Message = .{ .socket = socket, .incoming_message = undefined };
+        var result: Message = .{ .channel = .{ .socket = socket.* }, .incoming_message = undefined };
 
         const buffer = try agent.createPacket();
         result.incoming_message = socket.receiveTimeout(agent.io, buffer, timeout) catch |err| {
@@ -529,7 +657,7 @@ fn sendConsentFreshness(agent: *Agent) !void {
 
     const req = try agent.core.buildBindingRequest(randomNumber(u96, agent.io), false, buffer);
     const remote_candidate = &agent.core.nominated_pair.?.remote;
-    try agent.nominated_socket.?.send(agent.io, &remote_candidate.address, req);
+    try agent.nominated_channel.?.send(agent, &remote_candidate.address, req);
 }
 
 fn putInQueue(agent: *Agent, event: InnerEvent) !void {
@@ -543,9 +671,24 @@ fn batchSendConnectivityCheck(agent: *Agent) !void {
     var checks = agent.core.beginConnectivityChecks() orelse return;
 
     var buffer: [max_message_size]u8 = undefined;
+    var indication_buffer: [max_message_size]u8 = undefined;
     while (try checks.next(&buffer, randomNumber(u96, agent.io))) |send| {
+        if (agent.findRelayClient(&send.from_base)) |client| {
+            agent.ensurePermission(client, send.to, &indication_buffer) catch |err| {
+                Logger.warn("Failed to create turn permission for {f}: {}", .{ send.to, err });
+                continue;
+            };
+
+            if (send.use_candidate) agent.nominated_channel = .{ .relay = client };
+
+            client.sendIndication(agent.io, &indication_buffer, send.to, send.payload) catch |err| {
+                Logger.warn("Failed to send binding request via relay to {f}: {}", .{ send.to, err });
+            };
+            continue;
+        }
+
         const socket = agent.findSocket(&send.from_base) orelse continue;
-        if (send.use_candidate) agent.nominated_socket = socket.*;
+        if (send.use_candidate) agent.nominated_channel = .{ .socket = socket.* };
 
         Logger.debug("Send binding request to {f} (use_candidate={})", .{ send.to, send.use_candidate });
         socket.send(agent.io, &send.to, send.payload) catch |err| {
@@ -576,18 +719,18 @@ fn handleConnectivityCheckMessage(agent: *Agent, message: Message) !?Event {
                     agent.mutex.lockUncancelable(agent.io);
                     defer agent.mutex.unlock(agent.io);
 
-                    const r = try agent.core.handleRequest(&msg, message.socket.address, sender, buffer);
-                    if (agent.core.detectNominatedPair() != null) agent.nominated_socket = message.socket.*;
+                    const r = try agent.core.handleRequest(&msg, message.channel.address(), sender, buffer);
+                    if (agent.core.detectNominatedPair() != null) agent.nominated_channel = message.channel;
 
                     break :res r;
                 };
 
-                try message.socket.send(agent.io, &sender, resp);
+                try message.channel.send(agent, &sender, resp);
             },
             .success_response => {
                 agent.mutex.lockUncancelable(agent.io);
                 defer agent.mutex.unlock(agent.io);
-                try agent.core.handleSuccessResponse(&msg, message.socket.address, sender);
+                try agent.core.handleSuccessResponse(&msg, message.channel.address(), sender);
             },
             else => {},
         }
@@ -623,7 +766,7 @@ fn handleConsentFreshness(agent: *Agent, incoming_message: Io.net.IncomingMessag
     defer agent.destroyPacket(buffer);
 
     if (try agent.core.handleConsentFreshness(incoming_message, buffer)) |resp| {
-        try agent.nominated_socket.?.send(agent.io, &incoming_message.from, resp);
+        try agent.nominated_channel.?.send(agent, &incoming_message.from, resp);
     }
 }
 
