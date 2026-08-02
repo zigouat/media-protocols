@@ -1,3 +1,15 @@
+//! A TURN client implementation. This module provides a `Client` struct that can be used to create and manage TURN allocations,
+//! permissions, and data relaying.
+//!
+//! It handles the necessary STUN/TURN protocol interactions, including long term authentication, allocation refresh,
+//! and permission management.
+//!
+//! When an allocation is successfully created, the client will automatically spawn background tasks to maintain the allocation
+//! and refresh permissions at regular intervals.
+//!
+//! Receiving data from peers is done via the `receive` function, which will block until a data indication is received from the TURN server.
+//! It's the caller's responsibility to call `receive` in a loop to drive the client's state machine and handle incoming data.
+
 const std = @import("std");
 const stun = @import("stun");
 
@@ -15,6 +27,33 @@ pub const ClientConfig = struct {
     server: Io.net.IpAddress,
     username: []const u8,
     password: []const u8,
+};
+
+pub const Error = error{
+    BadRequest,
+    Unauthorized,
+    Forbidden,
+    UnknownAttribute,
+    AllocationMismatch,
+    StaleNonce,
+    AddressFamilyNotSupported,
+    WrongCredentials,
+    UnsupportedTransportProtocol,
+    AllocationQuotaReached,
+    RoleConflict,
+    ServerError,
+    InsufficientCapacity,
+    UnknownStunError,
+    NoAllocation,
+    BufferTooShort,
+    CreatePermissionFailed,
+    MissingErrorCode,
+    MissingRealm,
+    MissingNonce,
+    MissingRelayedAddress,
+    MissingMappedAddress,
+    MissingLifetime,
+    Timeout,
 };
 
 pub const ReceivedData = struct {
@@ -90,7 +129,7 @@ const Transaction = struct {
     buffer: []u8,
     req: []const u8,
     resp: []const u8 = &.{},
-    err: ?anyerror = null,
+    err: ?Error = null,
     done: Io.Event = .unset,
     mutex: Io.Mutex = .init,
 
@@ -117,7 +156,7 @@ allocation: ?Allocation = null,
 transactions: std.AutoHashMap(u96, *Transaction),
 tr_mutex: Io.Mutex = .init,
 
-pub fn init(allocator: std.mem.Allocator, config: ClientConfig) !Client {
+pub fn init(allocator: std.mem.Allocator, config: ClientConfig) Client {
     return Client{
         .allocator = allocator,
         .socket = config.socket,
@@ -133,6 +172,8 @@ pub fn init(allocator: std.mem.Allocator, config: ClientConfig) !Client {
 }
 
 pub fn deinit(client: *Client, io: Io) void {
+    if (client.allocation != null) client.deleteAllocation(io);
+
     client.group.cancel(io);
     client.socket.close(io);
     client.transactions.deinit();
@@ -191,54 +232,6 @@ pub fn hasPermission(client: *Client, peer: Io.net.IpAddress) bool {
     return false;
 }
 
-/// Creates permissions for one or more peer addresses on the client's allocation.
-///
-/// `peers` is any type exposing `next(peers: *T) ?Io.net.IpAddress`, e.g. a slice-backed
-/// iterator. See `createPermissionsSlice` for a plain `[]const Io.net.IpAddress` overload.
-pub fn createPermissions(client: *Client, io: Io, buffer: []u8, peers: anytype) !void {
-    const allocation = if (client.allocation) |*a| a else return error.NoAllocation;
-    const previous_len = allocation.permissions.items.len;
-    errdefer allocation.permissions.shrinkRetainingCapacity(previous_len);
-
-    const tx_id = newTransactionId(io);
-
-    var w = stun.Writer.init(buffer, .{ .password = client.key });
-    try writeHeader(&w, .request, .create_permission, tx_id);
-
-    var peer_count: usize = 0;
-    while (peers.next()) |peer| : (peer_count += 1) {
-        try w.writeAttribute(.{ .xor_peer_address = peer });
-        try allocation.trackPermission(client.allocator, peer);
-    }
-    if (peer_count == 0) return error.NoPeerAddresses;
-
-    try w.writeAttributes(&.{
-        .{ .username = client.username },
-        .{ .realm = client.realm },
-        .{ .nonce = client.nonce },
-        .{ .message_integrity = &.{} },
-        .fingerprint,
-    });
-
-    var tr = Transaction{ .id = tx_id, .req = w.final(), .buffer = buffer };
-    {
-        try client.tr_mutex.lock(io);
-        defer client.tr_mutex.unlock(io);
-        try client.transactions.put(tx_id, &tr);
-    }
-
-    const result = try client.performTransaction(io, &tr);
-    const response = try stun.Message.parse(result);
-
-    if (response.header.message_type.class() != .error_response) return;
-
-    var it = response.iterateAttributes(client.key);
-    while (try it.next()) |attr| {
-        if (attr == .error_code) return errorFromCode(attr.error_code.code);
-    }
-    return error.CreatePermissionFailed;
-}
-
 const IpAddressSliceIterator = struct {
     items: []const Io.net.IpAddress,
     index: usize = 0,
@@ -249,6 +242,22 @@ const IpAddressSliceIterator = struct {
         return it.items[it.index];
     }
 };
+
+/// Creates permissions for one or more peer addresses on the client's allocation.
+///
+/// `peers` is any type exposing `next(peers: *T) ?Io.net.IpAddress`, e.g. a slice-backed
+/// iterator. See `createPermissionsSlice` for a plain `[]const Io.net.IpAddress` overload.
+pub fn createPermissions(client: *Client, io: Io, buffer: []u8, peers: anytype) !void {
+    const allocation = if (client.allocation) |*a| a else return error.NoAllocation;
+    const previous_len = allocation.permissions.items.len;
+    errdefer allocation.permissions.shrinkRetainingCapacity(previous_len);
+
+    while (peers.next()) |peer| try allocation.trackPermission(client.allocator, peer);
+    const new_peers = allocation.permissions.items[previous_len..];
+    if (new_peers.len == 0) return;
+
+    try client.performCreatePermission(io, buffer, new_peers);
+}
 
 /// Same as `createPermissions`, but takes a plain slice of peer addresses.
 pub fn createPermissionsSlice(client: *Client, io: Io, buffer: []u8, peers: []const Io.net.IpAddress) !void {
@@ -269,6 +278,42 @@ pub fn sendIndication(client: *Client, io: Io, buffer: []u8, peer: Io.net.IpAddr
     });
 
     try client.socket.send(io, &client.server, w.final());
+}
+
+/// Blocks until a user's data is received from the TURN server.
+pub fn receive(client: *Client, io: Io, buffer: []u8) !ReceivedData {
+    while (true) {
+        const message = try client.socket.receive(io, buffer);
+        if (!stun.isMessage(message.data)) continue;
+
+        const s = stun.Message.parse(message.data) catch continue;
+        switch (s.header.message_type.class()) {
+            .request => continue,
+            .indication => {
+                if (s.header.message_type.method() != .data) continue;
+                if (client.parseDataIndication(&s)) |received| return received;
+            },
+            else => {
+                try client.tr_mutex.lock(io);
+                defer client.tr_mutex.unlock(io);
+                const entry = client.transactions.fetchRemove(s.header.transaction_id) orelse continue;
+
+                try entry.value.mutex.lock(io);
+                defer entry.value.mutex.unlock(io);
+                if (message.data.len > entry.value.buffer.len) {
+                    entry.value.err = error.BufferTooShort;
+                    entry.value.done.set(io);
+                    continue;
+                }
+
+                if (entry.value.done.isSet()) continue;
+
+                @memcpy(entry.value.buffer[0..message.data.len], message.data);
+                entry.value.resp = entry.value.buffer[0..message.data.len];
+                entry.value.done.set(io);
+            },
+        }
+    }
 }
 
 fn newTransactionId(io: Io) u96 {
@@ -344,6 +389,47 @@ fn sendRefreshRequest(client: *Client, io: Io, buffer: []u8, lifetime: u32) ![]c
     return client.performTransaction(io, &tr);
 }
 
+fn deleteAllocation(client: *Client, io: Io) void {
+    var buffer: [1500]u8 = undefined;
+    var w = stun.Writer.init(&buffer, .{ .password = client.key });
+
+    writeHeader(&w, .request, .refresh, newTransactionId(io)) catch return;
+    w.writeAttributes(&.{
+        .{ .lifetime = 0 },
+        .{ .username = client.username },
+        .{ .realm = client.realm },
+        .{ .nonce = client.nonce },
+        .{ .message_integrity = &.{} },
+        .fingerprint,
+    }) catch return;
+
+    client.socket.send(io, &client.server, w.final()) catch {};
+}
+
+fn sendCreatePermissionRequest(client: *Client, io: Io, buffer: []u8, peers: []const Io.net.IpAddress) ![]const u8 {
+    const tx_id = newTransactionId(io);
+
+    var w = stun.Writer.init(buffer, .{ .password = client.key });
+    try writeHeader(&w, .request, .create_permission, tx_id);
+    for (peers) |peer| try w.writeAttribute(.{ .xor_peer_address = peer });
+    try w.writeAttributes(&.{
+        .{ .username = client.username },
+        .{ .realm = client.realm },
+        .{ .nonce = client.nonce },
+        .{ .message_integrity = &.{} },
+        .fingerprint,
+    });
+
+    var tr = Transaction{ .id = tx_id, .req = w.final(), .buffer = buffer };
+    {
+        try client.tr_mutex.lock(io);
+        defer client.tr_mutex.unlock(io);
+        try client.transactions.put(tx_id, &tr);
+    }
+
+    return client.performTransaction(io, &tr);
+}
+
 fn maintainAllocation(client: *Client, io: Io) !void {
     var buffer: [1500]u8 = undefined;
 
@@ -376,12 +462,31 @@ fn maintainPermissions(client: *Client, io: Io) !void {
         const allocation = client.allocation orelse return;
         if (allocation.permissions.items.len == 0) continue;
 
-        // Every peer here is already tracked, so this can't grow the list mid-iteration.
-        client.createPermissionsSlice(io, &buffer, allocation.permissions.items) catch |err| switch (err) {
+        client.performCreatePermission(io, &buffer, allocation.permissions.items) catch |err| switch (err) {
             error.Canceled => return error.Canceled,
             else => std.log.warn("Failed to refresh TURN permissions: {}", .{err}),
         };
     }
+}
+
+fn performCreatePermission(client: *Client, io: Io, buffer: []u8, peers: []const Io.net.IpAddress) !void {
+    const first = try client.sendCreatePermissionRequest(io, buffer, peers);
+    var msg = try stun.Message.parse(first);
+
+    if (msg.header.message_type.class() == .error_response) {
+        try client.applyChallenge(&msg);
+
+        const second = try client.sendCreatePermissionRequest(io, buffer, peers);
+        msg = try stun.Message.parse(second);
+    }
+
+    if (msg.header.message_type.class() != .error_response) return;
+
+    var it = msg.iterateAttributes(client.key);
+    while (try it.next()) |attr| {
+        if (attr == .error_code) return errorFromCode(attr.error_code.code);
+    }
+    return error.CreatePermissionFailed;
 }
 
 /// Extracts REALM/NONCE from a 401/438 error response and derives the long-term credentials key.
@@ -403,12 +508,15 @@ fn applyChallenge(client: *Client, msg: *const stun.Message) !void {
         else => |c| return errorFromCode(c),
     }
 
+    if (realm == null) return error.MissingRealm;
+    if (nonce == null) return error.MissingNonce;
+
     client.allocator.free(client.realm);
     client.allocator.free(client.nonce);
     client.allocator.free(client.key);
 
-    client.realm = try client.allocator.dupe(u8, realm orelse return error.MissingRealm);
-    client.nonce = try client.allocator.dupe(u8, nonce orelse return error.MissingNonce);
+    client.realm = try client.allocator.dupe(u8, realm.?);
+    client.nonce = try client.allocator.dupe(u8, nonce.?);
 
     const digest = stun.longTermCredentialsKey(std.crypto.hash.Md5, client.username, client.realm, client.password);
     client.key = try client.allocator.dupe(u8, &digest);
@@ -453,7 +561,7 @@ fn parseRefresh(client: *Client, msg: *const stun.Message) !u32 {
     return lifetime orelse error.MissingLifetime;
 }
 
-fn errorFromCode(code: stun.StunErrorCode) anyerror {
+fn errorFromCode(code: stun.StunErrorCode) Error {
     return switch (code) {
         .bad_request => error.BadRequest,
         .unauthorized => error.Unauthorized,
@@ -470,41 +578,6 @@ fn errorFromCode(code: stun.StunErrorCode) anyerror {
         .insufficient_capacity => error.InsufficientCapacity,
         _ => error.UnknownStunError,
     };
-}
-
-pub fn receive(client: *Client, io: Io, buffer: []u8) !ReceivedData {
-    while (true) {
-        const message = try client.socket.receive(io, buffer);
-        if (!stun.isMessage(message.data)) continue;
-
-        const s = stun.Message.parse(message.data) catch continue;
-        switch (s.header.message_type.class()) {
-            .request => continue,
-            .indication => {
-                if (s.header.message_type.method() != .data) continue;
-                if (client.parseDataIndication(&s)) |received| return received;
-            },
-            else => {
-                try client.tr_mutex.lock(io);
-                defer client.tr_mutex.unlock(io);
-                const entry = client.transactions.fetchRemove(s.header.transaction_id) orelse continue;
-
-                try entry.value.mutex.lock(io);
-                defer entry.value.mutex.unlock(io);
-                if (message.data.len > entry.value.buffer.len) {
-                    entry.value.err = error.BufferTooShort;
-                    entry.value.done.set(io);
-                    continue;
-                }
-
-                if (entry.value.done.isSet()) continue;
-
-                @memcpy(entry.value.buffer[0..message.data.len], message.data);
-                entry.value.resp = entry.value.buffer[0..message.data.len];
-                entry.value.done.set(io);
-            },
-        }
-    }
 }
 
 fn parseDataIndication(client: *Client, msg: *const stun.Message) ?ReceivedData {
@@ -535,7 +608,7 @@ fn retry(client: *Client, io: Io, tr: *Transaction) !void {
         try tr.mutex.lock(io);
         defer tr.mutex.unlock(io);
 
-        if (!client.transactions.contains(tr.id)) break;
+        if (!client.transactions.contains(tr.id)) return;
 
         client.socket.send(io, &client.server, tr.req) catch |err| switch (err) {
             error.Canceled => return error.Canceled,
@@ -544,6 +617,10 @@ fn retry(client: *Client, io: Io, tr: *Transaction) !void {
 
         rto = @min(rto * 2, rto_max_ms);
     }
+
+    try client.tr_mutex.lock(io);
+    defer client.tr_mutex.unlock(io);
+    if (!client.transactions.contains(tr.id)) return;
 
     try tr.mutex.lock(io);
     defer tr.mutex.unlock(io);

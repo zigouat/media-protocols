@@ -168,7 +168,10 @@ pub fn poll(agent: *Agent) !Event {
             if (maybe_event) |ev| return ev;
         },
         .app_data => |data| return .{ .data = data },
-        .connection_state => |state| return .{ .connection_state = state },
+        .connection_state => |state| {
+            if (state == .failed) agent.closeConnection();
+            return .{ .connection_state = state };
+        },
         .gathering_state => |state| {
             agent.core.gathering_state = state;
             return .{ .gathering_state = state };
@@ -180,9 +183,12 @@ pub fn poll(agent: *Agent) !Event {
         .complete => {
             agent.setConnectionState(.completed);
 
-            agent.mutex.lockUncancelable(io);
-            defer agent.mutex.unlock(io);
-            agent.core.onComplete();
+            {
+                agent.mutex.lockUncancelable(io);
+                defer agent.mutex.unlock(io);
+                agent.core.onComplete();
+            }
+            agent.pruneNonNominatedRelayClients();
 
             return .{ .connection_state = .completed };
         },
@@ -362,6 +368,7 @@ fn doGatherServerReflexiveCandidates(agent: *Agent) !void {
 
         if (std.Io.net.IpAddress.resolve(io, parsed.host, parsed.port)) |addr| {
             try q.putOne(io, .{ .address = addr });
+            q.close(io);
         } else |_| {
             var hostname = HostName.init(parsed.host) catch continue;
             hostname.lookup(io, &q, .{ .port = parsed.port }) catch |err| switch (err) {
@@ -466,7 +473,7 @@ fn doTrunAllocate(agent: *Agent, dest: IpAddress, username: []const u8, pass: []
         const client = try allocator.create(TurnClient);
         errdefer allocator.destroy(client);
 
-        client.* = try TurnClient.init(allocator, .{
+        client.* = TurnClient.init(allocator, .{
             .socket = socket,
             .server = dest,
             .username = username,
@@ -510,17 +517,31 @@ fn doRelayReceive(agent: *Agent, client: *TurnClient, io: Io) !void {
         errdefer agent.destroyPacket(buffer);
 
         const received = try client.receive(io, buffer);
-
         @memmove(buffer[0..received.data.len], received.data);
-        try agent.putInQueue(.{ .message = .{
-            .channel = .{ .relay = client },
-            .incoming_message = .{
-                .from = received.from,
-                .data = buffer[0..received.data.len],
-                .control = &.{},
-                .flags = @bitCast(@as(u8, 0)),
-            },
-        } });
+
+        const incoming_message = Io.net.IncomingMessage{
+            .from = received.from,
+            .data = buffer[0..received.data.len],
+            .control = &.{},
+            .flags = @bitCast(@as(u8, 0)),
+        };
+
+        if (agent.core.connection_state == .completed) {
+            @branchHint(.likely);
+            if (stun.isMessage(incoming_message.data)) {
+                defer agent.destroyPacket(incoming_message.data);
+                agent.handleConsentFreshness(incoming_message) catch continue;
+            } else {
+                try agent.putInQueue(.{ .app_data = incoming_message.data });
+            }
+        } else {
+            try agent.putInQueue(.{
+                .message = .{
+                    .channel = .{ .relay = client },
+                    .incoming_message = incoming_message,
+                },
+            });
+        }
     }
 }
 
@@ -543,6 +564,27 @@ fn findRelayClient(agent: *Agent, addr: *const IpAddress) ?*TurnClient {
 fn ensurePermission(agent: *Agent, client: *TurnClient, peer: IpAddress, buffer: []u8) !void {
     if (client.hasPermission(peer)) return;
     try client.createPermissionsSlice(agent.io, buffer, &.{peer});
+}
+
+fn pruneNonNominatedRelayClients(agent: *Agent) void {
+    const allocator = agent.core.allocator;
+
+    var i: usize = 0;
+    while (i < agent.relay_clients.items.len) {
+        const client = agent.relay_clients.items[i];
+        const is_nominated = if (agent.nominated_channel) |channel| switch (channel) {
+            .relay => |c| c == client,
+            .socket => false,
+        } else false;
+        if (is_nominated) {
+            i += 1;
+            continue;
+        }
+
+        client.deinit(agent.io);
+        allocator.destroy(client);
+        _ = agent.relay_clients.swapRemove(i);
+    }
 }
 
 fn setConnectionState(agent: *Agent, new_state: ice.ConnectionState) void {
@@ -652,10 +694,8 @@ fn keepAlive(agent: *Agent, timeout: Io.Duration) !void {
 }
 
 fn sendConsentFreshness(agent: *Agent) !void {
-    const buffer = try agent.createPacket();
-    defer agent.destroyPacket(buffer);
-
-    const req = try agent.core.buildBindingRequest(randomNumber(u96, agent.io), false, buffer);
+    var buffer: [256]u8 = undefined;
+    const req = try agent.core.buildBindingRequest(randomNumber(u96, agent.io), false, &buffer);
     const remote_candidate = &agent.core.nominated_pair.?.remote;
     try agent.nominated_channel.?.send(agent, &remote_candidate.address, req);
 }
@@ -731,6 +771,7 @@ fn handleConnectivityCheckMessage(agent: *Agent, message: Message) !?Event {
                 agent.mutex.lockUncancelable(agent.io);
                 defer agent.mutex.unlock(agent.io);
                 try agent.core.handleSuccessResponse(&msg, message.channel.address(), sender);
+                if (agent.core.detectNominatedPair() != null) agent.nominated_channel = message.channel;
             },
             else => {},
         }
