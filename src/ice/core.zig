@@ -376,6 +376,20 @@ pub fn handleSuccessResponse(core: *Core, msg: *const stun.Message, base_addr: I
     }
 }
 
+pub fn toggleRole(core: *Core, tie_breaker: u64) void {
+    switch (core.role) {
+        .controlling => core.role = .controlled,
+        .controlled => core.role = .controlling,
+    }
+    core.tie_breaker = tie_breaker;
+
+    for (core.pairs.items) |*pair| {
+        const local = core.getPairLocal(pair);
+        const remote = core.getPairRemote(pair);
+        pair.priority = calculatePairPriority(local.priority, remote.priority, core.role);
+    }
+}
+
 fn pairsEql(core: *Core, pair1: *const CandidatePair, pair2: *const CandidatePair) bool {
     const local1 = core.getPairLocal(pair1);
     const remote1 = core.getPairRemote(pair1);
@@ -723,4 +737,30 @@ test "addServerReflexiveCandidate: skips candidate redundant with host" {
 
     try testing.expectEqual(null, try core.addServerReflexiveCandidate(base, mapped));
     try testing.expectEqual(2, core.candidates.items.len);
+}
+
+test "toggleRole: flips role, tie breaker and pair priorities" {
+    var core = try testNewCore(.controlling);
+    defer core.deinit();
+
+    const local_addr = try IpAddress.parse("10.0.0.1", 2000);
+    const remote_addr = try IpAddress.parse("192.168.1.10", 1000);
+
+    _ = try core.addHostCandidate(local_addr);
+    try core.addRemoteCandidate(Candidate.initServerReflexive(remote_addr, remote_addr));
+
+    try testing.expectEqual(1, core.pairs.items.len);
+    const controlling_priority = core.pairs.items[0].priority;
+
+    core.toggleRole(0xDEADBEEF);
+
+    try testing.expectEqual(.controlled, core.role);
+    try testing.expectEqual(0xDEADBEEF, core.tie_breaker);
+    try testing.expect(core.pairs.items[0].priority != controlling_priority);
+
+    core.toggleRole(0x1000000);
+
+    try testing.expectEqual(.controlling, core.role);
+    try testing.expectEqual(0x1000000, core.tie_breaker);
+    try testing.expectEqual(controlling_priority, core.pairs.items[0].priority);
 }
