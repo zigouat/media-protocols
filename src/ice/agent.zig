@@ -215,6 +215,7 @@ pub fn poll(agent: *Agent) !Event {
             return .{ .gathering_state = state };
         },
         .close => {
+            agent.setConnectionState(.closed);
             agent.closeConnection();
             return .{ .connection_state = .closed };
         },
@@ -357,8 +358,6 @@ fn closeConnection(agent: *Agent) void {
     allocator.free(agent.queue_buffer);
     agent.queue_buffer = &.{};
 
-    _ = agent.buffer_pool.reset(allocator, .free_all);
-
     agent.sockets.clearAndFree(allocator);
 
     for (agent.relay_clients.items) |client| {
@@ -366,8 +365,7 @@ fn closeConnection(agent: *Agent) void {
         allocator.destroy(client);
     }
     agent.relay_clients.clearAndFree(allocator);
-
-    agent.setConnectionState(.closed);
+    _ = agent.buffer_pool.reset(allocator, .free_all);
 }
 
 fn gatherLocalHostsAndInitSockets(agent: *Agent) !void {
@@ -635,11 +633,19 @@ fn setConnectionState(agent: *Agent, new_state: ice.ConnectionState) void {
 }
 
 fn connectivityCheck(agent: *Agent, timeout: Io.Duration) !void {
+    var dur = Io.Duration{ .nanoseconds = 0 };
+
     while (true) {
         switch (agent.core.connection_state) {
             .completed, .failed, .closed => return,
-            else => {
+            else => |state| {
                 try agent.io.sleep(timeout, .awake);
+                dur.nanoseconds += timeout.nanoseconds;
+                if (state != .connected and dur.nanoseconds > failing_timeout.raw.nanoseconds) {
+                    agent.setConnectionState(.failed);
+                    try agent.putInQueue(.{ .connection_state = .failed });
+                    return;
+                }
                 try agent.putInQueue(.{ .connectivity_check = {} });
             },
         }
