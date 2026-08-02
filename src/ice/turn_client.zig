@@ -15,6 +15,7 @@ const stun = @import("stun");
 
 const Client = @This();
 const Io = std.Io;
+const Logger = std.log.scoped(.turn_client);
 const testing = std.testing;
 
 const refresh_margin_seconds: u32 = 60;
@@ -72,6 +73,10 @@ const Allocation = struct {
     mapped_address: Io.net.IpAddress,
     lifetime: u32,
     permissions: std.ArrayList(Io.net.IpAddress) = .empty,
+
+    fn deinit(allocation: *Allocation, allocator: std.mem.Allocator) void {
+        allocation.permissions.deinit(allocator);
+    }
 
     fn trackPermission(allocation: *Allocation, allocator: std.mem.Allocator, peer: Io.net.IpAddress) !void {
         for (allocation.permissions.items) |existing| {
@@ -180,7 +185,7 @@ pub fn deinit(client: *Client, io: Io) void {
     client.allocator.free(client.realm);
     client.allocator.free(client.nonce);
     client.allocator.free(client.key);
-    if (client.allocation) |*allocation| allocation.permissions.deinit(client.allocator);
+    if (client.allocation) |*allocation| allocation.deinit(client.allocator);
 }
 
 /// Creates an allocation on the TURN server
@@ -220,7 +225,12 @@ pub fn refreshAllocation(client: *Client, io: Io, buffer: []u8, lifetime: u32) !
         msg = try stun.Message.parse(second);
     }
 
-    return client.parseRefresh(&msg);
+    const new_lifetime = try client.parseRefresh(&msg);
+    if (new_lifetime == 0) {
+        if (client.allocation) |*allocation| allocation.deinit(client.allocator);
+        client.allocation = null;
+    }
+    return new_lifetime;
 }
 
 /// Whether a permission is already installed for `peer`'s IP (port is ignored).
@@ -280,39 +290,57 @@ pub fn sendIndication(client: *Client, io: Io, buffer: []u8, peer: Io.net.IpAddr
     try client.socket.send(io, &client.server, w.final());
 }
 
-/// Blocks until a user's data is received from the TURN server.
+/// Blocks until a user's data is received from the TURN server. The returned
+/// `ReceivedData.data` is moved to start at `buffer[0]`, regardless of where the
+/// DATA attribute actually landed inside `buffer`.
 pub fn receive(client: *Client, io: Io, buffer: []u8) !ReceivedData {
     while (true) {
         const message = try client.socket.receive(io, buffer);
-        if (!stun.isMessage(message.data)) continue;
+        if (try client.handleReceivedMessage(io, buffer, message)) |received| return received;
+    }
+}
 
-        const s = stun.Message.parse(message.data) catch continue;
-        switch (s.header.message_type.class()) {
-            .request => continue,
-            .indication => {
-                if (s.header.message_type.method() != .data) continue;
-                if (client.parseDataIndication(&s)) |received| return received;
-            },
-            else => {
-                try client.tr_mutex.lock(io);
-                defer client.tr_mutex.unlock(io);
-                const entry = client.transactions.fetchRemove(s.header.transaction_id) orelse continue;
+/// Same as `receive`, but returns `error.Timeout` if no message arrives before `timeout`.
+pub fn receiveTimeout(client: *Client, io: Io, buffer: []u8, timeout: Io.Timeout) !ReceivedData {
+    while (true) {
+        const message = try client.socket.receiveTimeout(io, buffer, timeout);
+        if (try client.handleReceivedMessage(io, buffer, message)) |received| return received;
+    }
+}
 
-                try entry.value.mutex.lock(io);
-                defer entry.value.mutex.unlock(io);
-                if (message.data.len > entry.value.buffer.len) {
-                    entry.value.err = error.BufferTooShort;
-                    entry.value.done.set(io);
-                    continue;
-                }
+fn handleReceivedMessage(client: *Client, io: Io, buffer: []u8, message: Io.net.IncomingMessage) !?ReceivedData {
+    if (!stun.isMessage(message.data)) return null;
 
-                if (entry.value.done.isSet()) continue;
+    const s = stun.Message.parse(message.data) catch return null;
+    switch (s.header.message_type.class()) {
+        .request => return null,
+        .indication => {
+            if (s.header.message_type.method() != .data) return null;
+            var received = client.parseDataIndication(&s) orelse return null;
+            @memmove(buffer[0..received.data.len], received.data);
+            received.data = buffer[0..received.data.len];
+            return received;
+        },
+        else => {
+            try client.tr_mutex.lock(io);
+            defer client.tr_mutex.unlock(io);
+            const entry = client.transactions.fetchRemove(s.header.transaction_id) orelse return null;
 
-                @memcpy(entry.value.buffer[0..message.data.len], message.data);
-                entry.value.resp = entry.value.buffer[0..message.data.len];
+            try entry.value.mutex.lock(io);
+            defer entry.value.mutex.unlock(io);
+            if (message.data.len > entry.value.buffer.len) {
+                entry.value.err = error.BufferTooShort;
                 entry.value.done.set(io);
-            },
-        }
+                return null;
+            }
+
+            if (entry.value.done.isSet()) return null;
+
+            @memcpy(entry.value.buffer[0..message.data.len], message.data);
+            entry.value.resp = entry.value.buffer[0..message.data.len];
+            entry.value.done.set(io);
+            return null;
+        },
     }
 }
 
@@ -439,11 +467,14 @@ fn maintainAllocation(client: *Client, io: Io) !void {
 
         const sleep_seconds = if (lifetime > refresh_margin_seconds) lifetime - refresh_margin_seconds else lifetime;
         try io.sleep(.fromSeconds(sleep_seconds), .awake);
+        if (lifetime == 0) return;
+
+        Logger.debug("Refreshing TURN allocation: addr={f} lifetime={}s", .{ client.server, lifetime });
 
         const new_lifetime = client.refreshAllocation(io, &buffer, lifetime) catch |err| switch (err) {
             error.Canceled => return error.Canceled,
             else => {
-                std.log.warn("Failed to refresh TURN allocation: {}", .{err});
+                Logger.warn("Failed to refresh TURN allocation: {}", .{err});
                 return;
             },
         };
@@ -458,13 +489,14 @@ fn maintainPermissions(client: *Client, io: Io) !void {
 
     while (true) {
         try io.sleep(.fromSeconds(refresh_permissions_interval_seconds), .awake);
+        Logger.debug("Refreshing TURN permissions", .{});
 
         const allocation = client.allocation orelse return;
         if (allocation.permissions.items.len == 0) continue;
 
         client.performCreatePermission(io, &buffer, allocation.permissions.items) catch |err| switch (err) {
             error.Canceled => return error.Canceled,
-            else => std.log.warn("Failed to refresh TURN permissions: {}", .{err}),
+            else => Logger.warn("Failed to refresh TURN permissions: {}", .{err}),
         };
     }
 }

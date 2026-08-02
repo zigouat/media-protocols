@@ -49,6 +49,19 @@ const Channel = union(enum) {
             },
         }
     }
+
+    fn eql(a: Channel, b: Channel) bool {
+        return switch (a) {
+            .socket => |s| switch (b) {
+                .socket => |o| s.address.eql(&o.address),
+                .relay => false,
+            },
+            .relay => |c| switch (b) {
+                .relay => |o| c == o,
+                .socket => false,
+            },
+        };
+    }
 };
 
 const Message = struct {
@@ -488,7 +501,7 @@ fn doTrunAllocate(agent: *Agent, dest: IpAddress, username: []const u8, pass: []
     const buffer = try agent.createPacket();
     defer agent.destroyPacket(buffer);
 
-    std.log.debug("Create allocation: {f}", .{dest});
+    Logger.debug("Create allocation: {f}", .{dest});
     const allocation_result = try client.createAllocation(io, buffer);
     const candidate = ice.Candidate.initRelay(client.socket.address, allocation_result.relayed_address);
 
@@ -513,35 +526,71 @@ fn relayReceive(agent: *Agent, client: *TurnClient, io: Io) !void {
 
 fn doRelayReceive(agent: *Agent, client: *TurnClient, io: Io) !void {
     while (true) {
+        switch (agent.core.connection_state) {
+            .completed => {
+                if (agent.isNominatedChannel(.{ .relay = client }))
+                    try agent.group.concurrent(io, relayReceiveAppData, .{ agent, client, io });
+                return;
+            },
+            .failed, .closed => return,
+            else => {},
+        }
+
         const buffer = try agent.createPacket();
         errdefer agent.destroyPacket(buffer);
 
         const received = try client.receive(io, buffer);
-        @memmove(buffer[0..received.data.len], received.data);
 
-        const incoming_message = Io.net.IncomingMessage{
-            .from = received.from,
-            .data = buffer[0..received.data.len],
-            .control = &.{},
-            .flags = @bitCast(@as(u8, 0)),
+        try agent.putInQueue(.{
+            .message = .{
+                .channel = .{ .relay = client },
+                .incoming_message = .{
+                    .from = received.from,
+                    .data = @constCast(received.data),
+                    .control = &.{},
+                    .flags = @bitCast(@as(u8, 0)),
+                },
+            },
+        });
+    }
+}
+
+fn relayReceiveAppData(agent: *Agent, client: *TurnClient, io: Io) !void {
+    var timeout: Io.Timeout = .{ .duration = disconnect_timeout };
+
+    while (true) {
+        const buffer = agent.createPacket() catch return;
+
+        const received = client.receiveTimeout(io, buffer, timeout) catch |err| {
+            agent.destroyPacket(buffer);
+
+            switch (err) {
+                error.Timeout => {
+                    const new_state = agent.core.onConsentTimeout() orelse return;
+                    try agent.putInQueue(.{ .connection_state = new_state });
+                    if (new_state != .disconnected) return; // .failed
+                    timeout = .{ .duration = failing_timeout };
+                    continue;
+                },
+                error.Canceled => return error.Canceled,
+                else => |e| {
+                    logError("Error when listening from turn client: {}", .{e});
+                    return;
+                },
+            }
         };
 
-        if (agent.core.connection_state == .completed) {
-            @branchHint(.likely);
-            if (stun.isMessage(incoming_message.data)) {
-                defer agent.destroyPacket(incoming_message.data);
-                agent.handleConsentFreshness(incoming_message) catch continue;
-            } else {
-                try agent.putInQueue(.{ .app_data = incoming_message.data });
-            }
-        } else {
-            try agent.putInQueue(.{
-                .message = .{
-                    .channel = .{ .relay = client },
-                    .incoming_message = incoming_message,
-                },
-            });
-        }
+        const data = @constCast(received.data);
+
+        if (stun.isMessage(data)) {
+            defer agent.destroyPacket(data);
+            agent.handleConsentFreshness(.{
+                .from = received.from,
+                .data = data,
+                .control = &.{},
+                .flags = @bitCast(@as(u8, 0)),
+            }) catch continue;
+        } else try agent.putInQueue(.{ .app_data = data });
     }
 }
 
@@ -566,17 +615,18 @@ fn ensurePermission(agent: *Agent, client: *TurnClient, peer: IpAddress, buffer:
     try client.createPermissionsSlice(agent.io, buffer, &.{peer});
 }
 
+fn isNominatedChannel(agent: *Agent, channel: Channel) bool {
+    const nominated = agent.nominated_channel orelse return false;
+    return nominated.eql(channel);
+}
+
 fn pruneNonNominatedRelayClients(agent: *Agent) void {
     const allocator = agent.core.allocator;
 
     var i: usize = 0;
     while (i < agent.relay_clients.items.len) {
         const client = agent.relay_clients.items[i];
-        const is_nominated = if (agent.nominated_channel) |channel| switch (channel) {
-            .relay => |c| c == client,
-            .socket => false,
-        } else false;
-        if (is_nominated) {
+        if (agent.isNominatedChannel(.{ .relay = client })) {
             i += 1;
             continue;
         }
@@ -618,11 +668,7 @@ fn doReceive(agent: *Agent, socket: *const Socket) !void {
     while (true) {
         switch (agent.core.connection_state) {
             .completed => {
-                const is_nominated = switch (agent.nominated_channel.?) {
-                    .socket => |s| s.address.eql(&socket.address),
-                    .relay => false,
-                };
-                if (is_nominated)
+                if (agent.isNominatedChannel(.{ .socket = socket.* }))
                     try agent.group.concurrent(io, receiveAppData, .{ agent, socket.* })
                 else
                     socket.close(io);
