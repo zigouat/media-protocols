@@ -719,6 +719,7 @@ fn receiveAppData(agent: *Agent, channel: Channel) !void {
 
         if (agent.core.connection_state == .disconnected) {
             @branchHint(.cold);
+            timeout = .{ .duration = disconnect_timeout };
             agent.setConnectionState(.completed);
             try agent.putInQueue(.{ .connection_state = .completed });
         }
