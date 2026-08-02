@@ -544,6 +544,10 @@ pub const Writer = struct {
         std.mem.writeInt(u16, length, attr_size, .big);
     }
 
+    pub fn writeAttributes(msg_writer: *Writer, attributes: []const Attribute) Error!void {
+        for (attributes) |attribute| try msg_writer.writeAttribute(attribute);
+    }
+
     pub fn writeAttribute(msg_writer: *Writer, attribute: Attribute) Error!void {
         var out = &msg_writer.writer;
 
