@@ -174,7 +174,12 @@ pub fn poll(agent: *Agent) !Event {
         .message => |message| {
             const maybe_event = agent.handleConnectivityCheckMessage(message) catch |err| switch (err) {
                 error.Canceled => return error.Canceled,
-                error.SwitchRole => return error.SwitchRole, // TODO: switch role
+                error.SwitchRole => {
+                    agent.mutex.lockUncancelable(io);
+                    defer agent.mutex.unlock(io);
+                    agent.core.toggleRole(randomNumber(u64, io));
+                    continue;
+                },
                 else => continue,
             };
 
@@ -208,9 +213,16 @@ pub fn poll(agent: *Agent) !Event {
     } else |err| return err;
 }
 
+pub fn getRole(agent: *const Agent) ice.Role {
+    return agent.core.role;
+}
+
+/// Set the role of the agent in the ICE negotiation.
 pub fn setRole(agent: *Agent, role: ice.Role) void {
-    agent.core.role = role;
-    // TODO: Recalculate pairs priorities if role updated
+    agent.mutex.lockUncancelable(agent.io);
+    defer agent.mutex.unlock(agent.io);
+    if (agent.core.role == role) return;
+    agent.core.toggleRole(randomNumber(u64, agent.io));
 }
 
 /// Set remote credentials
