@@ -158,8 +158,8 @@ pub fn addServerReflexiveCandidate(core: *Core, base: IpAddress, mapped: IpAddre
     return if (try core.addLocalCandidate(candidate)) candidate else null;
 }
 
-pub fn handleConsentFreshness(core: *Core, message: std.Io.net.IncomingMessage, buffer: []u8) !?[]const u8 {
-    const msg = try stun.Message.parse(message.data);
+pub fn handleConsentFreshness(core: *Core, from: *const IpAddress, message: []const u8, buffer: []u8) !?[]const u8 {
+    const msg = try stun.Message.parse(message);
     switch (msg.header.message_type.class()) {
         .request => {
             _ = try Messages.parseAndValidateStunRequest(
@@ -168,7 +168,7 @@ pub fn handleConsentFreshness(core: *Core, message: std.Io.net.IncomingMessage, 
                 core.role,
                 core.tie_breaker,
             );
-            return try Messages.buildSuccessResponse(&msg, core.credentials.password, message.from, buffer);
+            return try Messages.buildSuccessResponse(&msg, core.credentials.password, from.*, buffer);
         },
         else => {},
     }

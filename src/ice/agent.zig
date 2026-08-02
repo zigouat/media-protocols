@@ -62,6 +62,26 @@ const Channel = union(enum) {
             },
         };
     }
+
+    fn receiveTimeout(channel: Channel, io: Io, buffer: []u8, timeout: Io.Timeout) !struct { IpAddress, []const u8 } {
+        switch (channel) {
+            .socket => |s| {
+                const incoming_message = try s.receiveTimeout(io, buffer, timeout);
+                return .{ incoming_message.from, incoming_message.data };
+            },
+            .relay => |c| {
+                const received = try c.receiveTimeout(io, buffer, timeout);
+                return .{ received.from, received.data };
+            },
+        }
+    }
+
+    fn close(channel: Channel, io: Io) void {
+        switch (channel) {
+            .socket => |s| s.close(io),
+            .relay => {},
+        }
+    }
 };
 
 const Message = struct {
@@ -541,7 +561,7 @@ fn doRelayReceive(agent: *Agent, client: *TurnClient, io: Io) !void {
         switch (agent.core.connection_state) {
             .completed => {
                 if (agent.isNominatedChannel(.{ .relay = client }))
-                    try agent.group.concurrent(io, relayReceiveAppData, .{ agent, client, io });
+                    try agent.group.concurrent(io, receiveAppData, .{ agent, Channel{ .relay = client } });
                 return;
             },
             .failed, .closed => return,
@@ -564,45 +584,6 @@ fn doRelayReceive(agent: *Agent, client: *TurnClient, io: Io) !void {
                 },
             },
         });
-    }
-}
-
-fn relayReceiveAppData(agent: *Agent, client: *TurnClient, io: Io) !void {
-    var timeout: Io.Timeout = .{ .duration = disconnect_timeout };
-
-    while (true) {
-        const buffer = agent.createPacket() catch return;
-
-        const received = client.receiveTimeout(io, buffer, timeout) catch |err| {
-            agent.destroyPacket(buffer);
-
-            switch (err) {
-                error.Timeout => {
-                    const new_state = agent.core.onConsentTimeout() orelse return;
-                    try agent.putInQueue(.{ .connection_state = new_state });
-                    if (new_state != .disconnected) return; // .failed
-                    timeout = .{ .duration = failing_timeout };
-                    continue;
-                },
-                error.Canceled => return error.Canceled,
-                else => |e| {
-                    logError("Error when listening from turn client: {}", .{e});
-                    return;
-                },
-            }
-        };
-
-        const data = @constCast(received.data);
-
-        if (stun.isMessage(data)) {
-            defer agent.destroyPacket(data);
-            agent.handleConsentFreshness(.{
-                .from = received.from,
-                .data = data,
-                .control = &.{},
-                .flags = @bitCast(@as(u8, 0)),
-            }) catch continue;
-        } else try agent.putInQueue(.{ .app_data = data });
     }
 }
 
@@ -681,7 +662,7 @@ fn doReceive(agent: *Agent, socket: *const Socket) !void {
         switch (agent.core.connection_state) {
             .completed => {
                 if (agent.isNominatedChannel(.{ .socket = socket.* }))
-                    try agent.group.concurrent(io, receiveAppData, .{ agent, socket.* })
+                    try agent.group.concurrent(io, receiveAppData, .{ agent, Channel{ .socket = socket.* } })
                 else
                     socket.close(io);
                 return;
@@ -710,14 +691,14 @@ fn doReceive(agent: *Agent, socket: *const Socket) !void {
     }
 }
 
-fn receiveAppData(agent: *Agent, socket: Socket) !void {
+fn receiveAppData(agent: *Agent, channel: Channel) !void {
     var timeout: Io.Timeout = .{ .duration = disconnect_timeout };
-    defer socket.close(agent.io);
+    defer channel.close(agent.io);
 
     while (true) {
         const buffer = agent.createPacket() catch return;
 
-        const incoming_message = socket.receiveTimeout(agent.io, buffer, timeout) catch |err| {
+        const from, const data = channel.receiveTimeout(agent.io, buffer, timeout) catch |err| {
             agent.destroyPacket(buffer);
 
             switch (err) {
@@ -736,10 +717,17 @@ fn receiveAppData(agent: *Agent, socket: Socket) !void {
             }
         };
 
-        if (stun.isMessage(incoming_message.data)) {
-            defer agent.destroyPacket(incoming_message.data);
-            agent.handleConsentFreshness(incoming_message) catch continue;
-        } else try agent.putInQueue(.{ .app_data = incoming_message.data });
+        if (agent.core.connection_state == .disconnected) {
+            @branchHint(.cold);
+            timeout = .{ .duration = disconnect_timeout };
+            agent.setConnectionState(.completed);
+            try agent.putInQueue(.{ .connection_state = .completed });
+        }
+
+        if (stun.isMessage(data)) {
+            defer agent.destroyPacket(data);
+            agent.handleConsentFreshness(&from, data) catch continue;
+        } else try agent.putInQueue(.{ .app_data = data });
     }
 }
 
@@ -859,13 +847,13 @@ fn handleConnectivityCheckMessage(agent: *Agent, message: Message) !?Event {
     return null;
 }
 
-fn handleConsentFreshness(agent: *Agent, incoming_message: Io.net.IncomingMessage) !void {
+fn handleConsentFreshness(agent: *Agent, from: *const IpAddress, data: []const u8) !void {
     Logger.debug("Received consent freshness request", .{});
     const buffer = try agent.createPacket();
     defer agent.destroyPacket(buffer);
 
-    if (try agent.core.handleConsentFreshness(incoming_message, buffer)) |resp| {
-        try agent.nominated_channel.?.send(agent, &incoming_message.from, resp);
+    if (try agent.core.handleConsentFreshness(from, data, buffer)) |resp| {
+        try agent.nominated_channel.?.send(agent, from, resp);
     }
 }
 
