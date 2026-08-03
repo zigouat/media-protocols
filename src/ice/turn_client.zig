@@ -136,9 +136,11 @@ const Transaction = struct {
     resp: []const u8 = &.{},
     err: ?Error = null,
     done: Io.Event = .unset,
+    timer_group: Io.Group = .init,
     mutex: Io.Mutex = .init,
 
     fn waitForResult(tr: *Transaction, io: Io) ![]const u8 {
+        defer tr.timer_group.cancel(io);
         try tr.done.wait(io);
         if (tr.err) |e| return e;
         return tr.resp;
@@ -628,7 +630,7 @@ fn parseDataIndication(client: *Client, msg: *const stun.Message) ?ReceivedData 
 
 fn performTransaction(client: *Client, io: Io, tr: *Transaction) ![]const u8 {
     try client.socket.send(io, &client.server, tr.req);
-    try client.group.concurrent(io, retry, .{ client, io, tr });
+    try tr.timer_group.concurrent(io, retry, .{ client, io, tr });
     return try tr.waitForResult(io);
 }
 

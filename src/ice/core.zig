@@ -10,6 +10,7 @@ const IpAddress = std.Io.net.IpAddress;
 
 const SelectedPair = struct {
     pair: CandidatePair,
+    pair_index: usize,
     local: Candidate,
     remote: Candidate,
 };
@@ -49,6 +50,7 @@ pub const Send = struct {
     from_base: IpAddress,
     to: IpAddress,
     use_candidate: bool,
+    pair: usize,
 };
 
 pub const ConnectivityChecks = struct {
@@ -61,7 +63,7 @@ pub const ConnectivityChecks = struct {
 
         if (!self.nomination_done) {
             self.nomination_done = true;
-            if (core.selected_pair) |selected| {
+            if (core.selected_pair) |*selected| {
                 const payload = try core.buildBindingRequest(tx_id, true, buffer);
                 try core.pending_requests.append(core.allocator, .{
                     .transaction_id = tx_id,
@@ -73,12 +75,14 @@ pub const ConnectivityChecks = struct {
                     .from_base = selected.local.base,
                     .to = selected.remote.address,
                     .use_candidate = true,
+                    .pair = selected.pair_index,
                 };
             }
         }
 
         while (self.index < core.pairs.items.len) {
-            const pair = &core.pairs.items[self.index];
+            const idx = self.index;
+            const pair = &core.pairs.items[idx];
             self.index += 1;
             switch (pair.status) {
                 .waiting, .in_progress => {
@@ -101,6 +105,7 @@ pub const ConnectivityChecks = struct {
                         .from_base = local.base,
                         .to = remote.address,
                         .use_candidate = false,
+                        .pair = idx,
                     };
                 },
                 else => {},
@@ -232,9 +237,10 @@ pub fn beginConnectivityChecks(core: *Core) ?ConnectivityChecks {
 
 pub fn detectNominatedPair(core: *Core) ?CandidatePair {
     if (core.role == .controlling or core.nominated_pair != null) return null;
-    for (core.pairs.items) |pair| if (pair.nominated) {
+    for (core.pairs.items, 0..) |pair, idx| if (pair.nominated) {
         core.nominated_pair = .{
             .pair = pair,
+            .pair_index = idx,
             .local = core.getPairLocal(&pair).*,
             .remote = core.getPairRemote(&pair).*,
         };
@@ -300,7 +306,7 @@ pub fn handleRequest(core: *Core, msg: *const stun.Message, base_addr: IpAddress
             else => candidate_pair.nominate_on_binding |= stun_req.use_candidate,
         }
     } else {
-        const local_idx = core.findLocalCandidate(&base_addr, &base_addr).?;
+        const local_idx = core.findLocalCandidate(&base_addr, &base_addr) orelse return error.NoLocalCandidate;
         const local_candidate = core.candidates.items[local_idx];
 
         const remote_idx: u32 = core.findRemoteCandidate(&from) orelse blk: {
@@ -426,14 +432,17 @@ fn calculatePairPriority(l: u32, r: u32, role: ice.Role) u64 {
 
 fn selectBestPair(core: *Core) ?SelectedPair {
     var selected_pair: ?CandidatePair = null;
-    for (core.pairs.items) |candidate_pair| if (candidate_pair.status == .succeeded) {
+    var selected_index: usize = undefined;
+    for (core.pairs.items, 0..) |candidate_pair, idx| if (candidate_pair.status == .succeeded) {
         if (selected_pair == null or candidate_pair.priority > selected_pair.?.priority) {
             selected_pair = candidate_pair;
+            selected_index = idx;
         }
     };
 
     return if (selected_pair) |pair| .{
         .pair = pair,
+        .pair_index = selected_index,
         .local = core.getPairLocal(&pair).*,
         .remote = core.getPairRemote(&pair).*,
     } else null;

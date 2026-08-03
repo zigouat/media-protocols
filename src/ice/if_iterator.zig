@@ -58,10 +58,11 @@ const IfAddrs = switch (os.tag) {
 };
 
 ifa: [*c]IfAddrs,
+head: [*c]IfAddrs,
 buffer: []u8,
 
 pub fn init(allocator: std.mem.Allocator) !IfIterator {
-    var it: IfIterator = .{ .ifa = undefined, .buffer = &.{} };
+    var it: IfIterator = .{ .ifa = undefined, .head = undefined, .buffer = &.{} };
     return switch (os.tag) {
         .windows => blk: {
             var size: windows.ULONG = 16 * 1024;
@@ -80,7 +81,11 @@ pub fn init(allocator: std.mem.Allocator) !IfIterator {
             }
             break :blk it;
         },
-        else => if (getifaddrs(&it.ifa) == 0) it else error.GetIfAddrsFailed,
+        else => blk: {
+            if (getifaddrs(&it.ifa) != 0) break :blk error.GetIfAddrsFailed;
+            it.head = it.ifa;
+            break :blk it;
+        },
     };
 }
 
@@ -94,7 +99,7 @@ pub fn next(it: *IfIterator) ?std.Io.net.IpAddress {
 pub fn deinit(iterator: *IfIterator, allocator: std.mem.Allocator) void {
     switch (os.tag) {
         .windows => allocator.free(iterator.buffer),
-        else => freeifaddrs(iterator.ifa),
+        else => freeifaddrs(iterator.head),
     }
 }
 

@@ -769,33 +769,57 @@ fn putInQueue(agent: *Agent, event: InnerEvent) !void {
 }
 
 fn batchSendConnectivityCheck(agent: *Agent) !void {
-    var checks = agent.core.beginConnectivityChecks() orelse return;
+    agent.mutex.lockUncancelable(agent.io);
+    const maybe_checks = agent.core.beginConnectivityChecks();
+    agent.mutex.unlock(agent.io);
+    var checks = maybe_checks orelse return;
 
     var buffer: [max_message_size]u8 = undefined;
     var indication_buffer: [max_message_size]u8 = undefined;
-    while (try checks.next(&buffer, randomNumber(u96, agent.io))) |send| {
+    while (try agent.nextConnectivityCheck(&checks, &buffer, randomNumber(u96, agent.io))) |send| {
         if (agent.findRelayClient(&send.from_base)) |client| {
             agent.ensurePermission(client, send.to, &indication_buffer) catch |err| {
                 Logger.warn("Failed to create turn permission for {f}: {}", .{ send.to, err });
+                agent.failPair(send.pair);
                 continue;
             };
 
-            if (send.use_candidate) agent.nominated_channel = .{ .relay = client };
+            if (send.use_candidate) agent.setNominatedChannel(.{ .relay = client });
 
             client.sendIndication(agent.io, &indication_buffer, send.to, send.payload) catch |err| {
                 Logger.warn("Failed to send binding request via relay to {f}: {}", .{ send.to, err });
+                agent.failPair(send.pair);
             };
             continue;
         }
 
         const socket = agent.findSocket(&send.from_base) orelse continue;
-        if (send.use_candidate) agent.nominated_channel = .{ .socket = socket.* };
+        if (send.use_candidate) agent.setNominatedChannel(.{ .socket = socket.* });
 
         Logger.debug("Send binding request to {f} (use_candidate={})", .{ send.to, send.use_candidate });
         socket.send(agent.io, &send.to, send.payload) catch |err| {
             Logger.warn("Failed to send binding request to {f}: {}", .{ send.to, err });
+            agent.failPair(send.pair);
         };
     }
+}
+
+fn nextConnectivityCheck(agent: *Agent, checks: *Core.ConnectivityChecks, buffer: []u8, tx_id: u96) !?Core.Send {
+    agent.mutex.lockUncancelable(agent.io);
+    defer agent.mutex.unlock(agent.io);
+    return try checks.next(buffer, tx_id);
+}
+
+fn failPair(agent: *Agent, pair_index: usize) void {
+    agent.mutex.lockUncancelable(agent.io);
+    defer agent.mutex.unlock(agent.io);
+    agent.core.pairs.items[pair_index].status = .failed;
+}
+
+fn setNominatedChannel(agent: *Agent, channel: Channel) void {
+    agent.mutex.lockUncancelable(agent.io);
+    defer agent.mutex.unlock(agent.io);
+    agent.nominated_channel = channel;
 }
 
 fn handleConnectivityCheckMessage(agent: *Agent, message: Message) !?Event {
