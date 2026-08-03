@@ -109,21 +109,17 @@ const InnerEvent = union(enum) {
     message: Message,
     connectivity_check: void,
     app_data: []const u8,
-    candidate: struct { ?Candidate, ?Channel },
+    candidate: ?union(enum) {
+        host: Socket,
+        srflx: struct { Socket, IpAddress },
+        relay: *TurnClient,
+    },
     remote_candidate: Candidate,
     close: void,
     complete: void,
     connection_state: ice.ConnectionState,
     gathering_state: ice.GatheringState,
     role: ice.Role,
-
-    fn socketCandidate(candidate: Candidate, socket: Socket) InnerEvent {
-        return .{ .candidate = .{ candidate, .{ .socket = socket } } };
-    }
-
-    fn relayCandidate(candidate: Candidate, client: *TurnClient) InnerEvent {
-        return .{ .candidate = .{ candidate, .{ .relay = client } } };
-    }
 };
 
 // Timeouts config
@@ -198,44 +194,46 @@ pub fn poll(agent: *Agent) !Event {
     }
 
     while (agent.queue.getOne(io)) |event| switch (event) {
-        .candidate => |s| {
-            const candidate, const channel = s;
-            errdefer if (channel) |*c| c.close(io);
-
-            if (candidate == null) return .{ .candidate = null };
-
-            switch (candidate.?.candidate_type) {
-                .host => {
-                    _ = try agent.core.addLocalCandidate(candidate.?);
-                    try agent.sockets.append(agent.core.allocator, channel.?.socket);
-                    try agent.group.concurrent(io, receive, .{ agent, channel.?.socket });
+        .candidate => |c| {
+            if (c) |candidate| switch (candidate) {
+                .host => |socket| {
+                    errdefer socket.close(io);
+                    if (try agent.core.addHostCandidate(socket.address)) |host_candidate| {
+                        try agent.sockets.append(agent.core.allocator, socket);
+                        try agent.group.concurrent(io, receive, .{ agent, socket });
+                        return .{ .candidate = host_candidate };
+                    } else socket.close(io);
                 },
-                .srflx => {
-                    const added = agent.core.addServerReflexiveCandidate(candidate.?.base, candidate.?.address) catch {
-                        channel.?.close(io);
+                .srflx => |srflx| {
+                    const socket, const addr = srflx;
+                    errdefer socket.close(io);
+                    const added = agent.core.addServerReflexiveCandidate(socket.address, addr) catch {
+                        socket.close(io);
                         continue;
                     };
                     if (added == null) {
-                        channel.?.close(io);
+                        socket.close(io);
                         continue;
                     }
-
-                    try agent.sockets.append(agent.core.allocator, channel.?.socket);
-                    try agent.group.concurrent(io, receive, .{ agent, channel.?.socket });
+                    try agent.sockets.append(agent.core.allocator, socket);
+                    try agent.group.concurrent(io, receive, .{ agent, socket });
+                    return .{ .candidate = added.? };
                 },
-                .relay => {
+                .relay => |client| {
                     errdefer {
-                        const relay = channel.?.relay;
-                        relay.deinit(io);
-                        agent.core.allocator.destroy(relay);
+                        client.deinit(io);
+                        agent.core.allocator.destroy(client);
                     }
-                    _ = try agent.core.addLocalCandidate(candidate.?);
-                    try agent.relay_clients.append(agent.core.allocator, channel.?.relay);
+                    const relay_c = Candidate.initRelay(client.socket.address, client.allocation.?.relayed_address);
+                    if (try agent.core.addLocalCandidate(relay_c)) {
+                        try agent.relay_clients.append(agent.core.allocator, client);
+                        return .{ .candidate = relay_c };
+                    } else {
+                        client.deinit(io);
+                        agent.core.allocator.destroy(client);
+                    }
                 },
-                else => unreachable,
-            }
-
-            return .{ .candidate = candidate.? };
+            } else return .{ .candidate = null };
         },
         .remote_candidate => |candidate| try agent.core.addRemoteCandidate(candidate),
         .connectivity_check => agent.batchSendConnectivityCheck() catch |err| logError("connectivity check failed due to {}", .{err}),
@@ -339,7 +337,7 @@ pub fn gatherCandidates(agent: *Agent) !void {
     if (agent.ice_servers.len != 0) {
         try agent.group.concurrent(agent.io, gatherServerReflexiveCandidates, .{agent});
     } else {
-        try agent.queue.putOne(agent.io, .{ .candidate = .{ null, null } });
+        try agent.queue.putOne(agent.io, .{ .candidate = null });
         try agent.putInQueue(.{ .gathering_state = .complete });
     }
 }
@@ -406,7 +404,7 @@ fn gatherLocalHostsAndInitSockets(agent: *Agent) !void {
             Logger.warn("Could not bind address {f}: {}", .{ addr, err });
             continue;
         };
-        try agent.putInQueue(.socketCandidate(.initHost(socket.address), socket));
+        try agent.putInQueue(.{ .candidate = .{ .host = socket } });
     }
 }
 
@@ -457,7 +455,7 @@ fn doGatherServerReflexiveCandidates(agent: *Agent) !void {
     }
 
     try grp.await(io);
-    try agent.putInQueue(.{ .candidate = .{ null, null } });
+    try agent.putInQueue(.{ .candidate = null });
     try agent.putInQueue(.{ .gathering_state = .complete });
 }
 
@@ -498,8 +496,7 @@ fn sendBindingRequest(agent: *Agent, dest: IpAddress) !void {
         };
 
         const addr = Messages.getMappedAddress(incoming_msg.data, tx_id) catch continue;
-        const candidate = Candidate.initServerReflexive(socket.address, addr);
-        try agent.putInQueue(.socketCandidate(candidate, socket));
+        try agent.putInQueue(.{ .candidate = .{ .srflx = .{ socket, addr } } });
         return;
     }
 }
@@ -541,9 +538,8 @@ fn doTrunAllocate(agent: *Agent, dest: IpAddress, username: []const u8, pass: []
     defer agent.destroyPacket(buffer);
 
     Logger.debug("Create allocation: {f}", .{dest});
-    const allocation_result = try client.createAllocation(io, buffer);
-    const candidate = ice.Candidate.initRelay(client.socket.address, allocation_result.relayed_address);
-    try agent.putInQueue(.relayCandidate(candidate, client));
+    _ = try client.createAllocation(io, buffer);
+    try agent.putInQueue(.{ .candidate = .{ .relay = client } });
 }
 
 fn relayReceive(agent: *Agent, client: *TurnClient, io: Io) !void {
