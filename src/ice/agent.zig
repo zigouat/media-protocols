@@ -109,15 +109,21 @@ const InnerEvent = union(enum) {
     message: Message,
     connectivity_check: void,
     app_data: []const u8,
-    /// Add a new socket
-    ///
-    /// This is usually paired with a new server reflexive candidate
-    add_socket: Socket,
-    candidate: ?Candidate,
+    candidate: struct { ?Candidate, ?Channel },
+    remote_candidate: Candidate,
     close: void,
     complete: void,
     connection_state: ice.ConnectionState,
     gathering_state: ice.GatheringState,
+    role: ice.Role,
+
+    fn socketCandidate(candidate: Candidate, socket: Socket) InnerEvent {
+        return .{ .candidate = .{ candidate, .{ .socket = socket } } };
+    }
+
+    fn relayCandidate(candidate: Candidate, client: *TurnClient) InnerEvent {
+        return .{ .candidate = .{ candidate, .{ .relay = client } } };
+    }
 };
 
 // Timeouts config
@@ -159,7 +165,7 @@ pub fn init(io: Io, allocator: Allocator, config: AgentConfig) !Agent {
             ice.Credentials.generate(io, allocator);
     errdefer credens.deinit(allocator);
 
-    const queue_buffer = try allocator.alloc(InnerEvent, 10);
+    const queue_buffer = try allocator.alloc(InnerEvent, 16);
 
     return .{
         .disconnected_timeout = config.disconnected_timeout,
@@ -192,19 +198,51 @@ pub fn poll(agent: *Agent) !Event {
     }
 
     while (agent.queue.getOne(io)) |event| switch (event) {
-        .add_socket => |socket| {
-            errdefer socket.close(io);
-            try agent.sockets.append(agent.core.allocator, socket);
-            try agent.group.concurrent(io, receive, .{ agent, socket });
+        .candidate => |s| {
+            const candidate, const channel = s;
+            errdefer if (channel) |*c| c.close(io);
+
+            if (candidate == null) return .{ .candidate = null };
+
+            switch (candidate.?.candidate_type) {
+                .host => {
+                    _ = try agent.core.addLocalCandidate(candidate.?);
+                    try agent.sockets.append(agent.core.allocator, channel.?.socket);
+                    try agent.group.concurrent(io, receive, .{ agent, channel.?.socket });
+                },
+                .srflx => {
+                    const added = agent.core.addServerReflexiveCandidate(candidate.?.base, candidate.?.address) catch {
+                        channel.?.close(io);
+                        continue;
+                    };
+                    if (added == null) {
+                        channel.?.close(io);
+                        continue;
+                    }
+
+                    try agent.sockets.append(agent.core.allocator, channel.?.socket);
+                    try agent.group.concurrent(io, receive, .{ agent, channel.?.socket });
+                },
+                .relay => {
+                    errdefer {
+                        const relay = channel.?.relay;
+                        relay.deinit(io);
+                        agent.core.allocator.destroy(relay);
+                    }
+                    _ = try agent.core.addLocalCandidate(candidate.?);
+                    try agent.relay_clients.append(agent.core.allocator, channel.?.relay);
+                },
+                else => unreachable,
+            }
+
+            return .{ .candidate = candidate.? };
         },
-        .candidate => |c| return .{ .candidate = c },
+        .remote_candidate => |candidate| try agent.core.addRemoteCandidate(candidate),
         .connectivity_check => agent.batchSendConnectivityCheck() catch |err| logError("connectivity check failed due to {}", .{err}),
         .message => |message| {
             const maybe_event = agent.handleConnectivityCheckMessage(message) catch |err| switch (err) {
                 error.Canceled => return error.Canceled,
                 error.SwitchRole => {
-                    agent.mutex.lockUncancelable(io);
-                    defer agent.mutex.unlock(io);
                     agent.core.toggleRole(randomNumber(u64, io));
                     continue;
                 },
@@ -229,16 +267,12 @@ pub fn poll(agent: *Agent) !Event {
         },
         .complete => {
             agent.setConnectionState(.completed);
-
-            {
-                agent.mutex.lockUncancelable(io);
-                defer agent.mutex.unlock(io);
-                agent.core.onComplete();
-            }
+            agent.core.onComplete();
             agent.pruneNonNominatedRelayClients();
 
             return .{ .connection_state = .completed };
         },
+        .role => |r| if (agent.core.role != r) agent.core.toggleRole(agent.core.tie_breaker),
     } else |err| return err;
 }
 
@@ -246,12 +280,15 @@ pub fn getRole(agent: *const Agent) ice.Role {
     return agent.core.role;
 }
 
-/// Set the role of the agent in the ICE negotiation.
-pub fn setRole(agent: *Agent, role: ice.Role) void {
-    agent.mutex.lockUncancelable(agent.io);
-    defer agent.mutex.unlock(agent.io);
-    if (agent.core.role == role) return;
-    agent.core.toggleRole(randomNumber(u64, agent.io));
+pub fn setRole(agent: *Agent, role: ice.Role) !void {
+    try agent.putInQueue(.{ .role = role });
+}
+
+pub fn addRemoteCandidate(agent: *Agent, remote_candidate: Candidate) !void {
+    switch (agent.core.connection_state) {
+        .new, .checking, .connected => try agent.putInQueue(.{ .remote_candidate = remote_candidate }),
+        else => {},
+    }
 }
 
 /// Set remote credentials
@@ -291,17 +328,6 @@ pub fn connectionState(agent: *const Agent) ice.ConnectionState {
     return agent.core.connection_state;
 }
 
-pub fn addRemoteCandidate(agent: *Agent, remote_candidate: Candidate) !void {
-    switch (agent.core.connection_state) {
-        .new, .checking, .connected => {
-            agent.mutex.lockUncancelable(agent.io);
-            defer agent.mutex.unlock(agent.io);
-            try agent.core.addRemoteCandidate(remote_candidate);
-        },
-        else => {},
-    }
-}
-
 /// Start gathering candidates.
 ///
 /// This function should be called first before starting the event loop so local sockets are
@@ -310,18 +336,10 @@ pub fn gatherCandidates(agent: *Agent) !void {
     try agent.putInQueue(.{ .gathering_state = .gathering });
     try agent.gatherLocalHostsAndInitSockets();
 
-    for (agent.core.candidates.items) |candidate| {
-        try agent.queue.putOne(agent.io, .{ .candidate = candidate });
-    }
-
-    for (agent.sockets.items) |socket| {
-        try agent.group.concurrent(agent.io, receive, .{ agent, socket });
-    }
-
     if (agent.ice_servers.len != 0) {
         try agent.group.concurrent(agent.io, gatherServerReflexiveCandidates, .{agent});
     } else {
-        try agent.queue.putOne(agent.io, .{ .candidate = null });
+        try agent.queue.putOne(agent.io, .{ .candidate = .{ null, null } });
         try agent.putInQueue(.{ .gathering_state = .complete });
     }
 }
@@ -388,12 +406,7 @@ fn gatherLocalHostsAndInitSockets(agent: *Agent) !void {
             Logger.warn("Could not bind address {f}: {}", .{ addr, err });
             continue;
         };
-
-        agent.mutex.lockUncancelable(agent.io);
-        defer agent.mutex.unlock(agent.io);
-
-        try agent.sockets.append(allocator, socket);
-        _ = try agent.core.addHostCandidate(socket.address);
+        try agent.putInQueue(.socketCandidate(.initHost(socket.address), socket));
     }
 }
 
@@ -444,7 +457,7 @@ fn doGatherServerReflexiveCandidates(agent: *Agent) !void {
     }
 
     try grp.await(io);
-    try agent.putInQueue(.{ .candidate = null });
+    try agent.putInQueue(.{ .candidate = .{ null, null } });
     try agent.putInQueue(.{ .gathering_state = .complete });
 }
 
@@ -456,7 +469,7 @@ fn sendBindingRequest(agent: *Agent, dest: IpAddress) !void {
     errdefer socket.close(agent.io);
 
     const tx_id: u96 = randomNumber(u96, agent.io);
-    var rto: u16 = 500;
+    var rto: u16 = 200;
     var attempts: u8 = 5;
     var timeout = Io.Timeout{ .duration = .{ .clock = .awake, .raw = .fromMilliseconds(rto) } };
 
@@ -476,7 +489,7 @@ fn sendBindingRequest(agent: *Agent, dest: IpAddress) !void {
 
         const incoming_msg = socket.receiveTimeout(agent.io, buffer, timeout) catch |err| switch (err) {
             error.Timeout => {
-                rto = rto * 2 + 500;
+                rto = @min(16_000, rto * 2);
                 timeout.duration.raw = .fromMilliseconds(rto);
                 continue;
             },
@@ -485,20 +498,8 @@ fn sendBindingRequest(agent: *Agent, dest: IpAddress) !void {
         };
 
         const addr = Messages.getMappedAddress(incoming_msg.data, tx_id) catch continue;
-
-        const candidate = blk: {
-            agent.mutex.lockUncancelable(agent.io);
-            defer agent.mutex.unlock(agent.io);
-            break :blk agent.core.addServerReflexiveCandidate(socket.address, addr) catch {
-                socket.close(agent.io);
-                return;
-            };
-        } orelse {
-            socket.close(agent.io);
-            return;
-        };
-        try agent.putInQueue(.{ .add_socket = socket });
-        try agent.putInQueue(.{ .candidate = candidate });
+        const candidate = Candidate.initServerReflexive(socket.address, addr);
+        try agent.putInQueue(.socketCandidate(candidate, socket));
         return;
     }
 }
@@ -542,17 +543,7 @@ fn doTrunAllocate(agent: *Agent, dest: IpAddress, username: []const u8, pass: []
     Logger.debug("Create allocation: {f}", .{dest});
     const allocation_result = try client.createAllocation(io, buffer);
     const candidate = ice.Candidate.initRelay(client.socket.address, allocation_result.relayed_address);
-
-    {
-        agent.mutex.lockUncancelable(io);
-        defer agent.mutex.unlock(io);
-        _ = try agent.core.addLocalCandidate(candidate);
-    }
-    try agent.putInQueue(.{ .candidate = candidate });
-
-    agent.mutex.lockUncancelable(io);
-    defer agent.mutex.unlock(io);
-    try agent.relay_clients.append(allocator, client);
+    try agent.putInQueue(.relayCandidate(candidate, client));
 }
 
 fn relayReceive(agent: *Agent, client: *TurnClient, io: Io) !void {
@@ -761,7 +752,7 @@ fn sendConsentFreshness(agent: *Agent) !void {
     try agent.nominated_channel.?.send(agent, &remote_candidate.address, req);
 }
 
-fn putInQueue(agent: *Agent, event: InnerEvent) !void {
+fn putInQueue(agent: *Agent, event: InnerEvent) error{Canceled}!void {
     agent.queue.putOne(agent.io, event) catch |in_err| switch (in_err) {
         error.Canceled => return error.Canceled,
         else => {},
@@ -769,57 +760,37 @@ fn putInQueue(agent: *Agent, event: InnerEvent) !void {
 }
 
 fn batchSendConnectivityCheck(agent: *Agent) !void {
-    agent.mutex.lockUncancelable(agent.io);
     const maybe_checks = agent.core.beginConnectivityChecks();
-    agent.mutex.unlock(agent.io);
     var checks = maybe_checks orelse return;
 
     var buffer: [max_message_size]u8 = undefined;
     var indication_buffer: [max_message_size]u8 = undefined;
-    while (try agent.nextConnectivityCheck(&checks, &buffer, randomNumber(u96, agent.io))) |send| {
+    while (try checks.next(&buffer, randomNumber(u96, agent.io))) |send| {
         if (agent.findRelayClient(&send.from_base)) |client| {
             agent.ensurePermission(client, send.to, &indication_buffer) catch |err| {
                 Logger.warn("Failed to create turn permission for {f}: {}", .{ send.to, err });
-                agent.failPair(send.pair);
+                agent.core.pairs.items[send.pair].status = .failed;
                 continue;
             };
 
-            if (send.use_candidate) agent.setNominatedChannel(.{ .relay = client });
+            if (send.use_candidate) agent.nominated_channel = .{ .relay = client };
 
             client.sendIndication(agent.io, &indication_buffer, send.to, send.payload) catch |err| {
                 Logger.warn("Failed to send binding request via relay to {f}: {}", .{ send.to, err });
-                agent.failPair(send.pair);
+                agent.core.pairs.items[send.pair].status = .failed;
             };
             continue;
         }
 
         const socket = agent.findSocket(&send.from_base) orelse continue;
-        if (send.use_candidate) agent.setNominatedChannel(.{ .socket = socket.* });
+        if (send.use_candidate) agent.nominated_channel = .{ .socket = socket.* };
 
         Logger.debug("Send binding request to {f} (use_candidate={})", .{ send.to, send.use_candidate });
         socket.send(agent.io, &send.to, send.payload) catch |err| {
             Logger.warn("Failed to send binding request to {f}: {}", .{ send.to, err });
-            agent.failPair(send.pair);
+            agent.core.pairs.items[send.pair].status = .failed;
         };
     }
-}
-
-fn nextConnectivityCheck(agent: *Agent, checks: *Core.ConnectivityChecks, buffer: []u8, tx_id: u96) !?Core.Send {
-    agent.mutex.lockUncancelable(agent.io);
-    defer agent.mutex.unlock(agent.io);
-    return try checks.next(buffer, tx_id);
-}
-
-fn failPair(agent: *Agent, pair_index: usize) void {
-    agent.mutex.lockUncancelable(agent.io);
-    defer agent.mutex.unlock(agent.io);
-    agent.core.pairs.items[pair_index].status = .failed;
-}
-
-fn setNominatedChannel(agent: *Agent, channel: Channel) void {
-    agent.mutex.lockUncancelable(agent.io);
-    defer agent.mutex.unlock(agent.io);
-    agent.nominated_channel = channel;
 }
 
 fn handleConnectivityCheckMessage(agent: *Agent, message: Message) !?Event {
@@ -841,9 +812,6 @@ fn handleConnectivityCheckMessage(agent: *Agent, message: Message) !?Event {
                 defer agent.destroyPacket(buffer);
 
                 const resp = res: {
-                    agent.mutex.lockUncancelable(agent.io);
-                    defer agent.mutex.unlock(agent.io);
-
                     const r = try agent.core.handleRequest(&msg, message.channel.address(), sender, buffer);
                     if (agent.core.detectNominatedPair() != null) agent.nominated_channel = message.channel;
 
@@ -853,8 +821,6 @@ fn handleConnectivityCheckMessage(agent: *Agent, message: Message) !?Event {
                 try message.channel.send(agent, &sender, resp);
             },
             .success_response => {
-                agent.mutex.lockUncancelable(agent.io);
-                defer agent.mutex.unlock(agent.io);
                 try agent.core.handleSuccessResponse(&msg, message.channel.address(), sender);
                 if (agent.core.detectNominatedPair() != null) agent.nominated_channel = message.channel;
             },
