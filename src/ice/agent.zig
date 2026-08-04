@@ -8,7 +8,6 @@ const ice = @import("ice.zig");
 const IfIterator = @import("if_iterator.zig");
 const Messages = @import("messages.zig");
 const ParsedServerUrl = @import("parsed_server_url.zig");
-const TurnClient = @import("turn_client.zig");
 
 const Core = @import("core.zig");
 
@@ -46,7 +45,7 @@ pub const AgentConfig = struct {
 
 const Channel = union(enum) {
     socket: Socket,
-    relay: *TurnClient,
+    relay: *stun.TurnClient,
 
     fn address(channel: Channel) IpAddress {
         return switch (channel) {
@@ -112,7 +111,7 @@ const InnerEvent = union(enum) {
     candidate: ?union(enum) {
         host: Socket,
         srflx: struct { Socket, IpAddress },
-        relay: *TurnClient,
+        relay: *stun.TurnClient,
     },
     remote_candidate: Candidate,
     close: void,
@@ -131,7 +130,7 @@ core: Core,
 ice_servers: []const ice.IceServer = &.{},
 buffer_pool: std.heap.MemoryPool([max_message_size]u8),
 sockets: std.ArrayList(Socket) = .empty,
-relay_clients: std.ArrayList(*TurnClient) = .empty,
+relay_clients: std.ArrayList(*stun.TurnClient) = .empty,
 
 mutex: Io.Mutex = .init,
 group: Io.Group = .init,
@@ -515,14 +514,14 @@ fn doTrunAllocate(agent: *Agent, dest: IpAddress, username: []const u8, pass: []
     const io = agent.io;
     const allocator = agent.core.allocator;
 
-    const client: *TurnClient = blk: {
+    const client: *stun.TurnClient = blk: {
         const socket = try (IpAddress{ .ip4 = .unspecified(0) }).bind(io, .{ .mode = .dgram });
         errdefer socket.close(io);
 
-        const client = try allocator.create(TurnClient);
+        const client = try allocator.create(stun.TurnClient);
         errdefer allocator.destroy(client);
 
-        client.* = TurnClient.init(allocator, .{
+        client.* = stun.TurnClient.init(allocator, .{
             .socket = socket,
             .server = dest,
             .username = username,
@@ -542,14 +541,14 @@ fn doTrunAllocate(agent: *Agent, dest: IpAddress, username: []const u8, pass: []
     try agent.putInQueue(.{ .candidate = .{ .relay = client } });
 }
 
-fn relayReceive(agent: *Agent, client: *TurnClient, io: Io) !void {
+fn relayReceive(agent: *Agent, client: *stun.TurnClient, io: Io) !void {
     agent.doRelayReceive(client, io) catch |err| switch (err) {
         error.Canceled => return error.Canceled,
         else => |e| logError("Error when receiving from turn client: {}", .{e}),
     };
 }
 
-fn doRelayReceive(agent: *Agent, client: *TurnClient, io: Io) !void {
+fn doRelayReceive(agent: *Agent, client: *stun.TurnClient, io: Io) !void {
     while (true) {
         switch (agent.core.connection_state) {
             .completed => {
@@ -591,12 +590,12 @@ fn findSocket(agent: *Agent, addr: *const IpAddress) ?*Io.net.Socket {
     return null;
 }
 
-fn findRelayClient(agent: *Agent, addr: *const IpAddress) ?*TurnClient {
+fn findRelayClient(agent: *Agent, addr: *const IpAddress) ?*stun.TurnClient {
     for (agent.relay_clients.items) |client| if (client.socket.address.eql(addr)) return client;
     return null;
 }
 
-fn ensurePermission(agent: *Agent, client: *TurnClient, peer: IpAddress, buffer: []u8) !void {
+fn ensurePermission(agent: *Agent, client: *stun.TurnClient, peer: IpAddress, buffer: []u8) !void {
     if (client.hasPermission(peer)) return;
     try client.createPermissionsSlice(agent.io, buffer, &.{peer});
 }

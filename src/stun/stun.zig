@@ -1,3 +1,5 @@
+pub const TurnClient = @import("turn_client.zig");
+
 const std = @import("std");
 const Io = std.Io;
 
@@ -677,6 +679,10 @@ pub const Writer = struct {
 };
 
 const testing = std.testing;
+
+test {
+    _ = @import("turn_client.zig");
+}
 
 test "MessageType: round-trip" {
     const classes = [_]Class{ .request, .indication, .success_response, .error_response };

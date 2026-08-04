@@ -11,7 +11,7 @@
 //! It's the caller's responsibility to call `receive` in a loop to drive the client's state machine and handle incoming data.
 
 const std = @import("std");
-const stun = @import("stun");
+const stun = @import("stun.zig");
 
 const Client = @This();
 const Io = std.Io;
@@ -24,6 +24,9 @@ const rto_base_ms: u32 = 200;
 const rto_max_ms: u32 = 1600;
 
 pub const ClientConfig = struct {
+    /// The socket used for communication with the turn server.
+    ///
+    /// The socket is owned by the caller and closed on client's deinit.
     socket: Io.net.Socket,
     server: Io.net.IpAddress,
     username: []const u8,
@@ -639,10 +642,12 @@ fn retry(client: *Client, io: Io, tr: *Transaction) !void {
     var rto: u32 = rto_base_ms;
     while (max_retries > 0) : (max_retries -= 1) {
         try io.sleep(.fromMilliseconds(rto), .awake);
-        try tr.mutex.lock(io);
-        defer tr.mutex.unlock(io);
 
-        if (!client.transactions.contains(tr.id)) return;
+        {
+            try client.tr_mutex.lock(io);
+            defer client.tr_mutex.unlock(io);
+            if (!client.transactions.contains(tr.id)) return;
+        }
 
         client.socket.send(io, &client.server, tr.req) catch |err| switch (err) {
             error.Canceled => return error.Canceled,
