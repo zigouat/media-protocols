@@ -3,11 +3,16 @@
 //! * AES 128 CM HMAC SHA1 32
 
 const std = @import("std");
+const builtin = @import("builtin");
 const srtp = @import("../srtp.zig");
 const kdf = @import("../kdf.zig");
+const X86Sha1 = @import("x86_sha1.zig");
+
+const has_sse4_1 = builtin.cpu.arch == .x86_64 and builtin.cpu.has(.x86, .sse4_1);
+const has_sha = builtin.cpu.arch == .x86_64 and builtin.cpu.has(.x86, .sha);
 
 const AesCm = @This();
-const HmacSha1 = std.crypto.auth.hmac.HmacSha1;
+const HmacSha1 = if (has_sse4_1 and has_sha) std.crypto.auth.hmac.Hmac(X86Sha1) else std.crypto.auth.hmac.HmacSha1;
 const aes = std.crypto.core.aes;
 const ctr = std.crypto.core.modes.ctr;
 
