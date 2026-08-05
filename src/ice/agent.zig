@@ -186,12 +186,6 @@ pub fn deinit(agent: *Agent) void {
 /// The event `data` buffer is owned by the agent, after processing the data, the user should call `destroyPacket` to free the buffer.
 pub fn poll(agent: *Agent) !Event {
     const io = agent.io;
-
-    switch (agent.core.connection_state) {
-        .failed, .closed => return error.FailedOrClosedAgent,
-        else => {},
-    }
-
     while (agent.queue.getOne(io)) |event| switch (event) {
         .candidate => |c| {
             if (c) |candidate| switch (candidate) {
@@ -250,7 +244,7 @@ pub fn poll(agent: *Agent) !Event {
         },
         .app_data => |data| return .{ .data = data },
         .connection_state => |state| {
-            if (state == .failed) agent.closeConnection();
+            if (state == .failed) agent.failConnection();
             return .{ .connection_state = state };
         },
         .gathering_state => |state| {
@@ -263,6 +257,7 @@ pub fn poll(agent: *Agent) !Event {
             return .{ .connection_state = .closed };
         },
         .complete => {
+            if (agent.core.connection_state != .connected) continue;
             agent.setConnectionState(.completed);
             agent.core.onComplete();
             agent.pruneNonNominatedRelayClients();
@@ -375,12 +370,17 @@ pub fn close(agent: *Agent) void {
 }
 
 fn closeConnection(agent: *Agent) void {
+    agent.failConnection();
+
+    agent.core.allocator.free(agent.queue_buffer);
+    agent.queue_buffer = &.{};
+    agent.queue.close(agent.io);
+}
+
+fn failConnection(agent: *Agent) void {
     const allocator = agent.core.allocator;
 
     agent.group.cancel(agent.io);
-    allocator.free(agent.queue_buffer);
-    agent.queue_buffer = &.{};
-
     agent.sockets.clearAndFree(allocator);
 
     for (agent.relay_clients.items) |client| {
