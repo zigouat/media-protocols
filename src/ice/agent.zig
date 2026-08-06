@@ -161,6 +161,7 @@ pub fn init(io: Io, allocator: Allocator, config: AgentConfig) !Agent {
     errdefer credens.deinit(allocator);
 
     const queue_buffer = try allocator.alloc(InnerEvent, 16);
+    errdefer allocator.free(queue_buffer);
 
     return .{
         .disconnected_timeout = config.disconnected_timeout,
@@ -168,7 +169,7 @@ pub fn init(io: Io, allocator: Allocator, config: AgentConfig) !Agent {
         .io = io,
         .core = .init(allocator, config.role, credens, randomNumber(u64, io)),
         .ice_servers = config.ice_servers,
-        .buffer_pool = .empty,
+        .buffer_pool = try .initCapacity(allocator, 8),
         .queue_buffer = queue_buffer,
         .queue = .init(queue_buffer),
     };

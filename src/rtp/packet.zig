@@ -92,6 +92,73 @@ pub const Extension = struct {
         }
     };
 
+    /// RTP extension writer. It contains helper methods to write one byte and two bytes extension items.
+    ///
+    /// Note that the writer reserves two bytes for the extension size, which is written when flush is called.
+    /// Make sure the IO.Writer's buffer is large enough to accommodate the whole extension data.
+    pub const Writer = struct {
+        profile: Profile,
+        size_slice: *[2]u8,
+        size: u16,
+        w: *std.Io.Writer,
+
+        pub fn init(profile: Profile, w: *std.Io.Writer) !Writer {
+            try w.writeInt(u16, @intFromEnum(profile), .big);
+            return .{
+                .profile = profile,
+                .w = w,
+                .size_slice = try w.writableArray(2),
+                .size = 0,
+            };
+        }
+
+        pub fn writeItem(self: *Writer, item: Item) !void {
+            switch (self.profile) {
+                .one_byte => try self.writeOneByteItem(item),
+                .two_bytes => try self.writeTwoBytesItem(item),
+                else => unreachable,
+            }
+        }
+
+        pub fn writeRaw(self: *Writer, data: []const u8) !void {
+            try self.w.writeAll(data);
+            self.size += @intCast(data.len);
+        }
+
+        pub fn flush(self: *Writer) !void {
+            const pad: u8 = switch (@rem(self.size, 4)) {
+                0 => 0,
+                else => |rem| @intCast(4 - rem),
+            };
+            self.size += pad;
+            try self.w.splatByteAll(0, pad);
+            std.mem.writeInt(u16, self.size_slice, @divExact(self.size, 4), .big);
+        }
+
+        fn writeOneByteItem(self: *Writer, item: Item) !void {
+            std.debug.assert(item.id > 0 and item.id < 15);
+            std.debug.assert(item.value.len > 0 and item.value.len <= 16);
+
+            const len: u8 = @intCast(item.value.len);
+            const byte: u8 = (item.id << 4) | (len - 1);
+            try self.w.writeByte(byte);
+            try self.w.writeAll(item.value);
+
+            self.size += @intCast(len + 1);
+        }
+
+        fn writeTwoBytesItem(self: *Writer, item: Item) !void {
+            std.debug.assert(item.id > 0);
+            std.debug.assert(item.value.len <= 255);
+
+            try self.w.writeByte(item.id);
+            try self.w.writeByte(@intCast(item.value.len));
+            try self.w.writeAll(item.value);
+
+            self.size += @intCast(item.value.len + 2);
+        }
+    };
+
     fn parse(reader: *Reader) !Extension {
         const profile: Profile = .fromInt(try reader.takeInt(u16, .big));
         const extension_size = (try reader.takeInt(u16, .big)) * 4;
@@ -101,6 +168,11 @@ pub const Extension = struct {
             .profile = profile,
             .data = ext_data,
         };
+    }
+
+    fn parseSlice(buffer: []const u8) !Extension {
+        var reader = Reader.fixed(buffer);
+        return try Extension.parse(&reader);
     }
 
     fn write(ext: *const Extension, writer: *std.Io.Writer) !void {
@@ -231,6 +303,105 @@ pub const Extension = struct {
             var it = try Iterator.init(ext);
             try std.testing.expectError(error.InvalidExtension, it.next());
         }
+    }
+
+    test "Writer: one byte extension" {
+        var buffer: [64]u8 = undefined;
+        var w = std.Io.Writer.fixed(&buffer);
+
+        var writer = try Writer.init(.one_byte, &w);
+        try writer.writeItem(.{ .id = 1, .value = &[_]u8{0x1F} });
+        try writer.writeItem(.{ .id = 10, .value = &[_]u8{ 0x01, 0x02, 0x03 } });
+        try writer.flush();
+
+        const expected = [_]u8{
+            0xBE, 0xDE, 0x00, 0x02,
+            0x10, 0x1F, 0xA2, 0x01,
+            0x02, 0x03, 0x00, 0x00,
+        };
+        try std.testing.expectEqualSlices(u8, &expected, w.buffered());
+
+        const ext: Extension = try .parseSlice(w.buffered());
+        var it = try Iterator.init(ext);
+
+        var item = (try it.next()).?;
+        try std.testing.expectEqual(1, item.id);
+        try std.testing.expectEqualSlices(u8, &[_]u8{0x1F}, item.value);
+
+        item = (try it.next()).?;
+        try std.testing.expectEqual(10, item.id);
+        try std.testing.expectEqualSlices(u8, &[_]u8{ 0x01, 0x02, 0x03 }, item.value);
+
+        try std.testing.expectEqual(null, it.next());
+    }
+
+    test "Writer: one byte extension no padding" {
+        var buffer: [64]u8 = undefined;
+        var w = std.Io.Writer.fixed(&buffer);
+
+        var writer = try Writer.init(.one_byte, &w);
+        try writer.writeItem(.{ .id = 3, .value = &[_]u8{ 0x01, 0x02, 0x03 } });
+        try writer.flush();
+
+        const expected = [_]u8{ 0xBE, 0xDE, 0x00, 0x01, 0x32, 0x01, 0x02, 0x03 };
+        try std.testing.expectEqualSlices(u8, &expected, w.buffered());
+    }
+
+    test "Writer: two bytes extension" {
+        var buffer: [64]u8 = undefined;
+        var w = std.Io.Writer.fixed(&buffer);
+
+        var writer = try Writer.init(.two_bytes, &w);
+        try writer.writeItem(.{ .id = 1, .value = &[_]u8{0x1F} });
+        try writer.writeItem(.{ .id = 2, .value = &[_]u8{ 0x01, 0x02, 0x03 } });
+        try writer.writeItem(.{ .id = 15, .value = &[_]u8{} });
+        try writer.writeItem(.{ .id = 192, .value = &[_]u8{0xFF} });
+        try writer.flush();
+
+        const ext: Extension = try .parseSlice(w.buffered());
+        var it = try Iterator.init(ext);
+
+        var item = (try it.next()).?;
+        try std.testing.expectEqual(1, item.id);
+        try std.testing.expectEqualSlices(u8, &[_]u8{0x1F}, item.value);
+
+        item = (try it.next()).?;
+        try std.testing.expectEqual(2, item.id);
+        try std.testing.expectEqualSlices(u8, &[_]u8{ 0x01, 0x02, 0x03 }, item.value);
+
+        item = (try it.next()).?;
+        try std.testing.expectEqual(15, item.id);
+        try std.testing.expectEqualSlices(u8, &[_]u8{}, item.value);
+
+        item = (try it.next()).?;
+        try std.testing.expectEqual(192, item.id);
+        try std.testing.expectEqualSlices(u8, &[_]u8{0xFF}, item.value);
+
+        try std.testing.expectEqual(null, it.next());
+    }
+
+    test "Writer: two bytes extension no padding" {
+        var buffer: [64]u8 = undefined;
+        var w = std.Io.Writer.fixed(&buffer);
+
+        var writer = try Writer.init(.two_bytes, &w);
+        try writer.writeItem(.{ .id = 1, .value = &[_]u8{ 0x02, 0x03 } });
+        try writer.flush();
+
+        const expected = [_]u8{ 0x10, 0x00, 0x00, 0x01, 0x01, 0x02, 0x02, 0x03 };
+        try std.testing.expectEqualSlices(u8, &expected, w.buffered());
+    }
+
+    test "Writer: writeRaw" {
+        var buffer: [64]u8 = undefined;
+        var w = std.Io.Writer.fixed(&buffer);
+
+        var writer = try Writer.init(.one_byte, &w);
+        try writer.writeRaw(&[_]u8{ 0x10, 0x1F });
+        try writer.flush();
+
+        const expected = [_]u8{ 0xBE, 0xDE, 0x00, 0x01, 0x10, 0x1F, 0x00, 0x00 };
+        try std.testing.expectEqualSlices(u8, &expected, w.buffered());
     }
 };
 
