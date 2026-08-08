@@ -78,6 +78,25 @@ pub const PLI = struct {
     }
 };
 
+/// Describes a payload specific feedback (PSFB) packet for Application layer Feedback (AFB) as defined in RFC 4585.
+pub const AFB = struct {
+    sender_ssrc: u32,
+    media_ssrc: u32,
+    data: []const u8,
+
+    pub fn decode(data: []const u8) rtcp.Error!AFB {
+        if (data.len < 8) return error.MalformedPacket;
+
+        const sender_ssrc = std.mem.readInt(u32, data[0..4], .big);
+        const source_ssrc = std.mem.readInt(u32, data[4..8], .big);
+        return AFB{
+            .sender_ssrc = sender_ssrc,
+            .media_ssrc = source_ssrc,
+            .data = data[8..],
+        };
+    }
+};
+
 test "Nack: decode" {
     const data = [_]u8{ 0, 1, 225, 185, 0, 1, 182, 103, 0, 100, 144, 4, 0, 117, 0, 128, 0, 153, 0, 0 };
     const fb = try Nack.decode(&data);
@@ -130,4 +149,27 @@ test "PLI: writer encode" {
     var writer = Io.Writer.fixed(&buffer);
     try PLI.writerEncode(&pli, &writer);
     try std.testing.expectEqualSlices(u8, &expected, buffer[0..]);
+}
+
+test "AFB: decode" {
+    const data = [_]u8{ 0, 1, 225, 185, 0, 1, 182, 103, 'R', 'E', 'M', 'B' };
+    const fb = try AFB.decode(&data);
+
+    try std.testing.expectEqual(123_321, fb.sender_ssrc);
+    try std.testing.expectEqual(112_231, fb.media_ssrc);
+    try std.testing.expectEqualSlices(u8, data[8..], fb.data);
+}
+
+test "AFB: decode with empty data" {
+    const data = [_]u8{ 0, 1, 225, 185, 0, 1, 182, 103 };
+    const fb = try AFB.decode(&data);
+
+    try std.testing.expectEqual(123_321, fb.sender_ssrc);
+    try std.testing.expectEqual(112_231, fb.media_ssrc);
+    try std.testing.expectEqual(0, fb.data.len);
+}
+
+test "AFB: decode malformed packet" {
+    const data = [_]u8{ 0, 1, 225, 185, 0, 1, 182 };
+    try std.testing.expectError(error.MalformedPacket, AFB.decode(&data));
 }
