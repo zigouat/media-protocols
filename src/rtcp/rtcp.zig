@@ -73,6 +73,7 @@ pub const Packet = struct {
         bye: []const u8,
         nack: Nack,
         pli: PLI,
+        afb: fb.AFB,
         unknown: []const u8,
     },
 
@@ -94,7 +95,7 @@ pub const Packet = struct {
             },
             .receiver_report => {
                 if (payload.len < @as(usize, packet.header.rc) * reception_report_size + rr_base_size) return error.EndOfStream;
-                packet.payload = .{ .rr = .deocdeFromSlice(payload, packet.header.rc) };
+                packet.payload = .{ .rr = .decodeFromSlice(payload, packet.header.rc) };
             },
             .source_description => packet.payload = .{ .sdes = .{ .chunks_bytes = payload } },
             .bye => {
@@ -107,6 +108,7 @@ pub const Packet = struct {
             },
             .ps_fb => switch (packet.header.rc) { // PSFB FMT
                 1 => packet.payload = .{ .pli = try PLI.decode(payload) },
+                15 => packet.payload = .{ .afb = try .decode(payload) },
                 else => packet.payload = .{ .unknown = payload },
             },
             else => packet.payload = .{ .unknown = payload },
@@ -178,7 +180,7 @@ pub const ReceiverReport = struct {
     profile_extensions: []const u8 = &.{},
 
     /// Parses a ReceiverReport from a byte slice, given the number of reception reports (rr_count) contained in the report.
-    pub fn deocdeFromSlice(data: []const u8, rr_count: u5) ReceiverReport {
+    pub fn decodeFromSlice(data: []const u8, rr_count: u5) ReceiverReport {
         const report_offset = @as(usize, reception_report_size) * rr_count + 4;
 
         return .{
@@ -191,7 +193,7 @@ pub const ReceiverReport = struct {
     /// Returns the reception report at the specified index.
     ///
     /// The total number of reception reports is determined by the `rc` field in the RTCP header.
-    pub fn getReceptionReport(sr: *const SenderReport, index: usize) ReceptionReport {
+    pub fn getReceptionReport(sr: *const ReceiverReport, index: usize) ReceptionReport {
         const offset = index * reception_report_size;
         std.debug.assert(offset + reception_report_size <= sr.report_bytes.len);
         return .decodeFromSlice(sr.report_bytes[offset .. offset + reception_report_size]);
@@ -232,16 +234,20 @@ pub const ReceptionReport = struct {
 };
 
 /// An iterator over compound rtcp packet.
-pub const Iterator = struct {
+pub const CompoundPacketIterator = struct {
     reader: Reader,
 
-    pub fn init(rtcp: []const u8) Iterator {
+    pub fn init(rtcp: []const u8) CompoundPacketIterator {
         return .{ .reader = .fixed(rtcp) };
     }
 
-    pub fn next(it: *Iterator) Error!?Packet {
+    pub fn next(it: *CompoundPacketIterator) Error!?Packet {
         if (it.reader.bufferedLen() == 0) return null;
         return Packet.decodeFromReader(&it.reader) catch return error.MalformedPacket;
+    }
+
+    pub fn data(it: *const CompoundPacketIterator) []const u8 {
+        return it.reader.buffer;
     }
 };
 
@@ -530,7 +536,7 @@ test "Compound packet: iterate" {
         0x01, 0xb2, 0x39, 0x3f, 0x3f,
     };
 
-    var it: Iterator = .init(&rtcp);
+    var it: CompoundPacketIterator = .init(&rtcp);
     var packet = try it.next();
     try testing.expect(packet != null);
     try testing.expectEqual(.sender_report, packet.?.header.payload_type);
