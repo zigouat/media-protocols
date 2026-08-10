@@ -24,6 +24,7 @@ const attribute_types_map: std.StaticStringMap(AttributeType) = .initComptime(&.
     .{ "sendonly", .direction },
     .{ "recvonly", .direction },
     .{ "inactive", .direction },
+    .{ "rtcp-fb", .rtcp_fb },
     .{ "rtcp-mux", .rtcp_mux },
     .{ "rtcp-mux-only", .rtcp_mux_only },
     .{ "rtcp-rsize", .rtcp_rsize },
@@ -53,6 +54,7 @@ pub const AttributeType = enum {
     ice_ufrag,
     mid,
     msid,
+    rtcp_fb,
     rtcp_mux,
     rtcp_mux_only,
     rtcp_rsize,
@@ -82,6 +84,7 @@ pub const ParsedAttribute = union(AttributeType) {
     ice_ufrag: []const u8,
     mid: []const u8,
     msid: Msid,
+    rtcp_fb: RtcpFb,
     rtcp_mux: void,
     rtcp_mux_only: void,
     rtcp_rsize: void,
@@ -116,6 +119,11 @@ pub const ParsedAttribute = union(AttributeType) {
             .msid => |msid| try msid.write(w),
             .setup => |v| try w.print("a=setup:{s}\r\n", .{@tagName(v)}),
             .rtpmap => |rtpmap| try w.print("a={f}\r\n", .{rtpmap}),
+            .rtcp_fb => |fb| {
+                try w.writeAll("a=rtcp-fb:");
+                try fb.write(w);
+                try w.writeAll("\r\n");
+            },
             .rtcp_mux => try w.writeAll("a=rtcp-mux\r\n"),
             .rtcp_mux_only => try w.writeAll("a=rtcp-mux-only\r\n"),
             .rtcp_rsize => try w.writeAll("a=rtcp-rsize\r\n"),
@@ -161,6 +169,7 @@ pub fn parse(attr: *const Attribute) !ParsedAttribute {
         .ice_pwd => .{ .ice_pwd = value },
         .mid => .{ .mid = value },
         .msid => .{ .msid = Msid.fromSlice(value) },
+        .rtcp_fb => .{ .rtcp_fb = try RtcpFb.parse(value) },
         .rtcp_mux => .rtcp_mux,
         .rtcp_mux_only => .rtcp_mux_only,
         .rtcp_rsize => .rtcp_rsize,
@@ -500,6 +509,41 @@ pub const Ssrc = struct {
     }
 };
 
+pub const RtcpFb = struct {
+    payload_type: enum(u8) { all = 128, _ },
+    value: []const u8,
+    param: []const u8,
+
+    pub fn parse(value: []const u8) !RtcpFb {
+        var it = std.mem.tokenizeScalar(u8, value, ' ');
+        var result: RtcpFb = undefined;
+
+        const pt = it.next() orelse return error.InvalidAttribute;
+        result.payload_type = blk: {
+            if (std.mem.eql(u8, pt, "*")) break :blk .all;
+            const pt_int = std.fmt.parseInt(u8, pt, 10) catch return error.InvalidAttribute;
+            if (pt_int > 127) return error.InvalidAttribute;
+            break :blk @enumFromInt(pt_int);
+        };
+
+        result.value = it.next() orelse return error.InvalidAttribute;
+        result.param = it.rest();
+        return result;
+    }
+
+    pub fn write(fb: *const RtcpFb, w: *Writer) !void {
+        switch (fb.payload_type) {
+            .all => try w.print("* {s}", .{fb.value}),
+            else => |pt| try w.print("{d} {s}", .{ @intFromEnum(pt), fb.value }),
+        }
+
+        if (fb.param.len != 0) {
+            try w.writeByte(' ');
+            try w.writeAll(fb.param);
+        }
+    }
+};
+
 test "attribute parsing" {
     const input =
         \\a=rtpmap:96 opus/48000/2
@@ -528,7 +572,7 @@ test "attribute parsing" {
     try std.testing.expect(part == null);
 }
 
-test "parse RtmMap" {
+test "RtmMap: parse" {
     const attribute = Attribute{
         .key = "rtpmap",
         .value = "96 opus/48000/2",
@@ -542,7 +586,7 @@ test "parse RtmMap" {
     try std.testing.expectEqual(2, rtpmap.channels.?);
 }
 
-test "parse invalid RtmMap" {
+test "RtmMap: parse invalid " {
     const attribute = Attribute{
         .key = "rtpmap",
         .value = "97 opus/4800q/2",
@@ -551,7 +595,28 @@ test "parse invalid RtmMap" {
     try std.testing.expectError(error.InvalidRtpMap, RtpMap.parse(attribute.value.?));
 }
 
-test "parse Fmtp" {
+test "RtcpFb: parse" {
+    {
+        const fb = try RtcpFb.parse("96 nack pli");
+        try std.testing.expectEqual(96, @intFromEnum(fb.payload_type));
+        try std.testing.expectEqualStrings("nack", fb.value);
+        try std.testing.expectEqualStrings("pli", fb.param);
+    }
+
+    {
+        const fb = try RtcpFb.parse("* nack");
+        try std.testing.expectEqual(.all, fb.payload_type);
+        try std.testing.expectEqualStrings("nack", fb.value);
+        try std.testing.expectEqualStrings("", fb.param);
+    }
+
+    try std.testing.expectError(error.InvalidAttribute, RtcpFb.parse("128 nack"));
+    try std.testing.expectError(error.InvalidAttribute, RtcpFb.parse("notanumber nack"));
+    try std.testing.expectError(error.InvalidAttribute, RtcpFb.parse("96"));
+    try std.testing.expectError(error.InvalidAttribute, RtcpFb.parse(""));
+}
+
+test "Fmtp: parse" {
     {
         const fmtp = try Fmtp.parse(
             "96 packetization-mode=1; profile-level-id=458723; level-asymmetry-allowed=1",
@@ -691,6 +756,14 @@ test "parse attribute" {
     }
 
     {
+        const attr = try (Attribute{ .key = "rtcp-fb", .value = "96 nack pli" }).parse();
+        try std.testing.expectEqual(.rtcp_fb, @as(AttributeType, attr));
+        try std.testing.expectEqual(96, @intFromEnum(attr.rtcp_fb.payload_type));
+        try std.testing.expectEqualStrings("nack", attr.rtcp_fb.value);
+        try std.testing.expectEqualStrings("pli", attr.rtcp_fb.param);
+    }
+
+    {
         const attr = try (Attribute{ .key = "rtcp-mux", .value = null }).parse();
         try std.testing.expect(attr == .rtcp_mux);
     }
@@ -814,6 +887,16 @@ test "ParsedAttribute: write" {
     try expectWrite(&w, .{ .direction = "sendrecv" }, "a=sendrecv\r\n");
     try expectWrite(&w, .{ .mid = "audio" }, "a=mid:audio\r\n");
     try expectWrite(&w, .{ .setup = .actpass }, "a=setup:actpass\r\n");
+    try expectWrite(
+        &w,
+        .{ .rtcp_fb = .{ .payload_type = @enumFromInt(96), .value = "nack", .param = "pli" } },
+        "a=rtcp-fb:96 nack pli\r\n",
+    );
+    try expectWrite(
+        &w,
+        .{ .rtcp_fb = .{ .payload_type = .all, .value = "nack", .param = "" } },
+        "a=rtcp-fb:* nack\r\n",
+    );
     try expectWrite(&w, .rtcp_mux, "a=rtcp-mux\r\n");
     try expectWrite(&w, .rtcp_mux_only, "a=rtcp-mux-only\r\n");
     try expectWrite(&w, .rtcp_rsize, "a=rtcp-rsize\r\n");
