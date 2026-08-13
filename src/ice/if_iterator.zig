@@ -145,14 +145,14 @@ fn nextWindowsInterfaceAddress(it: *IfIterator) ?std.Io.net.IpAddress {
                 it.ifa.*.first_unicast_address = unicast;
             }
 
-            const sockaddr = unicast.*.address.sockaddr.*;
-            switch (sockaddr.family) {
+            const sockaddr = unicast.*.address.sockaddr;
+            switch (sockaddr.*.family) {
                 windows.ws2_32.AF.INET => {
-                    const in: posix.sockaddr.in = @bitCast(sockaddr);
+                    const in: posix.sockaddr.in = @bitCast(sockaddr.*);
                     return .{ .ip4 = .{ .bytes = std.mem.toBytes(in.addr), .port = 0 } };
                 },
                 windows.ws2_32.AF.INET6 => {
-                    const in6: posix.sockaddr.in6 = @bitCast(sockaddr);
+                    const in6: *posix.sockaddr.in6 = @ptrCast(@alignCast(sockaddr));
                     const addr = std.Io.net.IpAddress{ .ip6 = .{ .bytes = std.mem.toBytes(in6.addr), .port = 0 } };
                     if (addr.ip6.isLinkLocal()) continue;
                     return addr;
