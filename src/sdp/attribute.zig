@@ -18,6 +18,7 @@ const attribute_types_map: std.StaticStringMap(AttributeType) = .initComptime(&.
     .{ "ice-options", .ice_options },
     .{ "ice-pwd", .ice_pwd },
     .{ "ice-ufrag", .ice_ufrag },
+    .{ "max-message-size", .max_message_size },
     .{ "mid", .mid },
     .{ "msid", .msid },
     .{ "sendrecv", .direction },
@@ -29,6 +30,7 @@ const attribute_types_map: std.StaticStringMap(AttributeType) = .initComptime(&.
     .{ "rtcp-mux-only", .rtcp_mux_only },
     .{ "rtcp-rsize", .rtcp_rsize },
     .{ "rtpmap", .rtpmap },
+    .{ "sctp-port", .sctp_port },
     .{ "setup", .setup },
     .{ "ssrc", .ssrc },
     .{ "ssrc-group", .ssrc_group },
@@ -52,6 +54,7 @@ pub const AttributeType = enum {
     ice_options,
     ice_pwd,
     ice_ufrag,
+    max_message_size,
     mid,
     msid,
     rtcp_fb,
@@ -59,6 +62,7 @@ pub const AttributeType = enum {
     rtcp_mux_only,
     rtcp_rsize,
     rtpmap,
+    sctp_port,
     setup,
     ssrc,
     ssrc_group,
@@ -82,6 +86,7 @@ pub const ParsedAttribute = union(AttributeType) {
     ice_options: IceOptions,
     ice_pwd: []const u8,
     ice_ufrag: []const u8,
+    max_message_size: u32,
     mid: []const u8,
     msid: Msid,
     rtcp_fb: RtcpFb,
@@ -89,6 +94,7 @@ pub const ParsedAttribute = union(AttributeType) {
     rtcp_mux_only: void,
     rtcp_rsize: void,
     rtpmap: RtpMap,
+    sctp_port: u16,
     setup: Setup,
     ssrc: Ssrc,
     ssrc_group: Group,
@@ -115,8 +121,10 @@ pub const ParsedAttribute = union(AttributeType) {
             },
             .ice_ufrag => |v| try w.print("a=ice-ufrag:{s}\r\n", .{v}),
             .ice_pwd => |v| try w.print("a=ice-pwd:{s}\r\n", .{v}),
+            .max_message_size => |v| try w.print("a=max-message-size:{d}\r\n", .{v}),
             .mid => |v| try w.print("a=mid:{s}\r\n", .{v}),
             .msid => |msid| try msid.write(w),
+            .sctp_port => |v| try w.print("a=sctp-port:{d}\r\n", .{v}),
             .setup => |v| try w.print("a=setup:{s}\r\n", .{@tagName(v)}),
             .rtpmap => |rtpmap| try w.print("a={f}\r\n", .{rtpmap}),
             .rtcp_fb => |fb| {
@@ -167,6 +175,7 @@ pub fn parse(attr: *const Attribute) !ParsedAttribute {
         .ice_options => .{ .ice_options = try IceOptions.parse(value) },
         .ice_ufrag => .{ .ice_ufrag = value },
         .ice_pwd => .{ .ice_pwd = value },
+        .max_message_size => .{ .max_message_size = std.fmt.parseInt(u32, value, 10) catch return error.InvalidAttribute },
         .mid => .{ .mid = value },
         .msid => .{ .msid = Msid.fromSlice(value) },
         .rtcp_fb => .{ .rtcp_fb = try RtcpFb.parse(value) },
@@ -174,6 +183,7 @@ pub fn parse(attr: *const Attribute) !ParsedAttribute {
         .rtcp_mux_only => .rtcp_mux_only,
         .rtcp_rsize => .rtcp_rsize,
         .rtpmap => .{ .rtpmap = try RtpMap.parse(value) },
+        .sctp_port => .{ .sctp_port = std.fmt.parseInt(u16, value, 10) catch return error.InvalidAttribute },
         .setup => if (std.meta.stringToEnum(Setup, value)) |setup| .{ .setup = setup } else error.InvalidAttribute,
         .ssrc => .{ .ssrc = try Ssrc.parse(value) },
         .ssrc_group => .{ .ssrc_group = try Group.parse(value) },
@@ -791,6 +801,28 @@ test "parse attribute" {
     }
 
     {
+        const attr = try (Attribute{ .key = "max-message-size", .value = "262144" }).parse();
+        try std.testing.expectEqual(.max_message_size, @as(AttributeType, attr));
+        try std.testing.expectEqual(262144, attr.max_message_size);
+
+        try std.testing.expectError(
+            error.InvalidAttribute,
+            (Attribute{ .key = "max-message-size", .value = "notanumber" }).parse(),
+        );
+    }
+
+    {
+        const attr = try (Attribute{ .key = "sctp-port", .value = "5000" }).parse();
+        try std.testing.expectEqual(.sctp_port, @as(AttributeType, attr));
+        try std.testing.expectEqual(5000, attr.sctp_port);
+
+        try std.testing.expectError(
+            error.InvalidAttribute,
+            (Attribute{ .key = "sctp-port", .value = "notanumber" }).parse(),
+        );
+    }
+
+    {
         inline for (.{ "sendrecv", "sendonly", "recvonly", "inactive" }) |dir| {
             const direction = try (Attribute{ .key = dir, .value = null }).parse();
             try std.testing.expect(direction == .direction);
@@ -884,6 +916,8 @@ test "ParsedAttribute: write" {
     try expectWrite(&w, .bundle_only, "a=bundle-only\r\n");
     try expectWrite(&w, .{ .ice_ufrag = "F7gI" }, "a=ice-ufrag:F7gI\r\n");
     try expectWrite(&w, .{ .ice_pwd = "x9cml/YzichV2+XlhiMu8g" }, "a=ice-pwd:x9cml/YzichV2+XlhiMu8g\r\n");
+    try expectWrite(&w, .{ .max_message_size = 262144 }, "a=max-message-size:262144\r\n");
+    try expectWrite(&w, .{ .sctp_port = 5000 }, "a=sctp-port:5000\r\n");
     try expectWrite(&w, .{ .direction = "sendrecv" }, "a=sendrecv\r\n");
     try expectWrite(&w, .{ .mid = "audio" }, "a=mid:audio\r\n");
     try expectWrite(&w, .{ .setup = .actpass }, "a=setup:actpass\r\n");
