@@ -41,6 +41,8 @@ pub const AgentConfig = struct {
     disconnected_timeout: u32 = 5000,
     /// Timeout in milliseconds before the agent considers the connection failed.
     failed_timeout: u32 = 25000,
+    /// Filter which network types (IP address families) the agent gathers candidates for.
+    network_types: ice.NetworkTypes = .{},
 };
 
 const Channel = union(enum) {
@@ -124,6 +126,7 @@ const InnerEvent = union(enum) {
 // Timeouts config
 disconnected_timeout: u32,
 failed_timeout: u32,
+network_types: ice.NetworkTypes,
 
 io: Io,
 core: Core,
@@ -166,6 +169,7 @@ pub fn init(io: Io, allocator: Allocator, config: AgentConfig) !Agent {
     return .{
         .disconnected_timeout = config.disconnected_timeout,
         .failed_timeout = config.failed_timeout,
+        .network_types = config.network_types,
         .io = io,
         .core = .init(allocator, config.role, credens, randomNumber(u64, io)),
         .ice_servers = config.ice_servers,
@@ -395,7 +399,7 @@ fn failConnection(agent: *Agent) void {
 fn gatherLocalHostsAndInitSockets(agent: *Agent) !bool {
     const allocator = agent.core.allocator;
 
-    var it: IfIterator = try .init(allocator);
+    var it: IfIterator = try .init(allocator, agent.network_types);
     defer it.deinit(allocator);
     errdefer for (agent.sockets.items) |*socket| socket.close(agent.io);
 
@@ -449,7 +453,10 @@ fn doGatherServerReflexiveCandidates(agent: *Agent, has_ipv6: bool) !void {
 
         while (q.getOne(io)) |result| switch (result) {
             .address => |addr| {
-                if (!has_ipv6 and std.meta.activeTag(addr) == .ip6) continue;
+                switch (addr) {
+                    .ip4 => if (!agent.network_types.udp4) continue,
+                    .ip6 => if (!has_ipv6) continue,
+                }
                 try grp.concurrent(io, sendBindingRequest, .{ agent, addr });
                 if (parsed.scheme == .turn) {
                     try grp.concurrent(io, trunAllocate, .{ agent, addr, ice_server.username, ice_server.credential });

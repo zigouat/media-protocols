@@ -37,6 +37,13 @@ pub const GatheringState = enum {
     complete,
 };
 
+/// NetworkTypes filters which IP address families the agent gathers candidates for.
+pub const NetworkTypes = packed struct(u8) {
+    udp4: bool = true,
+    udp6: bool = true,
+    _pad: u6 = 0,
+};
+
 /// Role represents the role of the ICE agent in the ICE negotiation process.
 pub const Role = enum {
     /// The ICE agent is in the controlling role, responsible for making the decision about the final candidate pair to use
