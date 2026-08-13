@@ -91,8 +91,8 @@ pub fn init(allocator: std.mem.Allocator) !IfIterator {
 
 pub fn next(it: *IfIterator) ?std.Io.net.IpAddress {
     return switch (os.tag) {
-        .windows => it.nextWindowsInterface(),
-        else => it.nextInterafaceIpAddress(),
+        .windows => it.nextWindowsInterfaceAddress(),
+        else => it.nextPosixInterfaceAddress(),
     };
 }
 
@@ -103,7 +103,7 @@ pub fn deinit(iterator: *IfIterator, allocator: std.mem.Allocator) void {
     }
 }
 
-fn nextInterafaceIpAddress(it: *IfIterator) ?std.Io.net.IpAddress {
+fn nextPosixInterfaceAddress(it: *IfIterator) ?std.Io.net.IpAddress {
     while (it.ifa) |ifa| {
         defer it.ifa = ifa.*.next;
         if (ifa.*.addr == null) continue;
@@ -116,6 +116,14 @@ fn nextInterafaceIpAddress(it: *IfIterator) ?std.Io.net.IpAddress {
                 const in: posix.sockaddr.in = @bitCast(sockaddr);
                 return .{ .ip4 = .{ .bytes = std.mem.toBytes(in.addr), .port = 0 } };
             },
+            posix.AF.INET6 => {
+                if (ifa.*.flags & IFF_LOOPBACK != 0) continue;
+
+                const in6: *posix.sockaddr.in6 = @ptrCast(@alignCast(ifa.*.addr));
+                const result = std.Io.net.IpAddress{ .ip6 = .{ .bytes = std.mem.toBytes(in6.addr), .port = 0 } };
+                if (result.ip6.isLinkLocal()) continue;
+                return result;
+            },
             else => {},
         }
     }
@@ -123,7 +131,7 @@ fn nextInterafaceIpAddress(it: *IfIterator) ?std.Io.net.IpAddress {
     return null;
 }
 
-fn nextWindowsInterface(it: *IfIterator) ?std.Io.net.IpAddress {
+fn nextWindowsInterfaceAddress(it: *IfIterator) ?std.Io.net.IpAddress {
     while (it.ifa != null) {
         if (it.ifa.*.if_type == IF_TYPE_SOFTWARE_LOOPBACK) {
             it.ifa = it.ifa.*.next;
@@ -142,6 +150,12 @@ fn nextWindowsInterface(it: *IfIterator) ?std.Io.net.IpAddress {
                 windows.ws2_32.AF.INET => {
                     const in: posix.sockaddr.in = @bitCast(sockaddr);
                     return .{ .ip4 = .{ .bytes = std.mem.toBytes(in.addr), .port = 0 } };
+                },
+                windows.ws2_32.AF.INET6 => {
+                    const in6: posix.sockaddr.in6 = @bitCast(sockaddr);
+                    const addr = std.Io.net.IpAddress{ .ip6 = .{ .bytes = std.mem.toBytes(in6.addr), .port = 0 } };
+                    if (addr.ip6.isLinkLocal()) continue;
+                    return addr;
                 },
                 else => {},
             }

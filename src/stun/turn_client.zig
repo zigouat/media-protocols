@@ -369,6 +369,7 @@ fn sendAllocateRequest(client: *Client, io: Io, buffer: []u8, authenticated: boo
     var w = stun.Writer.init(buffer, .{ .password = if (authenticated) client.key else null });
     try writeHeader(&w, .request, .allocate, tx_id);
     try w.writeAttribute(.{ .requested_transport = .udp });
+    try w.writeAttribute(.{ .requested_address_family = std.meta.activeTag(client.socket.address) });
 
     if (authenticated) {
         try w.writeAttributes(&.{
@@ -567,8 +568,8 @@ fn parseAllocation(client: *Client, msg: *const stun.Message) !AllocationResult 
 
     var it = msg.iterateAttributes(client.key);
     while (try it.next()) |attr| switch (attr) {
-        .xor_relayed_address => relayed_address = attr.xor_relayed_address,
-        .xor_mapped_address => mapped_address = attr.xor_mapped_address,
+        .xor_relayed_address => |addr| relayed_address = addr,
+        .xor_mapped_address => |addr| mapped_address = addr,
         .lifetime => lifetime = attr.lifetime,
         .error_code => code = attr.error_code.code,
         else => {},

@@ -327,10 +327,10 @@ pub fn connectionState(agent: *const Agent) ice.ConnectionState {
 /// available to listen on.
 pub fn gatherCandidates(agent: *Agent) !void {
     try agent.putInQueue(.{ .gathering_state = .gathering });
-    try agent.gatherLocalHostsAndInitSockets();
+    const has_ipv6 = try agent.gatherLocalHostsAndInitSockets();
 
     if (agent.ice_servers.len != 0) {
-        try agent.group.concurrent(agent.io, gatherServerReflexiveCandidates, .{agent});
+        try agent.group.concurrent(agent.io, gatherServerReflexiveCandidates, .{ agent, has_ipv6 });
     } else {
         try agent.queue.putOne(agent.io, .{ .candidate = null });
         try agent.putInQueue(.{ .gathering_state = .complete });
@@ -392,30 +392,35 @@ fn failConnection(agent: *Agent) void {
     _ = agent.buffer_pool.reset(allocator, .free_all);
 }
 
-fn gatherLocalHostsAndInitSockets(agent: *Agent) !void {
+fn gatherLocalHostsAndInitSockets(agent: *Agent) !bool {
     const allocator = agent.core.allocator;
 
     var it: IfIterator = try .init(allocator);
     defer it.deinit(allocator);
     errdefer for (agent.sockets.items) |*socket| socket.close(agent.io);
 
+    var has_ipv6 = false;
+
     while (it.next()) |addr| {
         const socket = addr.bind(agent.io, .{ .mode = .dgram }) catch |err| {
             Logger.warn("Could not bind address {f}: {}", .{ addr, err });
             continue;
         };
+        has_ipv6 |= std.meta.activeTag(addr) == .ip6;
         try agent.putInQueue(.{ .candidate = .{ .host = socket } });
     }
+
+    return has_ipv6;
 }
 
-fn gatherServerReflexiveCandidates(agent: *Agent) Io.Cancelable!void {
-    agent.doGatherServerReflexiveCandidates() catch |err| switch (err) {
+fn gatherServerReflexiveCandidates(agent: *Agent, has_ipv6: bool) Io.Cancelable!void {
+    agent.doGatherServerReflexiveCandidates(has_ipv6) catch |err| switch (err) {
         error.Canceled => return error.Canceled,
         else => {},
     };
 }
 
-fn doGatherServerReflexiveCandidates(agent: *Agent) !void {
+fn doGatherServerReflexiveCandidates(agent: *Agent, has_ipv6: bool) !void {
     const io = agent.io;
 
     var grp: Io.Group = .init;
@@ -444,7 +449,7 @@ fn doGatherServerReflexiveCandidates(agent: *Agent) !void {
 
         while (q.getOne(io)) |result| switch (result) {
             .address => |addr| {
-                if (std.meta.activeTag(addr) == .ip6) continue;
+                if (!has_ipv6 and std.meta.activeTag(addr) == .ip6) continue;
                 try grp.concurrent(io, sendBindingRequest, .{ agent, addr });
                 if (parsed.scheme == .turn) {
                     try grp.concurrent(io, trunAllocate, .{ agent, addr, ice_server.username, ice_server.credential });
@@ -460,10 +465,12 @@ fn doGatherServerReflexiveCandidates(agent: *Agent) !void {
 }
 
 fn sendBindingRequest(agent: *Agent, dest: IpAddress) !void {
-    const socket = (IpAddress{ .ip4 = .unspecified(0) }).bind(
-        agent.io,
-        .{ .mode = .dgram },
-    ) catch return;
+    const src = switch (dest) {
+        .ip4 => IpAddress{ .ip4 = .unspecified(0) },
+        .ip6 => IpAddress{ .ip6 = .unspecified(0) },
+    };
+
+    const socket = src.bind(agent.io, .{ .mode = .dgram }) catch return;
     errdefer socket.close(agent.io);
 
     const tx_id: u96 = randomNumber(u96, agent.io);
@@ -516,7 +523,11 @@ fn doTrunAllocate(agent: *Agent, dest: IpAddress, username: []const u8, pass: []
     const allocator = agent.core.allocator;
 
     const client: *stun.TurnClient = blk: {
-        const socket = try (IpAddress{ .ip4 = .unspecified(0) }).bind(io, .{ .mode = .dgram });
+        const addr = switch (dest) {
+            .ip4 => IpAddress{ .ip4 = .unspecified(0) },
+            .ip6 => IpAddress{ .ip6 = .unspecified(0) },
+        };
+        const socket = try addr.bind(io, .{ .mode = .dgram, .protocol = .udp });
         errdefer socket.close(io);
 
         const client = try allocator.create(stun.TurnClient);
@@ -537,8 +548,10 @@ fn doTrunAllocate(agent: *Agent, dest: IpAddress, username: []const u8, pass: []
     const buffer = try agent.createPacket();
     defer agent.destroyPacket(buffer);
 
-    Logger.debug("Create allocation: {f}", .{dest});
-    _ = try client.createAllocation(io, buffer);
+    Logger.debug("Create turn allocation: {f}", .{dest});
+    const alloc = try client.createAllocation(io, buffer);
+    if (std.meta.activeTag(alloc.relayed_address) != std.meta.activeTag(client.socket.address))
+        return error.MismatchedAddressFamily;
     try agent.putInQueue(.{ .candidate = .{ .relay = client } });
 }
 

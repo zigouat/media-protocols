@@ -186,6 +186,7 @@ pub fn addRemoteCandidate(core: *Core, remote_candidate: Candidate) std.mem.Allo
     const remote_idx = core.remote_candidates.items.len - 1;
 
     outer_loop: for (core.candidates.items, 0..) |candidate, local_idx| {
+        if (std.meta.activeTag(remote_candidate.address) != std.meta.activeTag(candidate.base)) continue;
         for (core.pairs.items) |*pair| {
             const local = core.getPairLocal(pair);
             const remote = core.getPairRemote(pair);
@@ -209,6 +210,8 @@ pub fn addLocalCandidate(core: *Core, candidate: Candidate) std.mem.Allocator.Er
     const idx = core.candidates.items.len - 1;
 
     outer_loop: for (core.remote_candidates.items, 0..) |remote_candidate, remote_idx| {
+        if (std.meta.activeTag(remote_candidate.address) != std.meta.activeTag(candidate.base)) continue;
+
         for (core.pairs.items) |*pair| {
             const local = core.getPairLocal(pair);
             const remote = core.getPairRemote(pair);
@@ -716,6 +719,32 @@ test "addRemoteCandidate: forms pairs with existing local candidates" {
 
     try core.addRemoteCandidate(Candidate.initHost(remote));
     try testing.expectEqual(2, core.pairs.items.len);
+}
+
+test "addRemoteCandidate: skips pairing across differing address families" {
+    var core = try testNewCore(.controlling);
+    defer core.deinit();
+
+    _ = try core.addHostCandidate(try IpAddress.parse("10.0.0.1", 2000));
+
+    try core.addRemoteCandidate(Candidate.initHost(try IpAddress.parse("2001:db8::10", 1000)));
+    try testing.expectEqual(0, core.pairs.items.len);
+
+    try core.addRemoteCandidate(Candidate.initHost(try IpAddress.parse("192.168.1.10", 1001)));
+    try testing.expectEqual(1, core.pairs.items.len);
+}
+
+test "addLocalCandidate: skips pairing across differing address families" {
+    var core = try testNewCore(.controlling);
+    defer core.deinit();
+
+    try core.addRemoteCandidate(Candidate.initHost(try IpAddress.parse("192.168.1.10", 1000)));
+
+    _ = try core.addHostCandidate(try IpAddress.parse("2001:db8::1", 2000));
+    try testing.expectEqual(0, core.pairs.items.len);
+
+    _ = try core.addHostCandidate(try IpAddress.parse("10.0.0.1", 2001));
+    try testing.expectEqual(1, core.pairs.items.len);
 }
 
 test "addLocalCandidate: reports whether the candidate was added" {
