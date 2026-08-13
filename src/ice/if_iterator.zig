@@ -3,6 +3,7 @@ const os = @import("builtin").os;
 
 const windows = std.os.windows;
 const posix = std.posix;
+const NetworkTypes = @import("ice.zig").NetworkTypes;
 const IfIterator = @This();
 
 const IFF_LOOPBACK: u32 = 8;
@@ -60,9 +61,10 @@ const IfAddrs = switch (os.tag) {
 ifa: [*c]IfAddrs,
 head: [*c]IfAddrs,
 buffer: []u8,
+network_types: NetworkTypes,
 
-pub fn init(allocator: std.mem.Allocator) !IfIterator {
-    var it: IfIterator = .{ .ifa = undefined, .head = undefined, .buffer = &.{} };
+pub fn init(allocator: std.mem.Allocator, network_types: NetworkTypes) !IfIterator {
+    var it: IfIterator = .{ .ifa = undefined, .head = undefined, .buffer = &.{}, .network_types = network_types };
     return switch (os.tag) {
         .windows => blk: {
             var size: windows.ULONG = 16 * 1024;
@@ -111,12 +113,14 @@ fn nextPosixInterfaceAddress(it: *IfIterator) ?std.Io.net.IpAddress {
         const sockaddr = ifa.*.addr.*;
         switch (sockaddr.family) {
             posix.AF.INET => {
+                if (!it.network_types.udp4) continue;
                 if (ifa.*.flags & IFF_LOOPBACK != 0) continue;
 
                 const in: posix.sockaddr.in = @bitCast(sockaddr);
                 return .{ .ip4 = .{ .bytes = std.mem.toBytes(in.addr), .port = 0 } };
             },
             posix.AF.INET6 => {
+                if (!it.network_types.udp6) continue;
                 if (ifa.*.flags & IFF_LOOPBACK != 0) continue;
 
                 const in6: *posix.sockaddr.in6 = @ptrCast(@alignCast(ifa.*.addr));
@@ -148,10 +152,12 @@ fn nextWindowsInterfaceAddress(it: *IfIterator) ?std.Io.net.IpAddress {
             const sockaddr = unicast.*.address.sockaddr;
             switch (sockaddr.*.family) {
                 windows.ws2_32.AF.INET => {
+                    if (!it.network_types.udp4) continue;
                     const in: posix.sockaddr.in = @bitCast(sockaddr.*);
                     return .{ .ip4 = .{ .bytes = std.mem.toBytes(in.addr), .port = 0 } };
                 },
                 windows.ws2_32.AF.INET6 => {
+                    if (!it.network_types.udp6) continue;
                     const in6: *posix.sockaddr.in6 = @ptrCast(@alignCast(sockaddr));
                     const addr = std.Io.net.IpAddress{ .ip6 = .{ .bytes = std.mem.toBytes(in6.addr), .port = 0 } };
                     if (addr.ip6.isLinkLocal()) continue;
