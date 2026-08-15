@@ -5,6 +5,7 @@ const Io = std.Io;
 
 pub const pli_size = 8;
 
+/// Describes a payload specific feedback (PSFB) packet for Negative Acknowledgment (NACK) as defined in RFC 4585.
 pub const Nack = struct {
     sender_ssrc: u32,
     media_ssrc: u32,
@@ -44,6 +45,47 @@ pub const Nack = struct {
             it.blp = std.mem.readInt(u16, it.fci[2..4], .big);
             it.fci = it.fci[4..];
             return it.pid;
+        }
+    };
+
+    pub const Writer = struct {
+        w: Io.Writer,
+        pid: u16,
+        blp: u16,
+
+        pub fn init(buffer: []u8, sender_ssrc: u32, media_ssrc: u32) !Writer {
+            var writer = Io.Writer.fixed(buffer);
+            try writer.writeInt(u32, sender_ssrc, .big);
+            try writer.writeInt(u32, media_ssrc, .big);
+            return Writer{ .w = writer, .pid = 0, .blp = 0 };
+        }
+
+        pub fn writeSequenceNumber(self: *Writer, seq_num: u16) !void {
+            if (self.w.end == 8) {
+                try self.w.writeInt(u16, seq_num, .big);
+                self.pid = seq_num;
+                return;
+            }
+
+            std.debug.assert(seq_num > self.pid);
+            const diff = seq_num - self.pid;
+
+            if (diff <= 16) {
+                self.blp |= @as(u16, 1) << @intCast(diff - 1);
+            } else {
+                try self.w.writeInt(u16, self.blp, .big);
+                try self.w.writeInt(u16, seq_num, .big);
+                self.pid = seq_num;
+                self.blp = 0;
+            }
+        }
+
+        pub fn finalize(self: *Writer) ![]const u8 {
+            if (self.w.end > 8) {
+                try self.w.writeInt(u16, self.blp, .big);
+            }
+
+            return self.w.buffered();
         }
     };
 };
@@ -97,7 +139,7 @@ pub const AFB = struct {
     }
 };
 
-test "Nack: decode" {
+test "NACK: decode" {
     const data = [_]u8{ 0, 1, 225, 185, 0, 1, 182, 103, 0, 100, 144, 4, 0, 117, 0, 128, 0, 153, 0, 0 };
     const fb = try Nack.decode(&data);
 
@@ -112,6 +154,8 @@ test "NACK: iterate sequence numbers" {
     const fb = try Nack.decode(&data);
     var it = fb.iterateSequenceNumbers();
 
+    std.debug.print("{} - {}\n", .{ fb.sender_ssrc, fb.media_ssrc });
+
     try std.testing.expectEqual(100, it.next().?);
     try std.testing.expectEqual(103, it.next().?);
     try std.testing.expectEqual(113, it.next().?);
@@ -122,6 +166,17 @@ test "NACK: iterate sequence numbers" {
     try std.testing.expectEqual(169, it.next().?);
     try std.testing.expectEqual(400, it.next().?);
     try std.testing.expect(it.next() == null);
+}
+
+test "NACK: write sequence numbers" {
+    const sequence_numbers = [_]u16{ 100, 103, 113, 116, 117, 125, 153, 169, 400 };
+    const data = [_]u8{ 0, 1, 225, 185, 0, 1, 182, 103, 0, 100, 144, 4, 0, 117, 0, 128, 0, 153, 128, 0, 1, 144, 0, 0 };
+
+    var buffer: [128]u8 = undefined;
+    var w = try Nack.Writer.init(&buffer, 123321, 112231);
+
+    for (&sequence_numbers) |seq| try w.writeSequenceNumber(seq);
+    try std.testing.expectEqualSlices(u8, &data, try w.finalize());
 }
 
 test "PLI: decode" {
