@@ -12,7 +12,7 @@ pub const Nack = struct {
     fci: []const u8,
 
     pub fn decode(data: []const u8) rtcp.Error!Nack {
-        if (data.len < 12 or @rem(data.len, 4) != 0) return error.MalformedPacket;
+        if (data.len < 8 or @rem(data.len, 4) != 0) return error.MalformedPacket;
         const sender_ssrc = std.mem.readInt(u32, data[0..4], .big);
         const source_ssrc = std.mem.readInt(u32, data[4..8], .big);
 
@@ -165,6 +165,13 @@ test "NACK: iterate sequence numbers" {
     try std.testing.expectEqual(153, it.next().?);
     try std.testing.expectEqual(169, it.next().?);
     try std.testing.expectEqual(400, it.next().?);
+    try std.testing.expect(it.next() == null);
+}
+
+test "NACK: iterate sequence numbers (empty list)" {
+    const data = [_]u8{ 0, 1, 225, 185, 0, 1, 182, 103 };
+    const fb = try Nack.decode(&data);
+    var it = fb.iterateSequenceNumbers();
     try std.testing.expect(it.next() == null);
 }
 
