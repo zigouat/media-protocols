@@ -939,8 +939,6 @@ fn testNewAgent() !Agent {
 fn onEvent(userdata: ?*anyopaque, agent: *Agent, event: Event) void {
     const close_event: *Io.Event = @ptrCast(@alignCast(userdata.?));
 
-    std.debug.print("{any}\n", .{event});
-
     switch (event) {
         .connection_state => |state| switch (state) {
             .closed => close_event.set(agent.io),
@@ -994,7 +992,6 @@ test "close" {
     const closeAgent = struct {
         pub fn close(a: *Agent) !void {
             try a.io.sleep(.fromMilliseconds(100), .awake);
-            std.debug.print("Close agent\n", .{});
             a.close();
         }
     }.close;
