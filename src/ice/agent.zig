@@ -196,7 +196,12 @@ pub fn poll(agent: *Agent) !Event {
             if (c) |candidate| switch (candidate) {
                 .host => |socket| {
                     errdefer socket.close(io);
-                    if (try agent.core.addHostCandidate(socket.address)) |host_candidate| {
+                    const maybe_host_candidate = blk: {
+                        agent.mutex.lockUncancelable(io);
+                        defer agent.mutex.unlock(io);
+                        break :blk try agent.core.addHostCandidate(socket.address);
+                    };
+                    if (maybe_host_candidate) |host_candidate| {
                         try agent.sockets.append(agent.core.allocator, socket);
                         try agent.group.concurrent(io, receive, .{ agent, socket });
                         return .{ .candidate = host_candidate };
@@ -205,9 +210,10 @@ pub fn poll(agent: *Agent) !Event {
                 .srflx => |srflx| {
                     const socket, const addr = srflx;
                     errdefer socket.close(io);
-                    const added = agent.core.addServerReflexiveCandidate(socket.address, addr) catch {
-                        socket.close(io);
-                        continue;
+                    const added = blk: {
+                        agent.mutex.lockUncancelable(io);
+                        defer agent.mutex.unlock(io);
+                        break :blk agent.core.addServerReflexiveCandidate(socket.address, addr) catch break :blk null;
                     };
                     if (added == null) {
                         socket.close(io);
@@ -223,7 +229,12 @@ pub fn poll(agent: *Agent) !Event {
                         agent.core.allocator.destroy(client);
                     }
                     const relay_c = Candidate.initRelay(client.socket.address, client.allocation.?.relayed_address);
-                    if (try agent.core.addLocalCandidate(relay_c)) {
+                    const added = blk: {
+                        agent.mutex.lockUncancelable(io);
+                        defer agent.mutex.unlock(io);
+                        break :blk try agent.core.addLocalCandidate(relay_c);
+                    };
+                    if (added) {
                         try agent.relay_clients.append(agent.core.allocator, client);
                         return .{ .candidate = relay_c };
                     } else {
@@ -837,7 +848,11 @@ fn handleConnectivityCheckMessage(agent: *Agent, message: Message) !?Event {
                 try message.channel.send(agent, &sender, resp);
             },
             .success_response => {
-                try agent.core.handleSuccessResponse(&msg, message.channel.address(), sender);
+                {
+                    agent.mutex.lockUncancelable(agent.io);
+                    defer agent.mutex.unlock(agent.io);
+                    try agent.core.handleSuccessResponse(&msg, message.channel.address(), sender);
+                }
                 if (agent.core.detectNominatedPair() != null) agent.nominated_channel = message.channel;
             },
             else => {},
