@@ -154,8 +154,6 @@ test "NACK: iterate sequence numbers" {
     const fb = try Nack.decode(&data);
     var it = fb.iterateSequenceNumbers();
 
-    std.debug.print("{} - {}\n", .{ fb.sender_ssrc, fb.media_ssrc });
-
     try std.testing.expectEqual(100, it.next().?);
     try std.testing.expectEqual(103, it.next().?);
     try std.testing.expectEqual(113, it.next().?);
