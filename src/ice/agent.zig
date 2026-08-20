@@ -400,17 +400,17 @@ fn poll(agent: *Agent) !void {
 }
 
 fn closeConnection(agent: *Agent) void {
+    agent.group.cancel(agent.io);
     agent.failConnection();
 
     agent.core.allocator.free(agent.queue_buffer);
     agent.queue_buffer = &.{};
     agent.queue.close(agent.io);
+    _ = agent.buffer_pool.reset(agent.core.allocator, .free_all);
 }
 
 fn failConnection(agent: *Agent) void {
     const allocator = agent.core.allocator;
-
-    agent.group.cancel(agent.io);
     agent.sockets.clearAndFree(allocator);
 
     for (agent.relay_clients.items) |client| {
@@ -418,7 +418,6 @@ fn failConnection(agent: *Agent) void {
         allocator.destroy(client);
     }
     agent.relay_clients.clearAndFree(allocator);
-    _ = agent.buffer_pool.reset(allocator, .free_all);
 }
 
 fn gatherLocalHostsAndInitSockets(agent: *Agent) !bool {
@@ -598,8 +597,7 @@ fn doRelayReceive(agent: *Agent, client: *stun.TurnClient, io: Io) !void {
     while (true) {
         switch (agent.core.connection_state) {
             .completed => {
-                if (agent.isNominatedChannel(.{ .relay = client }))
-                    try agent.group.concurrent(io, receiveAppData, .{ agent, Channel{ .relay = client } });
+                if (agent.isNominatedChannel(.{ .relay = client })) break;
                 return;
             },
             .failed, .closed => return,
@@ -623,6 +621,8 @@ fn doRelayReceive(agent: *Agent, client: *stun.TurnClient, io: Io) !void {
             },
         });
     }
+
+    try agent.receiveAppData(.{ .relay = client });
 }
 
 fn randomNumber(T: type, io: Io) T {
@@ -703,22 +703,15 @@ fn receive(agent: *Agent, socket: Socket) !void {
 fn doReceive(agent: *Agent, socket: *const Socket) !void {
     const io = agent.io;
     const timeout: Io.Timeout = .{ .duration = .{ .clock = .awake, .raw = .fromSeconds(2) } };
-    errdefer socket.close(io);
+    defer socket.close(io);
 
     while (true) {
         switch (agent.core.connection_state) {
             .completed => {
-                if (agent.isNominatedChannel(.{ .socket = socket.* }))
-                    break
-                    // try agent.group.concurrent(io, receiveAppData, .{ agent, Channel{ .socket = socket.* } })
-                else
-                    socket.close(io);
+                if (agent.isNominatedChannel(.{ .socket = socket.* })) break;
                 return;
             },
-            .failed, .closed => {
-                socket.close(io);
-                return;
-            },
+            .failed, .closed => return,
             else => {},
         }
 
@@ -743,7 +736,6 @@ fn doReceive(agent: *Agent, socket: *const Socket) !void {
 
 fn receiveAppData(agent: *Agent, channel: Channel) !void {
     var timeout: Io.Timeout = .{ .duration = .{ .clock = .awake, .raw = .fromMilliseconds(agent.disconnected_timeout) } };
-    defer channel.close(agent.io);
 
     while (true) {
         const buffer = agent.createPacket() catch return;
