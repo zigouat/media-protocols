@@ -154,7 +154,10 @@ pub const Candidate = struct {
     pub fn parse(value: []const u8) !Candidate {
         var it = std.mem.tokenizeScalar(u8, value, ' ');
 
-        const foundation = try std.fmt.parseUnsigned(u32, try nextToken(it.next()), 10);
+        const foundation = blk: {
+            const token = try nextToken(it.next());
+            break :blk std.fmt.parseInt(u32, token, 10) catch std.hash.Crc32.hash(token);
+        };
         const component = try std.fmt.parseUnsigned(u8, try nextToken(it.next()), 10);
 
         const transport_str = try nextToken(it.next());
