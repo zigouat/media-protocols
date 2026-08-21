@@ -44,6 +44,9 @@ pub const AgentConfig = struct {
     /// Filter which network types (IP address families) the agent gathers candidates for.
     network_types: ice.NetworkTypes = .{},
     userdata: ?*anyopaque = null,
+    /// Callback function to be called when the agent receives data from the remote peer.
+    ///
+    /// The data is owned by the agent and the buffer is invalidated after the callback returns.
     on_data: *const fn (?*anyopaque, *Agent, []const u8) Io.Cancelable!void,
     on_event: *const fn (?*anyopaque, *Agent, Event) Io.Cancelable!void,
 };
@@ -122,6 +125,7 @@ const InnerEvent = union(enum) {
     connection_state: ice.ConnectionState,
     gathering_state: ice.GatheringState,
     role: ice.Role,
+    close: void,
 };
 
 // Timeouts config
@@ -138,6 +142,7 @@ relay_clients: std.ArrayList(*stun.TurnClient) = .empty,
 
 mutex: Io.Mutex = .init,
 group: Io.Group = .init,
+poll_group: Io.Group = .init,
 started: bool = false,
 queue_buffer: []InnerEvent,
 queue: Io.Queue(InnerEvent),
@@ -169,7 +174,7 @@ pub fn init(io: Io, allocator: Allocator, config: AgentConfig) !Agent {
             ice.Credentials.generate(io, allocator);
     errdefer credens.deinit(allocator);
 
-    const queue_buffer = try allocator.alloc(InnerEvent, 16);
+    const queue_buffer = try allocator.alloc(InnerEvent, 8);
     errdefer allocator.free(queue_buffer);
 
     return .{
@@ -189,6 +194,7 @@ pub fn init(io: Io, allocator: Allocator, config: AgentConfig) !Agent {
 }
 
 pub fn deinit(agent: *Agent) void {
+    agent.poll_group.cancel(agent.io);
     agent.closeConnection();
     agent.core.deinit();
     agent.buffer_pool.deinit(agent.core.allocator);
@@ -295,9 +301,7 @@ pub fn destroyPacket(agent: *Agent, data: []const u8) void {
 /// This function will only enqueue an event that'll be handled
 /// by the inner queue. The user will get connection state update.
 pub fn close(agent: *Agent) void {
-    agent.setConnectionState(.closed);
-    agent.closeConnection();
-    agent.on_event(agent.userdata, agent, .{ .connection_state = .closed }) catch {};
+    agent.putInQueue(.close) catch {};
 }
 
 fn ensureStarted(agent: *Agent) !void {
@@ -305,7 +309,7 @@ fn ensureStarted(agent: *Agent) !void {
     defer agent.mutex.unlock(agent.io);
     if (agent.started) return;
     agent.started = true;
-    try agent.group.concurrent(agent.io, struct {
+    try agent.poll_group.concurrent(agent.io, struct {
         fn poll(a: *Agent) !void {
             a.poll() catch |err| switch (err) {
                 error.Canceled => return error.Canceled,
@@ -373,6 +377,7 @@ fn poll(agent: *Agent) !void {
         .remote_candidate => |candidate| try agent.core.addRemoteCandidate(candidate),
         .connectivity_check => agent.batchSendConnectivityCheck() catch |err| logError("connectivity check failed due to {}", .{err}),
         .message => |message| {
+            defer agent.destroyPacket(message.incoming_message.data);
             const maybe_event = agent.handleConnectivityCheckMessage(message) catch |err| switch (err) {
                 error.Canceled => return error.Canceled,
                 error.SwitchRole => {
@@ -404,6 +409,12 @@ fn poll(agent: *Agent) !void {
             try agent.on_event(agent.userdata, agent, .{ .connection_state = .completed });
         },
         .role => |r| if (agent.core.role != r) agent.core.toggleRole(agent.core.tie_breaker),
+        .close => {
+            agent.closeConnection();
+            agent.setConnectionState(.closed);
+            try agent.on_event(agent.userdata, agent, .{ .connection_state = .closed });
+            break;
+        },
     } else |err| return err;
 }
 
@@ -744,27 +755,26 @@ fn doReceive(agent: *Agent, socket: *const Socket) !void {
 
 fn receiveAppData(agent: *Agent, channel: Channel) !void {
     var timeout: Io.Timeout = .{ .duration = .{ .clock = .awake, .raw = .fromMilliseconds(agent.disconnected_timeout) } };
+    const buffer = agent.createPacket() catch {
+        try agent.putInQueue(.close);
+        return;
+    };
+    defer agent.destroyPacket(buffer);
 
     while (true) {
-        const buffer = agent.createPacket() catch return;
-
-        const from, const data = channel.receiveTimeout(agent.io, buffer, timeout) catch |err| {
-            agent.destroyPacket(buffer);
-
-            switch (err) {
-                error.Timeout => {
-                    const new_state = agent.core.onConsentTimeout() orelse return;
-                    try agent.putInQueue(.{ .connection_state = new_state });
-                    if (new_state != .disconnected) return; // .failed
-                    timeout.duration.raw = .fromMilliseconds(agent.failed_timeout);
-                    continue;
-                },
-                error.Canceled => return error.Canceled,
-                else => |e| {
-                    logError("Error when listening: {}", .{e});
-                    return;
-                },
-            }
+        const from, const data = channel.receiveTimeout(agent.io, buffer, timeout) catch |err| switch (err) {
+            error.Timeout => {
+                const new_state = agent.core.onConsentTimeout() orelse return;
+                try agent.putInQueue(.{ .connection_state = new_state });
+                if (new_state != .disconnected) return; // .failed
+                timeout.duration.raw = .fromMilliseconds(agent.failed_timeout);
+                continue;
+            },
+            error.Canceled => return error.Canceled,
+            else => |e| {
+                logError("Error when listening: {}", .{e});
+                return;
+            },
         };
 
         if (agent.core.connection_state == .disconnected) {
@@ -775,9 +785,9 @@ fn receiveAppData(agent: *Agent, channel: Channel) !void {
         }
 
         if (stun.isMessage(data)) {
-            defer agent.destroyPacket(data);
             agent.handleConsentFreshness(&from, data) catch continue;
         } else {
+            @branchHint(.likely);
             try agent.on_data(agent.userdata, agent, data);
         }
     }
@@ -844,7 +854,6 @@ fn handleConnectivityCheckMessage(agent: *Agent, message: Message) !?Event {
     const sender = message.incoming_message.from;
 
     if (stun.isMessage(data)) {
-        defer agent.destroyPacket(data);
         switch (agent.core.connection_state) {
             .completed, .failed, .closed => return null, // sockets are closed
             else => {},
@@ -892,7 +901,6 @@ fn handleConnectivityCheckMessage(agent: *Agent, message: Message) !?Event {
                     const remote = &agent.core.remote_candidates.items[candidate_pair.remote];
                     if (remote.address.eql(&sender)) return .{ .data = data };
                 } else {
-                    agent.destroyPacket(data);
                     Logger.warn("Drop non stun message from unknown remote candidate: {f}", .{sender});
                 }
             },
