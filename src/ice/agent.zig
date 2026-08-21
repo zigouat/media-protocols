@@ -138,6 +138,7 @@ relay_clients: std.ArrayList(*stun.TurnClient) = .empty,
 
 mutex: Io.Mutex = .init,
 group: Io.Group = .init,
+started: bool = false,
 queue_buffer: []InnerEvent,
 queue: Io.Queue(InnerEvent),
 nominated_channel: ?Channel = null,
@@ -193,26 +194,17 @@ pub fn deinit(agent: *Agent) void {
     agent.buffer_pool.deinit(agent.core.allocator);
 }
 
-pub fn startEventLoop(agent: *Agent) !void {
-    try agent.group.concurrent(agent.io, struct {
-        fn poll(a: *Agent) !void {
-            a.poll() catch |err| switch (err) {
-                error.Canceled => return error.Canceled,
-                else => |e| logError("Error when polling: {}", .{e}),
-            };
-        }
-    }.poll, .{agent});
-}
-
 pub fn getRole(agent: *const Agent) ice.Role {
     return agent.core.role;
 }
 
 pub fn setRole(agent: *Agent, role: ice.Role) !void {
+    try agent.ensureStarted();
     try agent.putInQueue(.{ .role = role });
 }
 
 pub fn addRemoteCandidate(agent: *Agent, remote_candidate: Candidate) !void {
+    try agent.ensureStarted();
     switch (agent.core.connection_state) {
         .new, .checking, .connected => try agent.putInQueue(.{ .remote_candidate = remote_candidate }),
         else => {},
@@ -223,6 +215,7 @@ pub fn addRemoteCandidate(agent: *Agent, remote_candidate: Candidate) !void {
 ///
 /// Calling this function will trigger connectivity checks. `gatherCandidates` should be called first.
 pub fn setRemoteCredentials(agent: *Agent, credentials: ice.Credentials) !void {
+    try agent.ensureStarted();
     switch (agent.core.connection_state) {
         .new => {
             const credens = try credentials.dupe(agent.core.allocator);
@@ -258,9 +251,9 @@ pub fn connectionState(agent: *const Agent) ice.ConnectionState {
 
 /// Start gathering candidates.
 ///
-/// This function should be called first before starting the event loop so local sockets are
-/// available to listen on.
+/// This function should be called first so local sockets are available to listen on.
 pub fn gatherCandidates(agent: *Agent) !void {
+    try agent.ensureStarted();
     try agent.putInQueue(.{ .gathering_state = .gathering });
     const has_ipv6 = try agent.gatherLocalHostsAndInitSockets();
 
@@ -305,6 +298,21 @@ pub fn close(agent: *Agent) void {
     agent.setConnectionState(.closed);
     agent.closeConnection();
     agent.on_event(agent.userdata, agent, .{ .connection_state = .closed }) catch {};
+}
+
+fn ensureStarted(agent: *Agent) !void {
+    agent.mutex.lockUncancelable(agent.io);
+    defer agent.mutex.unlock(agent.io);
+    if (agent.started) return;
+    agent.started = true;
+    try agent.group.concurrent(agent.io, struct {
+        fn poll(a: *Agent) !void {
+            a.poll() catch |err| switch (err) {
+                error.Canceled => return error.Canceled,
+                else => |e| logError("Error when polling: {}", .{e}),
+            };
+        }
+    }.poll, .{agent});
 }
 
 fn poll(agent: *Agent) !void {
@@ -988,7 +996,6 @@ test "close" {
         }
     }.close;
 
-    try agent.startEventLoop();
     try agent.gatherCandidates();
     try agent.setRemoteCredentials(.{ .username = "user", .password = "password" });
 
