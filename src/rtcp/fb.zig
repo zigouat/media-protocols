@@ -67,8 +67,8 @@ pub const Nack = struct {
                 return;
             }
 
-            std.debug.assert(seq_num > self.pid);
-            const diff = seq_num - self.pid;
+            const diff = seq_num -% self.pid;
+            std.debug.assert(diff != 0);
 
             if (diff <= 16) {
                 self.blp |= @as(u16, 1) << @intCast(diff - 1);
@@ -182,6 +182,21 @@ test "NACK: write sequence numbers" {
 
     for (&sequence_numbers) |seq| try w.writeSequenceNumber(seq);
     try std.testing.expectEqualSlices(u8, &data, try w.finalize());
+}
+
+test "NACK: write sequence numbers across u16 wraparound" {
+    const sequence_numbers = [_]u16{ 65533, 65534, 65535, 0, 1, 2 };
+
+    var buffer: [128]u8 = undefined;
+    var w = try Nack.Writer.init(&buffer, 123321, 112231);
+
+    for (&sequence_numbers) |seq| try w.writeSequenceNumber(seq);
+    const data = try w.finalize();
+
+    const fb = try Nack.decode(data);
+    var it = fb.iterateSequenceNumbers();
+    for (&sequence_numbers) |expected| try std.testing.expectEqual(expected, it.next().?);
+    try std.testing.expect(it.next() == null);
 }
 
 test "PLI: decode" {
