@@ -1,5 +1,5 @@
 pub const Agent = @import("agent.zig");
-pub const Agent2 = @import("agent2.zig");
+pub const Agent2 = @import("agent2.zig").Agent;
 
 const std = @import("std");
 const Io = std.Io;

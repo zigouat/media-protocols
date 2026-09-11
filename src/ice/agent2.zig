@@ -4,12 +4,11 @@ const ice = @import("ice.zig");
 const CandidatePair = @import("candidate_pair.zig");
 const Messages = @import("messages.zig");
 
-const Agent = @This();
 const Candidate = ice.Candidate;
 const IpAddress = std.Io.net.IpAddress;
 const Logger = std.log.scoped(.ice);
 
-const NominatedPair = struct {
+pub const NominatedPair = struct {
     local: u8,
     remote: u8,
 };
@@ -56,10 +55,20 @@ fn LocalCredentials(comptime size: u8) type {
 pub const Event = union(enum) {
     connection_state: ice.ConnectionState,
     gathering_state: ice.GatheringState,
-    nominated: IpAddress,
+    nominated: NominatedPair,
     connectivity_check: void,
     consent_freshness: void,
-    candidate: u8,
+    candidate: struct { u8, u8 }, // range inclusive
+};
+
+pub const ReadResult = union(enum) {
+    app_data: []const u8,
+    consumed: void,
+};
+
+const PendingRequest = struct {
+    transaction_id: [12]u8,
+    pair: u16,
 };
 
 /// The maximum number of binding requests sent on a pair before it is
@@ -68,119 +77,6 @@ pub const max_binding_requests: usize = 7;
 pub const connectivity_check_interval: i64 = 200;
 pub const keep_alive_interval: i64 = 4 * std.time.ms_per_s;
 
-// Comptime values
-const auth_info_size: u8 = 64;
-const max_transmits: u8 = 5;
-const max_candidates: u8 = 16;
-const max_events: u8 = 15;
-const initial_pairs_capacity: usize = @as(usize, max_candidates) * max_candidates / 2; // 128
-const initial_pending_requests_capacity: usize = 16;
-
-allocator: std.mem.Allocator,
-random: std.Random,
-
-credentials: LocalCredentials(auth_info_size),
-remote_credentials: ?LocalCredentials(auth_info_size),
-connection_state: ice.ConnectionState,
-gathering_state: ice.GatheringState,
-role: ice.Role,
-tie_breaker: u64,
-
-// Candidates and sockets
-candidates: [max_candidates]Candidate = undefined,
-candidates_len: u8 = 0,
-remote_candidates: [max_candidates]RemoteCandidate = undefined,
-remote_candidates_len: u8 = 0,
-pairs: std.ArrayList(CandidatePair) = .empty,
-pending_requests: std.ArrayList(PendingRequest) = .empty,
-// This is a peer for which a use-candidate request is sent, but we didn't
-// receive response yet.
-selected_pair: ?u8 = null,
-// This the final pair selected by this agent or the remote one.
-nominated_pair: ?NominatedPair = null,
-
-failed_timeout: u32,
-disconnected_timeout: u32,
-
-connectivity_check_deadline: i64,
-disconnected_connection_deadline: i64, // used for both disconnected and failed states
-keep_alive_deadline: i64,
-
-events_out: stun.BoundedDeque(Event, max_events),
-transmits: stun.BoundedDeque(stun.TransportMessage, max_transmits),
-
-const PendingRequest = struct {
-    transaction_id: [12]u8,
-    pair: u8,
-};
-
-pub const ConnectivityChecks = struct {
-    agent: *Agent,
-    nomination_done: bool = false,
-    index: usize = 0,
-
-    pub fn next(self: *ConnectivityChecks, buffer: []u8) !?stun.TransportMessage {
-        const agent = self.agent;
-
-        if (!self.nomination_done) {
-            self.nomination_done = true;
-            if (agent.selected_pair) |selected_idx| {
-                const pair = &agent.pairs.items[selected_idx];
-                const local = agent.getPairLocal(pair);
-                const remote = agent.getPairRemote(pair);
-
-                const tx_id = agent.random.int(u96);
-                const payload = try agent.buildBindingRequest(tx_id, true, buffer);
-
-                try agent.pending_requests.append(agent.allocator, .{
-                    .transaction_id = @bitCast(tx_id),
-                    .pair = selected_idx,
-                });
-
-                return stun.TransportMessage{
-                    .data = payload,
-                    .from = &local.base,
-                    .to = &remote.address,
-                };
-            }
-        }
-
-        while (self.index < agent.pairs.items.len) {
-            const idx = self.index;
-            const pair = &agent.pairs.items[idx];
-            self.index += 1;
-            switch (pair.status) {
-                .waiting, .in_progress => {
-                    pair.conn_check_count += 1;
-                    if (pair.conn_check_count > max_binding_requests) {
-                        pair.status = .failed;
-                        continue;
-                    }
-
-                    const tx_id = agent.random.int(u96);
-                    const payload = try agent.buildBindingRequest(tx_id, false, buffer);
-                    const local = agent.getPairLocal(pair);
-                    const remote = agent.getPairRemote(pair);
-
-                    try agent.pending_requests.append(agent.allocator, .{
-                        .transaction_id = @bitCast(tx_id),
-                        .pair = @intCast(idx),
-                    });
-
-                    return stun.TransportMessage{
-                        .data = payload,
-                        .from = &local.base,
-                        .to = &remote.address,
-                    };
-                },
-                else => {},
-            }
-        }
-
-        return null;
-    }
-};
-
 pub const Config = struct {
     role: ice.Role,
     credentials: ice.Credentials,
@@ -188,477 +84,6 @@ pub const Config = struct {
     failed_timeout: u32 = 25000,
     disconnected_timeout: u32 = 5000,
 };
-
-pub fn init(allocator: std.mem.Allocator, config: Config) error{ OutOfMemory, CredentialsTooLong }!Agent {
-    var pairs: std.ArrayList(CandidatePair) = try .initCapacity(allocator, initial_pairs_capacity);
-    errdefer pairs.deinit(allocator);
-
-    var pending_requests: std.ArrayList(PendingRequest) = try .initCapacity(allocator, initial_pending_requests_capacity);
-    errdefer pending_requests.deinit(allocator);
-
-    return .{
-        .allocator = allocator,
-        .random = config.random,
-        .role = config.role,
-        .connection_state = .new,
-        .gathering_state = .new,
-        .credentials = try .init(config.credentials.username, config.credentials.password),
-        .remote_credentials = null,
-        .tie_breaker = config.random.int(u64),
-        .connectivity_check_deadline = std.math.maxInt(i64),
-        .keep_alive_deadline = std.math.maxInt(i64),
-        .disconnected_connection_deadline = std.math.maxInt(i64),
-        .failed_timeout = config.failed_timeout,
-        .disconnected_timeout = config.disconnected_timeout,
-        .events_out = .empty,
-        .transmits = .empty,
-        .pairs = pairs,
-        .pending_requests = pending_requests,
-    };
-}
-
-pub fn deinit(agent: *Agent) void {
-    agent.close();
-    agent.pairs.deinit(agent.allocator);
-    agent.pending_requests.deinit(agent.allocator);
-    agent.events_out.clear();
-    agent.transmits.clear();
-}
-
-pub fn close(core: *Agent) void {
-    core.connection_state = .closed;
-
-    core.pairs.clearAndFree(core.allocator);
-    core.pending_requests.clearAndFree(core.allocator);
-    core.candidates_len = 0;
-    core.remote_candidates_len = 0;
-}
-
-pub fn getRemoteCredentials(core: *const Agent) ?ice.Credentials {
-    return if (core.remote_credentials) |*rc| rc.toIceCredentials() else null;
-}
-
-pub fn getLocalCredentials(core: *const Agent) ice.Credentials {
-    return core.credentials.toIceCredentials();
-}
-
-pub fn getNominatedRemoteAddress(core: *const Agent) ?IpAddress {
-    return if (core.nominated_pair) |nominated| core.remote_candidates[nominated.remote].address else null;
-}
-
-pub fn addLocalAddrs(core: *Agent, addrs: []const IpAddress) !void {
-    for (addrs) |addr| {
-        const candidate = Candidate.initHost(addr);
-        if (try core.addLocalCandidate(candidate)) |idx| {
-            try core.events_out.pushBack(.{ .candidate = @intCast(idx) });
-        }
-    }
-
-    // since there's no support for stun/turn servers, we can immediately transition to the "gathering done" state
-    core.gathering_state = .complete;
-    try core.events_out.pushBack(.{ .gathering_state = core.gathering_state });
-}
-
-pub fn setRemoteCredentials(agent: *Agent, credentials: ice.Credentials, now: i64) !void {
-    agent.remote_credentials = try .init(credentials.username, credentials.password);
-    try agent.setConnectionState(.checking, now);
-}
-
-pub fn addServerReflexiveCandidate(core: *Agent, base: IpAddress, mapped: IpAddress) !?Candidate {
-    for (core.candidates[0..core.candidates_len]) |candidate|
-        if (candidate.candidate_type == .host and ipEql(&candidate.base, &mapped)) return null;
-
-    const candidate = Candidate.initServerReflexive(base, mapped);
-    return if (try core.addLocalCandidate(candidate)) |_| candidate else null;
-}
-
-pub fn handleConsentFreshness(agent: *Agent, from: *const IpAddress, message: []const u8, buffer: []u8) !?[]const u8 {
-    const msg = try stun.Message.parse(message);
-    switch (msg.header.message_type.class()) {
-        .request => {
-            _ = try Messages.parseAndValidateStunRequest(
-                &msg,
-                agent.credentials.toIceCredentials(),
-                agent.role,
-                agent.tie_breaker,
-            );
-            return try Messages.buildSuccessResponse(&msg, agent.credentials.getPassword(), from, buffer);
-        },
-        else => {},
-    }
-
-    return null;
-}
-
-pub fn addRemoteCandidate(core: *Agent, remote_candidate: Candidate) !void {
-    const remote_idx = try core.appendRemoteCandidate(remote_candidate);
-
-    outer_loop: for (core.candidates[0..core.candidates_len], 0..) |candidate, local_idx| {
-        if (std.meta.activeTag(remote_candidate.address) != std.meta.activeTag(candidate.base)) continue;
-        for (core.pairs.items) |*pair| {
-            const local = core.getPairLocal(pair);
-            const remote = core.getPairRemote(pair);
-            if (local.base.eql(&candidate.base) and remote.address.eql(&remote_candidate.address))
-                continue :outer_loop;
-        }
-
-        try core.pairs.append(core.allocator, .{
-            .local = @intCast(local_idx),
-            .remote = @intCast(remote_idx),
-            .priority = calculatePairPriority(candidate.priority, remote_candidate.priority, core.role),
-        });
-    }
-}
-
-/// Returns `false` if an identical candidate already exists.
-pub fn addLocalCandidate(core: *Agent, candidate: Candidate) !?usize {
-    for (core.candidates[0..core.candidates_len]) |*existing| if (existing.eql(&candidate)) return null;
-
-    const idx = try core.appendCandidate(candidate);
-
-    outer_loop: for (core.remote_candidates[0..core.remote_candidates_len], 0..) |remote_candidate, remote_idx| {
-        if (std.meta.activeTag(remote_candidate.address) != std.meta.activeTag(candidate.base)) continue;
-
-        for (core.pairs.items) |*pair| {
-            const local = core.getPairLocal(pair);
-            const remote = core.getPairRemote(pair);
-            if (local.base.eql(&candidate.base) and remote.address.eql(&remote_candidate.address))
-                continue :outer_loop;
-        }
-
-        try core.pairs.append(core.allocator, .{
-            .local = @intCast(idx),
-            .remote = @intCast(remote_idx),
-            .priority = calculatePairPriority(candidate.priority, remote_candidate.priority, core.role),
-        });
-    }
-
-    return idx;
-}
-
-/// Begin a connectivity-check round. Returns null when a pair is already
-/// nominated (nothing to do). Performs the controlling-side best-pair selection.
-pub fn beginConnectivityChecks(agent: *Agent) ?ConnectivityChecks {
-    if (agent.nominated_pair != null) return null;
-    if (agent.role == .controlling and agent.selected_pair == null)
-        agent.selected_pair = agent.selectBestPair();
-    return .{ .agent = agent };
-}
-
-pub fn handleTimeout(agent: *Agent, now: i64) error{Overflow}!void {
-    if (agent.connection_state == .closed) return;
-
-    if (now >= agent.connectivity_check_deadline) {
-        agent.connectivity_check_deadline = now + connectivity_check_interval;
-        try agent.events_out.pushBack(.connectivity_check);
-    }
-
-    if (now >= agent.keep_alive_deadline) {
-        agent.keep_alive_deadline = now + keep_alive_interval;
-        if (agent.connection_state == .connected) {
-            try agent.setConnectionState(.completed, now);
-        }
-        try agent.events_out.pushBack(.consent_freshness);
-    }
-
-    if (now >= agent.disconnected_connection_deadline) {
-        switch (agent.connection_state) {
-            .checking, .disconnected => try agent.setConnectionState(.failed, now),
-            else => try agent.setConnectionState(.disconnected, now),
-        }
-    }
-}
-
-pub const ReadResult = union(enum) {
-    app_data: []const u8,
-    consumed: void,
-};
-
-pub fn handleRead(agent: *Agent, message: stun.TransportMessage, now: i64, buffer: []u8) !ReadResult {
-    if (!stun.isMessage(message.data)) {
-        return try agent.handleAppData(message.from, message.data);
-    }
-
-    switch (agent.connection_state) {
-        .completed, .disconnected, .failed => |state| {
-            agent.disconnected_connection_deadline = now + agent.disconnected_timeout;
-            if (state == .disconnected) try agent.setConnectionState(.completed, now);
-            if (try agent.handleConsentFreshness(message.from, message.data, buffer)) |resp| {
-                try agent.transmits.pushBack(.{
-                    .data = resp,
-                    .from = message.to,
-                    .to = message.from,
-                });
-            }
-
-            return .consumed;
-        },
-        else => return agent.handleStunMessage(message, now, buffer),
-    }
-}
-
-pub fn pollEvent(core: *Agent) ?Event {
-    return core.events_out.popFront();
-}
-
-pub fn pollTransmit(agent: *Agent) ?stun.TransportMessage {
-    return agent.transmits.popFront();
-}
-
-pub fn pollTimeout(core: *Agent) ?i64 {
-    if (core.connection_state == .closed) return null;
-    var deadline: i64 = std.math.maxInt(i64);
-
-    for (&[_]i64{
-        core.connectivity_check_deadline,
-        core.keep_alive_deadline,
-        core.disconnected_connection_deadline,
-    }) |d| deadline = @min(deadline, d);
-
-    return if (deadline == std.math.maxInt(i64)) null else deadline;
-}
-
-pub fn detectNominatedPair(core: *Agent) void {
-    if (core.role == .controlling or core.nominated_pair != null) return;
-    for (core.pairs.items) |pair| if (pair.nominated) {
-        core.nominated_pair = .{ .local = @intCast(pair.local), .remote = @intCast(pair.remote) };
-        return;
-    };
-}
-
-pub fn buildBindingRequest(core: *Agent, tx_id: u96, use_candidate: bool, buffer: []u8) ![]const u8 {
-    var w = stun.Writer.init(buffer, .{ .password = core.remote_credentials.?.getPassword() });
-    try w.writeHeader(.{
-        .message_type = .fromClassAndMethod(.request, .binding),
-        .transaction_id = tx_id,
-        .message_length = 0,
-    });
-
-    var username = [_][]const u8{ core.remote_credentials.?.getUsername(), ":", core.credentials.getUsername() };
-    try w.writeRaw(.username, &username);
-    try w.writeAttribute(.{ .priority = ice.CandidateType.prflx.priority() });
-    const role_attribute: stun.Attribute = switch (core.role) {
-        .controlled => .{ .ice_controlled = core.tie_breaker },
-        .controlling => .{ .ice_controlling = core.tie_breaker },
-    };
-    if (use_candidate) try w.writeAttribute(.use_candidate);
-    try w.writeAttribute(role_attribute);
-    try w.writeAttribute(.{ .message_integrity = &.{} });
-    try w.writeAttribute(.fingerprint);
-
-    return w.final();
-}
-
-pub fn toggleRole(agent: *Agent) void {
-    switch (agent.role) {
-        .controlling => agent.role = .controlled,
-        .controlled => agent.role = .controlling,
-    }
-    agent.tie_breaker = agent.random.int(u64);
-
-    for (agent.pairs.items) |*pair| {
-        const local = agent.getPairLocal(pair);
-        const remote = agent.getPairRemote(pair);
-        pair.priority = calculatePairPriority(local.priority, remote.priority, agent.role);
-    }
-}
-
-fn appendCandidate(core: *Agent, candidate: Candidate) error{Overflow}!usize {
-    if (core.candidates_len >= max_candidates) return error.Overflow;
-    const idx = core.candidates_len;
-    core.candidates[idx] = candidate;
-    core.candidates_len += 1;
-    return idx;
-}
-
-fn appendRemoteCandidate(core: *Agent, candidate: Candidate) error{Overflow}!usize {
-    if (core.remote_candidates_len >= max_candidates) return error.Overflow;
-    const idx = core.remote_candidates_len;
-    core.remote_candidates[idx] = .{ .address = candidate.address, .candidate_type = candidate.candidate_type, .priority = candidate.priority };
-    core.remote_candidates_len += 1;
-    return idx;
-}
-
-fn setConnectionState(agent: *Agent, state: ice.ConnectionState, now: i64) !void {
-    agent.connection_state = state;
-    switch (agent.connection_state) {
-        .checking => {
-            agent.connectivity_check_deadline = now + connectivity_check_interval;
-            agent.disconnected_connection_deadline = now + agent.failed_timeout;
-        },
-        .connected => {
-            agent.keep_alive_deadline = now + keep_alive_interval;
-            agent.disconnected_connection_deadline = now + agent.disconnected_timeout;
-        },
-        .completed => {
-            agent.connectivity_check_deadline = std.math.maxInt(i64);
-            agent.pairs.clearAndFree(agent.allocator);
-            agent.pending_requests.clearAndFree(agent.allocator);
-        },
-        .disconnected => agent.disconnected_connection_deadline = now + agent.failed_timeout,
-        .failed => {
-            agent.connectivity_check_deadline = std.math.maxInt(i64);
-            agent.disconnected_connection_deadline = std.math.maxInt(i64);
-            agent.keep_alive_deadline = std.math.maxInt(i64);
-        },
-        else => {},
-    }
-
-    try agent.events_out.pushBack(.{ .connection_state = agent.connection_state });
-}
-
-fn handleStunMessage(agent: *Agent, message: stun.TransportMessage, now: i64, buffer: []u8) !ReadResult {
-    const was_nominated = agent.nominated_pair != null;
-    const msg = try stun.Message.parse(message.data);
-
-    switch (msg.header.message_type.class()) {
-        .request => {
-            const resp = try agent.handleRequest(&msg, message.to, message.from, buffer);
-            agent.detectNominatedPair();
-            try agent.transmits.pushBack(.{
-                .data = resp,
-                .from = message.to,
-                .to = message.from,
-            });
-        },
-        .success_response => {
-            try agent.handleSuccessResponse(&msg, message.to, message.from);
-            agent.detectNominatedPair();
-        },
-        else => {},
-    }
-
-    if (!was_nominated) if (agent.nominated_pair) |nominated| {
-        try agent.setConnectionState(.connected, now);
-        try agent.events_out.pushBack(.{ .nominated = agent.candidates[nominated.local].base });
-    };
-
-    return .consumed;
-}
-
-fn handleAppData(agent: *Agent, sender: *const IpAddress, data: []const u8) !ReadResult {
-    switch (agent.connection_state) {
-        .connected, .completed, .disconnected => return .{ .app_data = data },
-        else => {
-            for (agent.pairs.items) |*candidate_pair| {
-                const remote = &agent.remote_candidates[candidate_pair.remote];
-                if (remote.address.eql(sender)) return .{ .app_data = data };
-            } else Logger.debug("Drop non stun message from unknown remote candidate: {f}", .{sender});
-        },
-    }
-
-    return .consumed;
-}
-
-fn handleRequest(agent: *Agent, msg: *const stun.Message, base_addr: *const IpAddress, from: *const IpAddress, buffer: []u8) ![]const u8 {
-    const stun_req = Messages.parseAndValidateStunRequest(
-        msg,
-        agent.credentials.toIceCredentials(),
-        agent.role,
-        agent.tie_breaker,
-    ) catch |err| switch (err) {
-        error.RoleConflict => return try Messages.buildRoleConflictErrorMessage(msg.header.transaction_id, agent.credentials.getPassword(), buffer),
-        error.SwitchRole => blk: {
-            agent.toggleRole();
-            break :blk try Messages.parseAndValidateStunRequest(
-                msg,
-                agent.credentials.toIceCredentials(),
-                agent.role,
-                agent.tie_breaker,
-            );
-        },
-        else => |e| return e,
-    };
-
-    if (agent.findCandidatePair(base_addr, from)) |candidate_pair| {
-        switch (candidate_pair.status) {
-            .succeeded => candidate_pair.nominated |= stun_req.use_candidate,
-            else => candidate_pair.nominate_on_binding |= stun_req.use_candidate,
-        }
-    } else {
-        const local_idx = agent.findLocalCandidate(base_addr, base_addr) orelse return error.NoLocalCandidate;
-        const local_candidate = agent.candidates[local_idx];
-
-        const remote_idx: u32 = agent.findRemoteCandidate(from) orelse blk: {
-            const candidate = Candidate{
-                .base = from.*,
-                .address = from.*,
-                .candidate_type = .prflx,
-                .priority = stun_req.priority,
-            };
-            break :blk @intCast(try agent.appendRemoteCandidate(candidate));
-        };
-
-        try agent.pairs.append(agent.allocator, .{
-            .local = local_idx,
-            .remote = remote_idx,
-            .priority = calculatePairPriority(local_candidate.priority, stun_req.priority, agent.role),
-            .status = .in_progress,
-            .nominate_on_binding = stun_req.use_candidate,
-        });
-    }
-
-    return try Messages.buildSuccessResponse(msg, agent.credentials.getPassword(), from, buffer);
-}
-
-fn handleSuccessResponse(core: *Agent, msg: *const stun.Message, base_addr: *const IpAddress, from: *const IpAddress) !void {
-    const pending_request = blk: {
-        const tx_id = msg.header.transaction_id;
-        for (core.pending_requests.items, 0..) |pr, i| {
-            if (@as(u96, @bitCast(pr.transaction_id)) == tx_id) {
-                const pending_request = core.pending_requests.swapRemove(i);
-                break :blk pending_request;
-            }
-        }
-
-        return;
-    };
-
-    const expected_pair = core.pairs.items[pending_request.pair];
-    if (!core.getPairLocal(&expected_pair).base.eql(base_addr) or !core.getPairRemote(&expected_pair).address.eql(from)) return;
-
-    if (core.findCandidatePair(base_addr, from)) |candidate_pair| {
-        const mapped_address = try Messages.parseAndValidateStunResponse(msg, core.remote_credentials.?.getPassword());
-
-        if (mapped_address.eql(base_addr)) {
-            candidate_pair.status = .succeeded;
-            core.maybeSetNominatedField(candidate_pair);
-            return;
-        }
-        candidate_pair.status = .failed;
-
-        const local_idx: u32 = core.findLocalCandidate(base_addr, &mapped_address) orelse blk: {
-            const prflx_candidate: Candidate = .initPeerReflexive(base_addr.*, mapped_address);
-            break :blk @intCast(try core.appendCandidate(prflx_candidate));
-        };
-        const local_candidate = core.candidates[local_idx];
-        const remote_candidate = core.getPairRemote(candidate_pair);
-
-        if (core.findCandidatePairByLocalAndRemote(&local_candidate, from)) |existing_candidate_pair| {
-            existing_candidate_pair.status = .succeeded;
-            core.maybeSetNominatedField(existing_candidate_pair);
-            return;
-        }
-
-        try core.pairs.append(core.allocator, .{
-            .local = local_idx,
-            .remote = candidate_pair.remote,
-            .priority = calculatePairPriority(local_candidate.priority, remote_candidate.priority, core.role),
-            .status = .succeeded,
-        });
-    }
-}
-
-fn pairsEql(core: *Agent, pair1: *const CandidatePair, pair2: *const CandidatePair) bool {
-    const local1 = core.getPairLocal(pair1);
-    const remote1 = core.getPairRemote(pair1);
-
-    const local2 = core.getPairLocal(pair2);
-    const remote2 = core.getPairRemote(pair2);
-
-    return local1.base.eql(&local2.base) and local1.address.eql(&local2.address) and
-        remote1.address.eql(&remote2.address);
-}
 
 /// Compare addresses by IP only, ignoring port.
 fn ipEql(a: *const IpAddress, b: *const IpAddress) bool {
@@ -683,82 +108,667 @@ fn calculatePairPriority(l: u32, r: u32, role: ice.Role) u64 {
     return (@as(u64, 1) << 32) * @min(g, d) + 2 * @max(g, d) + last_part;
 }
 
-fn selectBestPair(core: *Agent) ?u8 {
-    var selected_idx: ?u8 = null;
-    var best_priority: u64 = 0;
-    for (core.pairs.items, 0..) |candidate_pair, idx| if (candidate_pair.status == .succeeded) {
-        if (selected_idx == null or candidate_pair.priority > best_priority) {
-            selected_idx = @intCast(idx);
-            best_priority = candidate_pair.priority;
+pub fn Agent(comptime config: struct {
+    auth_info_size: u8 = 64,
+    max_candidates: u8 = 16,
+}) type {
+    return struct {
+        const Self = @This();
+
+        const max_events: u8 = 5;
+        const initial_pairs_capacity: usize = @as(usize, config.max_candidates) * config.max_candidates / 2;
+        const initial_pending_requests_capacity: usize = 16;
+
+        allocator: std.mem.Allocator,
+        random: std.Random,
+
+        credentials: LocalCredentials(config.auth_info_size),
+        remote_credentials: ?LocalCredentials(config.auth_info_size),
+        connection_state: ice.ConnectionState,
+        gathering_state: ice.GatheringState,
+        role: ice.Role,
+        tie_breaker: u64,
+
+        // Candidates and sockets
+        candidates: [config.max_candidates]Candidate = undefined,
+        candidates_len: u8 = 0,
+        remote_candidates: [config.max_candidates]RemoteCandidate = undefined,
+        remote_candidates_len: u8 = 0,
+        pairs: std.ArrayList(CandidatePair) = .empty,
+        pending_requests: std.ArrayList(PendingRequest) = .empty,
+        // This is a peer for which a use-candidate request is sent, but we didn't
+        // receive response yet.
+        selected_pair: ?u8 = null,
+        // This the final pair selected by this agent or the remote one.
+        nominated_pair: ?NominatedPair = null,
+
+        failed_timeout: u32,
+        disconnected_timeout: u32,
+
+        connectivity_check_deadline: i64,
+        disconnected_connection_deadline: i64, // used for both disconnected and failed states
+        keep_alive_deadline: i64,
+
+        events_out: stun.BoundedDeque(Event, max_events),
+        transmits: stun.BoundedDeque(stun.TransportMessage, max_events),
+
+        pub const ConnectivityChecks = struct {
+            agent: *Self,
+            nomination_done: bool = false,
+            index: usize = 0,
+
+            pub fn next(self: *ConnectivityChecks, buffer: []u8) !?stun.TransportMessage {
+                const agent = self.agent;
+
+                if (!self.nomination_done) {
+                    self.nomination_done = true;
+                    if (agent.selected_pair) |selected_idx| {
+                        const pair = &agent.pairs.items[selected_idx];
+                        const local = agent.getPairLocal(pair);
+                        const remote = agent.getPairRemote(pair);
+
+                        const tx_id = agent.random.int(u96);
+                        const payload = try agent.buildBindingRequest(tx_id, true, buffer);
+
+                        try agent.pending_requests.append(agent.allocator, .{
+                            .transaction_id = @bitCast(tx_id),
+                            .pair = selected_idx,
+                        });
+
+                        return stun.TransportMessage{
+                            .data = payload,
+                            .from = &local.base,
+                            .to = &remote.address,
+                        };
+                    }
+                }
+
+                while (self.index < agent.pairs.items.len) {
+                    const idx = self.index;
+                    const pair = &agent.pairs.items[idx];
+                    self.index += 1;
+                    switch (pair.status) {
+                        .waiting, .in_progress => {
+                            pair.conn_check_count += 1;
+                            if (pair.conn_check_count > max_binding_requests) {
+                                pair.status = .failed;
+                                continue;
+                            }
+
+                            const tx_id = agent.random.int(u96);
+                            const payload = try agent.buildBindingRequest(tx_id, false, buffer);
+                            const local = agent.getPairLocal(pair);
+                            const remote = agent.getPairRemote(pair);
+
+                            try agent.pending_requests.append(agent.allocator, .{
+                                .transaction_id = @bitCast(tx_id),
+                                .pair = @intCast(idx),
+                            });
+
+                            return stun.TransportMessage{
+                                .data = payload,
+                                .from = &local.base,
+                                .to = &remote.address,
+                            };
+                        },
+                        else => {},
+                    }
+                }
+
+                return null;
+            }
+        };
+
+        pub fn init(allocator: std.mem.Allocator, agent_config: Config) error{ OutOfMemory, CredentialsTooLong }!Self {
+            var pairs: std.ArrayList(CandidatePair) = try .initCapacity(allocator, initial_pairs_capacity);
+            errdefer pairs.deinit(allocator);
+
+            var pending_requests: std.ArrayList(PendingRequest) = try .initCapacity(allocator, initial_pending_requests_capacity);
+            errdefer pending_requests.deinit(allocator);
+
+            return .{
+                .allocator = allocator,
+                .random = agent_config.random,
+                .role = agent_config.role,
+                .connection_state = .new,
+                .gathering_state = .new,
+                .credentials = try .init(agent_config.credentials.username, agent_config.credentials.password),
+                .remote_credentials = null,
+                .tie_breaker = agent_config.random.int(u64),
+                .connectivity_check_deadline = std.math.maxInt(i64),
+                .keep_alive_deadline = std.math.maxInt(i64),
+                .disconnected_connection_deadline = std.math.maxInt(i64),
+                .failed_timeout = agent_config.failed_timeout,
+                .disconnected_timeout = agent_config.disconnected_timeout,
+                .events_out = .empty,
+                .transmits = .empty,
+                .pairs = pairs,
+                .pending_requests = pending_requests,
+            };
+        }
+
+        pub fn deinit(agent: *Self) void {
+            agent.close();
+            agent.pairs.deinit(agent.allocator);
+            agent.pending_requests.deinit(agent.allocator);
+            agent.events_out.clear();
+            agent.transmits.clear();
+        }
+
+        pub fn close(core: *Self) void {
+            core.connection_state = .closed;
+
+            core.pairs.clearAndFree(core.allocator);
+            core.pending_requests.clearAndFree(core.allocator);
+            core.candidates_len = 0;
+            core.remote_candidates_len = 0;
+        }
+
+        pub fn getRemoteCredentials(core: *const Self) ?ice.Credentials {
+            return if (core.remote_credentials) |*rc| rc.toIceCredentials() else null;
+        }
+
+        pub fn getLocalCredentials(core: *const Self) ice.Credentials {
+            return core.credentials.toIceCredentials();
+        }
+
+        pub fn getNominatedRemoteAddress(core: *const Self) ?IpAddress {
+            return if (core.nominated_pair) |nominated| core.remote_candidates[nominated.remote].address else null;
+        }
+
+        pub fn addLocalAddrs(core: *Self, addrs: []const IpAddress) !void {
+            var min_index: ?u8 = null;
+            var max_index: ?u8 = null;
+            for (addrs) |addr| {
+                const candidate = Candidate.initHost(addr);
+                if (try core.addLocalCandidate(candidate)) |idx| {
+                    if (min_index == null) min_index = @intCast(idx);
+                    max_index = @intCast(idx);
+                }
+            }
+
+            // since there's no support for stun/turn servers, we can immediately transition to the "gathering done" state
+            core.gathering_state = .complete;
+            if (min_index) |min| try core.events_out.pushBack(.{ .candidate = .{ min, max_index.? } });
+            try core.events_out.pushBack(.{ .gathering_state = core.gathering_state });
+        }
+
+        pub fn setRemoteCredentials(agent: *Self, credentials: ice.Credentials, now: i64) !void {
+            agent.remote_credentials = try .init(credentials.username, credentials.password);
+            try agent.setConnectionState(.checking, now);
+        }
+
+        pub fn addServerReflexiveCandidate(core: *Self, base: IpAddress, mapped: IpAddress) !?Candidate {
+            for (core.candidates[0..core.candidates_len]) |candidate|
+                if (candidate.candidate_type == .host and ipEql(&candidate.base, &mapped)) return null;
+
+            const candidate = Candidate.initServerReflexive(base, mapped);
+            return if (try core.addLocalCandidate(candidate)) |_| candidate else null;
+        }
+
+        pub fn handleConsentFreshness(agent: *Self, from: *const IpAddress, message: []const u8, buffer: []u8) !?[]const u8 {
+            const msg = try stun.Message.parse(message);
+            switch (msg.header.message_type.class()) {
+                .request => {
+                    _ = try Messages.parseAndValidateStunRequest(
+                        &msg,
+                        agent.credentials.toIceCredentials(),
+                        agent.role,
+                        agent.tie_breaker,
+                    );
+                    return try Messages.buildSuccessResponse(&msg, agent.credentials.getPassword(), from, buffer);
+                },
+                else => {},
+            }
+
+            return null;
+        }
+
+        pub fn addRemoteCandidate(core: *Self, remote_candidate: Candidate) !void {
+            const remote_idx = try core.appendRemoteCandidate(remote_candidate);
+
+            outer_loop: for (core.candidates[0..core.candidates_len], 0..) |candidate, local_idx| {
+                if (std.meta.activeTag(remote_candidate.address) != std.meta.activeTag(candidate.base)) continue;
+                for (core.pairs.items) |*pair| {
+                    const local = core.getPairLocal(pair);
+                    const remote = core.getPairRemote(pair);
+                    if (local.base.eql(&candidate.base) and remote.address.eql(&remote_candidate.address))
+                        continue :outer_loop;
+                }
+
+                try core.pairs.append(core.allocator, .{
+                    .local = @intCast(local_idx),
+                    .remote = @intCast(remote_idx),
+                    .priority = calculatePairPriority(candidate.priority, remote_candidate.priority, core.role),
+                });
+            }
+        }
+
+        /// Returns `false` if an identical candidate already exists.
+        pub fn addLocalCandidate(core: *Self, candidate: Candidate) !?usize {
+            for (core.candidates[0..core.candidates_len]) |*existing| if (existing.eql(&candidate)) return null;
+
+            const idx = try core.appendCandidate(candidate);
+
+            outer_loop: for (core.remote_candidates[0..core.remote_candidates_len], 0..) |remote_candidate, remote_idx| {
+                if (std.meta.activeTag(remote_candidate.address) != std.meta.activeTag(candidate.base)) continue;
+
+                for (core.pairs.items) |*pair| {
+                    const local = core.getPairLocal(pair);
+                    const remote = core.getPairRemote(pair);
+                    if (local.base.eql(&candidate.base) and remote.address.eql(&remote_candidate.address))
+                        continue :outer_loop;
+                }
+
+                try core.pairs.append(core.allocator, .{
+                    .local = @intCast(idx),
+                    .remote = @intCast(remote_idx),
+                    .priority = calculatePairPriority(candidate.priority, remote_candidate.priority, core.role),
+                });
+            }
+
+            return idx;
+        }
+
+        /// Begin a connectivity-check round. Returns null when a pair is already
+        /// nominated (nothing to do). Performs the controlling-side best-pair selection.
+        pub fn beginConnectivityChecks(agent: *Self) ?ConnectivityChecks {
+            if (agent.nominated_pair != null) return null;
+            if (agent.role == .controlling and agent.selected_pair == null)
+                agent.selected_pair = agent.selectBestPair();
+            return .{ .agent = agent };
+        }
+
+        pub fn handleTimeout(agent: *Self, now: i64) error{Overflow}!void {
+            if (agent.connection_state == .closed) return;
+
+            if (now >= agent.connectivity_check_deadline) {
+                agent.connectivity_check_deadline = now + connectivity_check_interval;
+                try agent.events_out.pushBack(.connectivity_check);
+            }
+
+            if (now >= agent.keep_alive_deadline) {
+                agent.keep_alive_deadline = now + keep_alive_interval;
+                if (agent.connection_state == .connected) {
+                    try agent.setConnectionState(.completed, now);
+                }
+                try agent.events_out.pushBack(.consent_freshness);
+            }
+
+            if (now >= agent.disconnected_connection_deadline) {
+                switch (agent.connection_state) {
+                    .checking, .disconnected => try agent.setConnectionState(.failed, now),
+                    else => try agent.setConnectionState(.disconnected, now),
+                }
+            }
+        }
+
+        pub fn handleRead(agent: *Self, message: stun.TransportMessage, now: i64, buffer: []u8) !ReadResult {
+            if (!stun.isMessage(message.data)) {
+                return try agent.handleAppData(message.from, message.data);
+            }
+
+            switch (agent.connection_state) {
+                .completed, .disconnected, .failed => |state| {
+                    agent.disconnected_connection_deadline = now + agent.disconnected_timeout;
+                    if (state == .disconnected) try agent.setConnectionState(.completed, now);
+                    if (try agent.handleConsentFreshness(message.from, message.data, buffer)) |resp| {
+                        try agent.transmits.pushBack(.{
+                            .data = resp,
+                            .from = message.to,
+                            .to = message.from,
+                        });
+                    }
+
+                    return .consumed;
+                },
+                else => return agent.handleStunMessage(message, now, buffer),
+            }
+        }
+
+        pub fn pollEvent(core: *Self) ?Event {
+            return core.events_out.popFront();
+        }
+
+        pub fn pollTransmit(agent: *Self) ?stun.TransportMessage {
+            return agent.transmits.popFront();
+        }
+
+        pub fn pollTimeout(core: *Self) ?i64 {
+            if (core.connection_state == .closed) return null;
+            var deadline: i64 = std.math.maxInt(i64);
+
+            for (&[_]i64{
+                core.connectivity_check_deadline,
+                core.keep_alive_deadline,
+                core.disconnected_connection_deadline,
+            }) |d| deadline = @min(deadline, d);
+
+            return if (deadline == std.math.maxInt(i64)) null else deadline;
+        }
+
+        pub fn detectNominatedPair(core: *Self) void {
+            if (core.role == .controlling or core.nominated_pair != null) return;
+            for (core.pairs.items) |pair| if (pair.nominated) {
+                core.nominated_pair = .{ .local = @intCast(pair.local), .remote = @intCast(pair.remote) };
+                return;
+            };
+        }
+
+        pub fn buildBindingRequest(core: *Self, tx_id: u96, use_candidate: bool, buffer: []u8) ![]const u8 {
+            var w = stun.Writer.init(buffer, .{ .password = core.remote_credentials.?.getPassword() });
+            try w.writeHeader(.{
+                .message_type = .fromClassAndMethod(.request, .binding),
+                .transaction_id = tx_id,
+                .message_length = 0,
+            });
+
+            var username = [_][]const u8{ core.remote_credentials.?.getUsername(), ":", core.credentials.getUsername() };
+            try w.writeRaw(.username, &username);
+            try w.writeAttribute(.{ .priority = ice.CandidateType.prflx.priority() });
+            const role_attribute: stun.Attribute = switch (core.role) {
+                .controlled => .{ .ice_controlled = core.tie_breaker },
+                .controlling => .{ .ice_controlling = core.tie_breaker },
+            };
+            if (use_candidate) try w.writeAttribute(.use_candidate);
+            try w.writeAttribute(role_attribute);
+            try w.writeAttribute(.{ .message_integrity = &.{} });
+            try w.writeAttribute(.fingerprint);
+
+            return w.final();
+        }
+
+        pub fn toggleRole(agent: *Self) void {
+            switch (agent.role) {
+                .controlling => agent.role = .controlled,
+                .controlled => agent.role = .controlling,
+            }
+            agent.tie_breaker = agent.random.int(u64);
+
+            for (agent.pairs.items) |*pair| {
+                const local = agent.getPairLocal(pair);
+                const remote = agent.getPairRemote(pair);
+                pair.priority = calculatePairPriority(local.priority, remote.priority, agent.role);
+            }
+        }
+
+        fn appendCandidate(core: *Self, candidate: Candidate) error{Overflow}!usize {
+            if (core.candidates_len >= config.max_candidates) return error.Overflow;
+            const idx = core.candidates_len;
+            core.candidates[idx] = candidate;
+            core.candidates_len += 1;
+            return idx;
+        }
+
+        fn appendRemoteCandidate(core: *Self, candidate: Candidate) error{Overflow}!usize {
+            if (core.remote_candidates_len >= config.max_candidates) return error.Overflow;
+            const idx = core.remote_candidates_len;
+            core.remote_candidates[idx] = .{ .address = candidate.address, .candidate_type = candidate.candidate_type, .priority = candidate.priority };
+            core.remote_candidates_len += 1;
+            return idx;
+        }
+
+        fn setConnectionState(agent: *Self, state: ice.ConnectionState, now: i64) !void {
+            agent.connection_state = state;
+            switch (agent.connection_state) {
+                .checking => {
+                    agent.connectivity_check_deadline = now + connectivity_check_interval;
+                    agent.disconnected_connection_deadline = now + agent.failed_timeout;
+                },
+                .connected => {
+                    agent.keep_alive_deadline = now + keep_alive_interval;
+                    agent.disconnected_connection_deadline = now + agent.disconnected_timeout;
+                },
+                .completed => {
+                    agent.connectivity_check_deadline = std.math.maxInt(i64);
+                    agent.pairs.clearAndFree(agent.allocator);
+                    agent.pending_requests.clearAndFree(agent.allocator);
+                },
+                .disconnected => agent.disconnected_connection_deadline = now + agent.failed_timeout,
+                .failed => {
+                    agent.connectivity_check_deadline = std.math.maxInt(i64);
+                    agent.disconnected_connection_deadline = std.math.maxInt(i64);
+                    agent.keep_alive_deadline = std.math.maxInt(i64);
+                },
+                else => {},
+            }
+
+            try agent.events_out.pushBack(.{ .connection_state = agent.connection_state });
+        }
+
+        fn handleStunMessage(agent: *Self, message: stun.TransportMessage, now: i64, buffer: []u8) !ReadResult {
+            const was_nominated = agent.nominated_pair != null;
+            const msg = try stun.Message.parse(message.data);
+
+            switch (msg.header.message_type.class()) {
+                .request => {
+                    const resp = try agent.handleRequest(&msg, message.to, message.from, buffer);
+                    agent.detectNominatedPair();
+                    try agent.transmits.pushBack(.{
+                        .data = resp,
+                        .from = message.to,
+                        .to = message.from,
+                    });
+                },
+                .success_response => {
+                    try agent.handleSuccessResponse(&msg, message.to, message.from);
+                    agent.detectNominatedPair();
+                },
+                else => {},
+            }
+
+            if (!was_nominated) if (agent.nominated_pair) |nominated| {
+                try agent.setConnectionState(.connected, now);
+                try agent.events_out.pushBack(.{ .nominated = nominated });
+            };
+
+            return .consumed;
+        }
+
+        fn handleAppData(agent: *Self, sender: *const IpAddress, data: []const u8) !ReadResult {
+            switch (agent.connection_state) {
+                .connected, .completed, .disconnected => return .{ .app_data = data },
+                else => {
+                    for (agent.pairs.items) |*candidate_pair| {
+                        const remote = &agent.remote_candidates[candidate_pair.remote];
+                        if (remote.address.eql(sender)) return .{ .app_data = data };
+                    } else Logger.debug("Drop non stun message from unknown remote candidate: {f}", .{sender});
+                },
+            }
+
+            return .consumed;
+        }
+
+        fn handleRequest(agent: *Self, msg: *const stun.Message, base_addr: *const IpAddress, from: *const IpAddress, buffer: []u8) ![]const u8 {
+            const stun_req = Messages.parseAndValidateStunRequest(
+                msg,
+                agent.credentials.toIceCredentials(),
+                agent.role,
+                agent.tie_breaker,
+            ) catch |err| switch (err) {
+                error.RoleConflict => return try Messages.buildRoleConflictErrorMessage(msg.header.transaction_id, agent.credentials.getPassword(), buffer),
+                error.SwitchRole => blk: {
+                    agent.toggleRole();
+                    break :blk try Messages.parseAndValidateStunRequest(
+                        msg,
+                        agent.credentials.toIceCredentials(),
+                        agent.role,
+                        agent.tie_breaker,
+                    );
+                },
+                else => |e| return e,
+            };
+
+            if (agent.findCandidatePair(base_addr, from)) |candidate_pair| {
+                switch (candidate_pair.status) {
+                    .succeeded => candidate_pair.nominated |= stun_req.use_candidate,
+                    else => candidate_pair.nominate_on_binding |= stun_req.use_candidate,
+                }
+            } else {
+                const local_idx = agent.findLocalCandidate(base_addr, base_addr) orelse return error.NoLocalCandidate;
+                const local_candidate = agent.candidates[local_idx];
+
+                const remote_idx: u32 = agent.findRemoteCandidate(from) orelse blk: {
+                    const candidate = Candidate{
+                        .base = from.*,
+                        .address = from.*,
+                        .candidate_type = .prflx,
+                        .priority = stun_req.priority,
+                    };
+                    break :blk @intCast(try agent.appendRemoteCandidate(candidate));
+                };
+
+                try agent.pairs.append(agent.allocator, .{
+                    .local = local_idx,
+                    .remote = remote_idx,
+                    .priority = calculatePairPriority(local_candidate.priority, stun_req.priority, agent.role),
+                    .status = .in_progress,
+                    .nominate_on_binding = stun_req.use_candidate,
+                });
+            }
+
+            return try Messages.buildSuccessResponse(msg, agent.credentials.getPassword(), from, buffer);
+        }
+
+        fn handleSuccessResponse(core: *Self, msg: *const stun.Message, base_addr: *const IpAddress, from: *const IpAddress) !void {
+            const pending_request = blk: {
+                const tx_id = msg.header.transaction_id;
+                for (core.pending_requests.items, 0..) |pr, i| {
+                    if (@as(u96, @bitCast(pr.transaction_id)) == tx_id) {
+                        const pending_request = core.pending_requests.swapRemove(i);
+                        break :blk pending_request;
+                    }
+                }
+
+                return;
+            };
+
+            const expected_pair = core.pairs.items[pending_request.pair];
+            if (!core.getPairLocal(&expected_pair).base.eql(base_addr) or !core.getPairRemote(&expected_pair).address.eql(from)) return;
+
+            if (core.findCandidatePair(base_addr, from)) |candidate_pair| {
+                const mapped_address = try Messages.parseAndValidateStunResponse(msg, core.remote_credentials.?.getPassword());
+
+                if (mapped_address.eql(base_addr)) {
+                    candidate_pair.status = .succeeded;
+                    core.maybeSetNominatedField(candidate_pair);
+                    return;
+                }
+                candidate_pair.status = .failed;
+
+                const local_idx: u32 = core.findLocalCandidate(base_addr, &mapped_address) orelse blk: {
+                    const prflx_candidate: Candidate = .initPeerReflexive(base_addr.*, mapped_address);
+                    break :blk @intCast(try core.appendCandidate(prflx_candidate));
+                };
+                const local_candidate = core.candidates[local_idx];
+                const remote_candidate = core.getPairRemote(candidate_pair);
+
+                if (core.findCandidatePairByLocalAndRemote(&local_candidate, from)) |existing_candidate_pair| {
+                    existing_candidate_pair.status = .succeeded;
+                    core.maybeSetNominatedField(existing_candidate_pair);
+                    return;
+                }
+
+                try core.pairs.append(core.allocator, .{
+                    .local = local_idx,
+                    .remote = candidate_pair.remote,
+                    .priority = calculatePairPriority(local_candidate.priority, remote_candidate.priority, core.role),
+                    .status = .succeeded,
+                });
+            }
+        }
+
+        fn pairsEql(core: *Self, pair1: *const CandidatePair, pair2: *const CandidatePair) bool {
+            const local1 = core.getPairLocal(pair1);
+            const remote1 = core.getPairRemote(pair1);
+
+            const local2 = core.getPairLocal(pair2);
+            const remote2 = core.getPairRemote(pair2);
+
+            return local1.base.eql(&local2.base) and local1.address.eql(&local2.address) and
+                remote1.address.eql(&remote2.address);
+        }
+
+        fn selectBestPair(core: *Self) ?u8 {
+            var selected_idx: ?u8 = null;
+            var best_priority: u64 = 0;
+            for (core.pairs.items, 0..) |candidate_pair, idx| if (candidate_pair.status == .succeeded) {
+                if (selected_idx == null or candidate_pair.priority > best_priority) {
+                    selected_idx = @intCast(idx);
+                    best_priority = candidate_pair.priority;
+                }
+            };
+
+            return selected_idx;
+        }
+
+        fn findCandidatePair(core: *Self, local: *const IpAddress, remote: *const IpAddress) ?*CandidatePair {
+            var pair: ?*CandidatePair = null;
+            for (core.pairs.items) |*candidate| {
+                const local_c = core.getPairLocal(candidate);
+                const remote_c = core.getPairRemote(candidate);
+                if (local_c.base.eql(local) and remote_c.address.eql(remote)) {
+                    if (pair == null or candidate.status != .failed and pair.?.status == .failed) pair = candidate;
+                }
+            }
+
+            return pair;
+        }
+
+        fn maybeSetNominatedField(core: *Self, candidate_pair: *CandidatePair) void {
+            if (candidate_pair.nominate_on_binding) {
+                candidate_pair.nominate_on_binding = false;
+                candidate_pair.nominated = true;
+            } else if (core.selected_pair) |selected_idx| {
+                if (core.pairsEql(&core.pairs.items[selected_idx], candidate_pair)) {
+                    core.nominated_pair = .{ .local = @intCast(candidate_pair.local), .remote = @intCast(candidate_pair.remote) };
+                    candidate_pair.nominated = true;
+                    core.selected_pair = null;
+                }
+            }
+        }
+
+        fn findLocalCandidate(core: *Self, base: *const IpAddress, addr: *const IpAddress) ?u32 {
+            for (core.candidates[0..core.candidates_len], 0..) |candidate, idx| {
+                if (candidate.base.eql(base) and candidate.address.eql(addr)) return @intCast(idx);
+            }
+            return null;
+        }
+
+        fn findRemoteCandidate(core: *Self, addr: *const IpAddress) ?u32 {
+            for (core.remote_candidates[0..core.remote_candidates_len], 0..) |candidate, idx| if (candidate.address.eql(addr)) return @intCast(idx);
+            return null;
+        }
+
+        fn findCandidatePairByLocalAndRemote(core: *Self, local: *const Candidate, remote: *const IpAddress) ?*CandidatePair {
+            for (core.pairs.items) |*candidate| {
+                if (core.getPairLocal(candidate).eql(local) and core.getPairRemote(candidate).address.eql(remote))
+                    return candidate;
+            }
+            return null;
+        }
+
+        fn getPairLocal(core: *Self, pair: *const CandidatePair) *const Candidate {
+            return &core.candidates[pair.local];
+        }
+
+        fn getPairRemote(core: *Self, pair: *const CandidatePair) *const RemoteCandidate {
+            return &core.remote_candidates[pair.remote];
         }
     };
-
-    return selected_idx;
-}
-
-fn findCandidatePair(core: *Agent, local: *const IpAddress, remote: *const IpAddress) ?*CandidatePair {
-    var pair: ?*CandidatePair = null;
-    for (core.pairs.items) |*candidate| {
-        const local_c = core.getPairLocal(candidate);
-        const remote_c = core.getPairRemote(candidate);
-        if (local_c.base.eql(local) and remote_c.address.eql(remote)) {
-            if (pair == null or candidate.status != .failed and pair.?.status == .failed) pair = candidate;
-        }
-    }
-
-    return pair;
-}
-
-fn maybeSetNominatedField(core: *Agent, candidate_pair: *CandidatePair) void {
-    if (candidate_pair.nominate_on_binding) {
-        candidate_pair.nominate_on_binding = false;
-        candidate_pair.nominated = true;
-    } else if (core.selected_pair) |selected_idx| {
-        if (core.pairsEql(&core.pairs.items[selected_idx], candidate_pair)) {
-            core.nominated_pair = .{ .local = @intCast(candidate_pair.local), .remote = @intCast(candidate_pair.remote) };
-            candidate_pair.nominated = true;
-            core.selected_pair = null;
-        }
-    }
-}
-
-fn findLocalCandidate(core: *Agent, base: *const IpAddress, addr: *const IpAddress) ?u32 {
-    for (core.candidates[0..core.candidates_len], 0..) |candidate, idx| {
-        if (candidate.base.eql(base) and candidate.address.eql(addr)) return @intCast(idx);
-    }
-    return null;
-}
-
-fn findRemoteCandidate(core: *Agent, addr: *const IpAddress) ?u32 {
-    for (core.remote_candidates[0..core.remote_candidates_len], 0..) |candidate, idx| if (candidate.address.eql(addr)) return @intCast(idx);
-    return null;
-}
-
-fn findCandidatePairByLocalAndRemote(core: *Agent, local: *const Candidate, remote: *const IpAddress) ?*CandidatePair {
-    for (core.pairs.items) |*candidate| {
-        if (core.getPairLocal(candidate).eql(local) and core.getPairRemote(candidate).address.eql(remote))
-            return candidate;
-    }
-    return null;
-}
-
-fn getPairLocal(core: *Agent, pair: *const CandidatePair) *const Candidate {
-    return &core.candidates[pair.local];
-}
-
-fn getPairRemote(core: *Agent, pair: *const CandidatePair) *const RemoteCandidate {
-    return &core.remote_candidates[pair.remote];
 }
 
 const testing = std.testing;
 var rand = std.Random.DefaultPrng.init(0xDEADBEEF);
 
+const TestAgent = Agent(.{});
+
 fn testRemoteCandidate(address: IpAddress) RemoteCandidate {
     return .{ .address = address, .candidate_type = .host, .priority = ice.CandidateType.host.priority() };
 }
 
-fn testNewAgent(role: ice.Role) !Agent {
-    return Agent.init(testing.allocator, .{
+fn testNewAgent(role: ice.Role) !TestAgent {
+    return TestAgent.init(testing.allocator, .{
         .role = role,
         .credentials = .{ .username = "user", .password = "VOkJxbRl1RmTxUk/WvJxBt" },
         .random = rand.random(),
@@ -797,12 +807,12 @@ fn testBuildResponse(tx_id: u96, addr: IpAddress, password: []const u8, buffer: 
     return try stun.Message.parse(w.final());
 }
 
-fn expectEvent(core: *Agent, tag: std.meta.Tag(Event)) !void {
+fn expectEvent(core: *TestAgent, tag: std.meta.Tag(Event)) !void {
     const event = core.pollEvent() orelse return error.ExpectedEvent;
     if (std.meta.activeTag(event) != tag) return error.UnexpectedEvent;
 }
 
-fn expectConnectionStateEvent(core: *Agent, state: ice.ConnectionState) !void {
+fn expectConnectionStateEvent(core: *TestAgent, state: ice.ConnectionState) !void {
     switch (core.pollEvent() orelse return error.ExpectedEvent) {
         .connection_state => |s| try testing.expectEqual(state, s),
         else => return error.UnexpectedEvent,
