@@ -11,8 +11,15 @@ const Logger = std.log.scoped(.ice);
 
 const SelectedPair = struct {
     pair: CandidatePair,
+    pair_index: u8,
     local: Candidate,
-    remote: Candidate,
+    remote: RemoteCandidate,
+};
+
+const RemoteCandidate = struct {
+    address: IpAddress,
+    candidate_type: ice.CandidateType,
+    priority: u32,
 };
 
 fn LocalCredentials(comptime size: u8) type {
@@ -68,6 +75,8 @@ const auth_info_size: u8 = 64;
 const max_transmits: u8 = 5;
 const max_candidates: u8 = 16;
 const max_events: u8 = 15;
+const initial_pairs_capacity: usize = @as(usize, max_candidates) * max_candidates / 2; // 128
+const initial_pending_requests_capacity: usize = 16;
 
 allocator: std.mem.Allocator,
 random: std.Random,
@@ -82,7 +91,7 @@ tie_breaker: u64,
 // Candidates and sockets
 candidates: [max_candidates]Candidate = undefined,
 candidates_len: u8 = 0,
-remote_candidates: [max_candidates]Candidate = undefined,
+remote_candidates: [max_candidates]RemoteCandidate = undefined,
 remote_candidates_len: u8 = 0,
 pairs: std.ArrayList(CandidatePair) = .empty,
 pending_requests: std.ArrayList(PendingRequest) = .empty,
@@ -103,9 +112,8 @@ events_out: stun.BoundedDeque(Event, max_events),
 transmits: stun.BoundedDeque(stun.TransportMessage, max_transmits),
 
 const PendingRequest = struct {
-    transaction_id: u96,
-    source: IpAddress,
-    target: IpAddress,
+    transaction_id: [12]u8,
+    pair: u8,
 };
 
 pub const ConnectivityChecks = struct {
@@ -123,9 +131,8 @@ pub const ConnectivityChecks = struct {
                 const payload = try agent.buildBindingRequest(tx_id, true, buffer);
 
                 try agent.pending_requests.append(agent.allocator, .{
-                    .transaction_id = tx_id,
-                    .source = selected.local.base,
-                    .target = selected.remote.address,
+                    .transaction_id = @bitCast(tx_id),
+                    .pair = selected.pair_index,
                 });
 
                 return stun.TransportMessage{
@@ -154,9 +161,8 @@ pub const ConnectivityChecks = struct {
                     const remote = agent.getPairRemote(pair);
 
                     try agent.pending_requests.append(agent.allocator, .{
-                        .transaction_id = tx_id,
-                        .source = local.base,
-                        .target = remote.address,
+                        .transaction_id = @bitCast(tx_id),
+                        .pair = @intCast(idx),
                     });
 
                     return stun.TransportMessage{
@@ -181,7 +187,7 @@ pub const Config = struct {
     disconnected_timeout: u32 = 5000,
 };
 
-pub fn init(allocator: std.mem.Allocator, config: Config) error{CredentialsTooLong}!Agent {
+pub fn init(allocator: std.mem.Allocator, config: Config) !Agent {
     return .{
         .allocator = allocator,
         .random = config.random,
@@ -198,6 +204,8 @@ pub fn init(allocator: std.mem.Allocator, config: Config) error{CredentialsTooLo
         .disconnected_timeout = config.disconnected_timeout,
         .events_out = .empty,
         .transmits = .empty,
+        .pairs = try .initCapacity(allocator, initial_pairs_capacity),
+        .pending_requests = try .initCapacity(allocator, initial_pending_requests_capacity),
     };
 }
 
@@ -400,9 +408,10 @@ pub fn pollTimeout(core: *Agent) ?i64 {
 
 pub fn detectNominatedPair(core: *Agent) ?CandidatePair {
     if (core.role == .controlling or core.nominated_pair != null) return null;
-    for (core.pairs.items) |pair| if (pair.nominated) {
+    for (core.pairs.items, 0..) |pair, idx| if (pair.nominated) {
         core.nominated_pair = .{
             .pair = pair,
+            .pair_index = @intCast(idx),
             .local = core.getPairLocal(&pair).*,
             .remote = core.getPairRemote(&pair).*,
         };
@@ -459,7 +468,7 @@ fn appendCandidate(core: *Agent, candidate: Candidate) error{Overflow}!usize {
 fn appendRemoteCandidate(core: *Agent, candidate: Candidate) error{Overflow}!usize {
     if (core.remote_candidates_len >= max_candidates) return error.Overflow;
     const idx = core.remote_candidates_len;
-    core.remote_candidates[idx] = candidate;
+    core.remote_candidates[idx] = .{ .address = candidate.address, .candidate_type = candidate.candidate_type, .priority = candidate.priority };
     core.remote_candidates_len += 1;
     return idx;
 }
@@ -591,7 +600,7 @@ fn handleSuccessResponse(core: *Agent, msg: *const stun.Message, base_addr: *con
     const pending_request = blk: {
         const tx_id = msg.header.transaction_id;
         for (core.pending_requests.items, 0..) |pr, i| {
-            if (pr.transaction_id == tx_id) {
+            if (@as(u96, @bitCast(pr.transaction_id)) == tx_id) {
                 const pending_request = core.pending_requests.swapRemove(i);
                 break :blk pending_request;
             }
@@ -600,7 +609,8 @@ fn handleSuccessResponse(core: *Agent, msg: *const stun.Message, base_addr: *con
         return;
     };
 
-    if (!pending_request.source.eql(base_addr) or !pending_request.target.eql(from)) return;
+    const expected_pair = core.pairs.items[pending_request.pair];
+    if (!core.getPairLocal(&expected_pair).base.eql(base_addr) or !core.getPairRemote(&expected_pair).address.eql(from)) return;
 
     if (core.findCandidatePair(base_addr, from)) |candidate_pair| {
         const mapped_address = try Messages.parseAndValidateStunResponse(msg, core.remote_credentials.?.getPassword());
@@ -670,12 +680,17 @@ fn calculatePairPriority(l: u32, r: u32, role: ice.Role) u64 {
 
 fn selectBestPair(core: *Agent) ?SelectedPair {
     var selected_pair: ?CandidatePair = null;
-    for (core.pairs.items) |candidate_pair| if (candidate_pair.status == .succeeded) {
-        if (selected_pair == null or candidate_pair.priority > selected_pair.?.priority) selected_pair = candidate_pair;
+    var selected_idx: usize = 0;
+    for (core.pairs.items, 0..) |candidate_pair, idx| if (candidate_pair.status == .succeeded) {
+        if (selected_pair == null or candidate_pair.priority > selected_pair.?.priority) {
+            selected_pair = candidate_pair;
+            selected_idx = idx;
+        }
     };
 
     return if (selected_pair) |pair| .{
         .pair = pair,
+        .pair_index = @intCast(selected_idx),
         .local = core.getPairLocal(&pair).*,
         .remote = core.getPairRemote(&pair).*,
     } else null;
@@ -729,12 +744,16 @@ fn getPairLocal(core: *Agent, pair: *const CandidatePair) *const Candidate {
     return &core.candidates[pair.local];
 }
 
-fn getPairRemote(core: *Agent, pair: *const CandidatePair) *const Candidate {
+fn getPairRemote(core: *Agent, pair: *const CandidatePair) *const RemoteCandidate {
     return &core.remote_candidates[pair.remote];
 }
 
 const testing = std.testing;
 var rand = std.Random.DefaultPrng.init(0xDEADBEEF);
+
+fn testRemoteCandidate(address: IpAddress) RemoteCandidate {
+    return .{ .address = address, .candidate_type = .host, .priority = ice.CandidateType.host.priority() };
+}
 
 fn testNewAgent(role: ice.Role) !Agent {
     return Agent.init(testing.allocator, .{
@@ -869,7 +888,7 @@ test "handleRequest: nominate peer" {
 
     agent.candidates[0] = .initHost(base_addr);
     agent.candidates_len = 1;
-    agent.remote_candidates[0] = .initHost(from);
+    agent.remote_candidates[0] = testRemoteCandidate(from);
     agent.remote_candidates_len = 1;
     try agent.pairs.append(testing.allocator, .{
         .local = 0,
@@ -1094,7 +1113,7 @@ test "handleInput: forwards non-stun data from a known remote candidate pair" {
 
     core.candidates[0] = .initHost(base_addr);
     core.candidates_len = 1;
-    core.remote_candidates[0] = .initHost(from);
+    core.remote_candidates[0] = testRemoteCandidate(from);
     core.remote_candidates_len = 1;
     try core.pairs.append(testing.allocator, .{ .local = 0, .remote = 0, .status = .in_progress, .priority = 0 });
 
@@ -1222,13 +1241,12 @@ test "handleInput: success response completes the pending request and marks the 
 
     core.candidates[0] = .initHost(base_addr);
     core.candidates_len = 1;
-    core.remote_candidates[0] = .initHost(from);
+    core.remote_candidates[0] = testRemoteCandidate(from);
     core.remote_candidates_len = 1;
     try core.pairs.append(testing.allocator, .{ .local = 0, .remote = 0, .status = .in_progress, .priority = 0 });
     try core.pending_requests.append(testing.allocator, .{
-        .transaction_id = 0x2,
-        .source = base_addr,
-        .target = from,
+        .transaction_id = @bitCast(@as(u96, 0x2)),
+        .pair = 0,
     });
 
     var buffer: [1024]u8 = undefined;
@@ -1254,7 +1272,7 @@ test "handleInput: success response nominates the pair and transitions to connec
 
     core.candidates[0] = .initHost(base_addr);
     core.candidates_len = 1;
-    core.remote_candidates[0] = .initHost(from);
+    core.remote_candidates[0] = testRemoteCandidate(from);
     core.remote_candidates_len = 1;
     try core.pairs.append(testing.allocator, .{
         .local = 0,
@@ -1264,9 +1282,8 @@ test "handleInput: success response nominates the pair and transitions to connec
         .nominate_on_binding = true,
     });
     try core.pending_requests.append(testing.allocator, .{
-        .transaction_id = 0x2,
-        .source = base_addr,
-        .target = from,
+        .transaction_id = @bitCast(@as(u96, 0x2)),
+        .pair = 0,
     });
 
     var buffer: [1024]u8 = undefined;
@@ -1351,12 +1368,11 @@ test "handleTimeout: connected transitions to completed once keep_alive_deadline
     core.disconnected_connection_deadline = 100_000;
     core.keep_alive_deadline = 1000;
 
-    const base_addr = try IpAddress.parse("192.168.1.100", 1000);
     const from = try IpAddress.parse("192.168.1.120", 2000);
-    core.remote_candidates[0] = .initHost(from);
+    core.remote_candidates[0] = testRemoteCandidate(from);
     core.remote_candidates_len = 1;
     try core.pairs.append(testing.allocator, .{ .local = 0, .remote = 0, .status = .succeeded, .priority = 0 });
-    try core.pending_requests.append(testing.allocator, .{ .transaction_id = 0x1, .source = base_addr, .target = from });
+    try core.pending_requests.append(testing.allocator, .{ .transaction_id = @bitCast(@as(u96, 0x1)), .pair = 0 });
 
     try core.handleTimeout(1000);
 
@@ -1473,3 +1489,65 @@ test "setRemoteCredentials: replaces and frees the previous value" {
     try testing.expectEqualStrings("second-password-0123456789", core.remote_credentials.?.getPassword());
 }
 
+fn testFillPairs(core: *Agent) void {
+    for (0..max_pairs) |i| {
+        core.pairs[i] = .{ .local = 0, .remote = 0, .priority = @intCast(i + 1), .status = .waiting };
+    }
+    core.pairs_len = max_pairs;
+}
+
+test "addPair: replaces a failed pair when full" {
+    var core = try testNewAgent(.controlling);
+    defer core.deinit();
+
+    testFillPairs(&core);
+    core.pairs[3].status = .failed;
+
+    core.addPair(.{ .local = 0, .remote = 0, .priority = 999, .status = .waiting });
+
+    try testing.expectEqual(max_pairs, core.pairs_len);
+    try testing.expectEqual(999, core.pairs[3].priority);
+    try testing.expectEqual(.waiting, core.pairs[3].status);
+}
+
+test "addPair: replaces the lowest-priority pair when full and no failed pairs" {
+    var core = try testNewAgent(.controlling);
+    defer core.deinit();
+
+    testFillPairs(&core);
+    // Lowest priority (1) is at index 0.
+
+    core.addPair(.{ .local = 0, .remote = 0, .priority = 999, .status = .waiting });
+
+    try testing.expectEqual(max_pairs, core.pairs_len);
+    try testing.expectEqual(999, core.pairs[0].priority);
+}
+
+test "addPair: drops the new pair when full and it doesn't improve on the lowest priority" {
+    var core = try testNewAgent(.controlling);
+    defer core.deinit();
+
+    testFillPairs(&core);
+
+    core.addPair(.{ .local = 0, .remote = 0, .priority = 1, .status = .waiting });
+
+    try testing.expectEqual(max_pairs, core.pairs_len);
+    try testing.expectEqual(1, core.pairs[0].priority);
+}
+
+test "addPendingRequest: evicts the oldest entry (FIFO) when full" {
+    var core = try testNewAgent(.controlling);
+    defer core.deinit();
+
+    const addr = try IpAddress.parse("10.0.0.1", 1000);
+    for (0..max_pending_requests) |i| {
+        core.pending_requests[i] = .{ .transaction_id = @intCast(i), .source = addr, .target = addr };
+    }
+    core.pending_requests_len = max_pending_requests;
+
+    core.addPendingRequest(.{ .transaction_id = 999, .source = addr, .target = addr });
+
+    try testing.expectEqual(max_pending_requests, core.pending_requests_len);
+    try testing.expectEqual(1, core.pending_requests[0].transaction_id);
+    try testing.expectEqual(999, core.pending_requests[max_pending_requests - 1].transaction_id);
+}
