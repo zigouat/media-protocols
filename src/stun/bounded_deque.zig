@@ -23,6 +23,11 @@ pub fn BoundedDeque(comptime T: type, comptime capacity: usize) type {
             self.len -= 1;
             return value;
         }
+
+        pub fn clear(self: *Self) void {
+            self.head = 0;
+            self.len = 0;
+        }
     };
 }
 

@@ -54,7 +54,7 @@ pub const Event = union(enum) {
     nominated: IpAddress,
     connectivity_check: void,
     consent_freshness: void,
-    candidate: Candidate,
+    candidate: u8,
 };
 
 /// The maximum number of binding requests sent on a pair before it is
@@ -65,21 +65,25 @@ pub const keep_alive_interval: i64 = 4 * std.time.ms_per_s;
 
 // Comptime values
 const auth_info_size: u8 = 64;
+const max_transmits: u8 = 5;
+const max_candidates: u8 = 16;
+const max_events: u8 = 15;
 
 allocator: std.mem.Allocator,
-connection_state: ice.ConnectionState = .new,
-gathering_state: ice.GatheringState = .new,
-
 random: std.Random,
 
-role: ice.Role,
 credentials: LocalCredentials(auth_info_size),
-remote_credentials: ?LocalCredentials(auth_info_size) = null,
+remote_credentials: ?LocalCredentials(auth_info_size),
+connection_state: ice.ConnectionState,
+gathering_state: ice.GatheringState,
+role: ice.Role,
 tie_breaker: u64,
 
 // Candidates and sockets
-candidates: std.ArrayList(Candidate) = .empty,
-remote_candidates: std.ArrayList(Candidate) = .empty,
+candidates: [max_candidates]Candidate = undefined,
+candidates_len: u8 = 0,
+remote_candidates: [max_candidates]Candidate = undefined,
+remote_candidates_len: u8 = 0,
 pairs: std.ArrayList(CandidatePair) = .empty,
 pending_requests: std.ArrayList(PendingRequest) = .empty,
 // This is a peer for which a use-candidate request is sent, but we didn't
@@ -90,12 +94,13 @@ nominated_pair: ?SelectedPair = null,
 
 failed_timeout: u32,
 disconnected_timeout: u32,
+
 connectivity_check_deadline: i64,
 disconnected_connection_deadline: i64, // used for both disconnected and failed states
 keep_alive_deadline: i64,
 
-events_out: std.Deque(Event),
-transmits: stun.BoundedDeque(stun.TransportMessage, 10),
+events_out: stun.BoundedDeque(Event, max_events),
+transmits: stun.BoundedDeque(stun.TransportMessage, max_transmits),
 
 const PendingRequest = struct {
     transaction_id: u96,
@@ -179,9 +184,12 @@ pub const Config = struct {
 pub fn init(allocator: std.mem.Allocator, config: Config) error{CredentialsTooLong}!Agent {
     return .{
         .allocator = allocator,
-        .role = config.role,
-        .credentials = try .init(config.credentials.username, config.credentials.password),
         .random = config.random,
+        .role = config.role,
+        .connection_state = .new,
+        .gathering_state = .new,
+        .credentials = try .init(config.credentials.username, config.credentials.password),
+        .remote_credentials = null,
         .tie_breaker = config.random.int(u64),
         .connectivity_check_deadline = std.math.maxInt(i64),
         .keep_alive_deadline = std.math.maxInt(i64),
@@ -197,9 +205,8 @@ pub fn deinit(agent: *Agent) void {
     agent.close();
     agent.pairs.deinit(agent.allocator);
     agent.pending_requests.deinit(agent.allocator);
-    agent.candidates.deinit(agent.allocator);
-    agent.remote_candidates.deinit(agent.allocator);
-    agent.events_out.deinit(agent.allocator);
+    agent.events_out.clear();
+    agent.transmits.clear();
 }
 
 pub fn close(core: *Agent) void {
@@ -207,8 +214,8 @@ pub fn close(core: *Agent) void {
 
     core.pairs.clearAndFree(core.allocator);
     core.pending_requests.clearAndFree(core.allocator);
-    core.candidates.clearAndFree(core.allocator);
-    core.remote_candidates.clearAndFree(core.allocator);
+    core.candidates_len = 0;
+    core.remote_candidates_len = 0;
 }
 
 pub fn getRemoteCredentials(core: *const Agent) ?ice.Credentials {
@@ -222,14 +229,14 @@ pub fn getLocalCredentials(core: *const Agent) ice.Credentials {
 pub fn addLocalAddrs(core: *Agent, addrs: []const IpAddress) !void {
     for (addrs) |addr| {
         const candidate = Candidate.initHost(addr);
-        if (try core.addLocalCandidate(candidate)) {
-            try core.events_out.pushBack(core.allocator, .{ .candidate = candidate });
+        if (try core.addLocalCandidate(candidate)) |idx| {
+            try core.events_out.pushBack(.{ .candidate = @intCast(idx) });
         }
     }
 
     // since there's no support for stun/turn servers, we can immediately transition to the "gathering done" state
     core.gathering_state = .complete;
-    try core.events_out.pushBack(core.allocator, .{ .gathering_state = core.gathering_state });
+    try core.events_out.pushBack(.{ .gathering_state = core.gathering_state });
 }
 
 pub fn setRemoteCredentials(agent: *Agent, credentials: ice.Credentials, now: i64) !void {
@@ -238,11 +245,11 @@ pub fn setRemoteCredentials(agent: *Agent, credentials: ice.Credentials, now: i6
 }
 
 pub fn addServerReflexiveCandidate(core: *Agent, base: IpAddress, mapped: IpAddress) !?Candidate {
-    for (core.candidates.items) |candidate|
+    for (core.candidates[0..core.candidates_len]) |candidate|
         if (candidate.candidate_type == .host and ipEql(&candidate.base, &mapped)) return null;
 
     const candidate = Candidate.initServerReflexive(base, mapped);
-    return if (try core.addLocalCandidate(candidate)) candidate else null;
+    return if (try core.addLocalCandidate(candidate)) |_| candidate else null;
 }
 
 pub fn handleConsentFreshness(agent: *Agent, from: *const IpAddress, message: []const u8, buffer: []u8) !?[]const u8 {
@@ -263,11 +270,10 @@ pub fn handleConsentFreshness(agent: *Agent, from: *const IpAddress, message: []
     return null;
 }
 
-pub fn addRemoteCandidate(core: *Agent, remote_candidate: Candidate) std.mem.Allocator.Error!void {
-    try core.remote_candidates.append(core.allocator, remote_candidate);
-    const remote_idx = core.remote_candidates.items.len - 1;
+pub fn addRemoteCandidate(core: *Agent, remote_candidate: Candidate) !void {
+    const remote_idx = try core.appendRemoteCandidate(remote_candidate);
 
-    outer_loop: for (core.candidates.items, 0..) |candidate, local_idx| {
+    outer_loop: for (core.candidates[0..core.candidates_len], 0..) |candidate, local_idx| {
         if (std.meta.activeTag(remote_candidate.address) != std.meta.activeTag(candidate.base)) continue;
         for (core.pairs.items) |*pair| {
             const local = core.getPairLocal(pair);
@@ -285,13 +291,12 @@ pub fn addRemoteCandidate(core: *Agent, remote_candidate: Candidate) std.mem.All
 }
 
 /// Returns `false` if an identical candidate already exists.
-pub fn addLocalCandidate(core: *Agent, candidate: Candidate) std.mem.Allocator.Error!bool {
-    for (core.candidates.items) |*existing| if (existing.eql(&candidate)) return false;
+pub fn addLocalCandidate(core: *Agent, candidate: Candidate) !?usize {
+    for (core.candidates[0..core.candidates_len]) |*existing| if (existing.eql(&candidate)) return null;
 
-    try core.candidates.append(core.allocator, candidate);
-    const idx = core.candidates.items.len - 1;
+    const idx = try core.appendCandidate(candidate);
 
-    outer_loop: for (core.remote_candidates.items, 0..) |remote_candidate, remote_idx| {
+    outer_loop: for (core.remote_candidates[0..core.remote_candidates_len], 0..) |remote_candidate, remote_idx| {
         if (std.meta.activeTag(remote_candidate.address) != std.meta.activeTag(candidate.base)) continue;
 
         for (core.pairs.items) |*pair| {
@@ -308,7 +313,7 @@ pub fn addLocalCandidate(core: *Agent, candidate: Candidate) std.mem.Allocator.E
         });
     }
 
-    return true;
+    return idx;
 }
 
 /// Begin a connectivity-check round. Returns null when a pair is already
@@ -320,12 +325,12 @@ pub fn beginConnectivityChecks(agent: *Agent) ?ConnectivityChecks {
     return .{ .agent = agent };
 }
 
-pub fn handleTimeout(agent: *Agent, now: i64) std.mem.Allocator.Error!void {
+pub fn handleTimeout(agent: *Agent, now: i64) error{Overflow}!void {
     if (agent.connection_state == .closed) return;
 
     if (now >= agent.connectivity_check_deadline) {
         agent.connectivity_check_deadline = now + connectivity_check_interval;
-        try agent.events_out.pushBack(agent.allocator, .connectivity_check);
+        try agent.events_out.pushBack(.connectivity_check);
     }
 
     if (now >= agent.keep_alive_deadline) {
@@ -333,7 +338,7 @@ pub fn handleTimeout(agent: *Agent, now: i64) std.mem.Allocator.Error!void {
         if (agent.connection_state == .connected) {
             try agent.setConnectionState(.completed, now);
         }
-        try agent.events_out.pushBack(agent.allocator, .consent_freshness);
+        try agent.events_out.pushBack(.consent_freshness);
     }
 
     if (now >= agent.disconnected_connection_deadline) {
@@ -443,6 +448,22 @@ pub fn toggleRole(agent: *Agent) void {
     }
 }
 
+fn appendCandidate(core: *Agent, candidate: Candidate) error{Overflow}!usize {
+    if (core.candidates_len >= max_candidates) return error.Overflow;
+    const idx = core.candidates_len;
+    core.candidates[idx] = candidate;
+    core.candidates_len += 1;
+    return idx;
+}
+
+fn appendRemoteCandidate(core: *Agent, candidate: Candidate) error{Overflow}!usize {
+    if (core.remote_candidates_len >= max_candidates) return error.Overflow;
+    const idx = core.remote_candidates_len;
+    core.remote_candidates[idx] = candidate;
+    core.remote_candidates_len += 1;
+    return idx;
+}
+
 fn setConnectionState(agent: *Agent, state: ice.ConnectionState, now: i64) !void {
     agent.connection_state = state;
     switch (agent.connection_state) {
@@ -456,7 +477,7 @@ fn setConnectionState(agent: *Agent, state: ice.ConnectionState, now: i64) !void
         },
         .completed => {
             agent.connectivity_check_deadline = std.math.maxInt(i64);
-            agent.remote_candidates.clearAndFree(agent.allocator);
+            agent.remote_candidates_len = 0;
             agent.pairs.clearAndFree(agent.allocator);
             agent.pending_requests.clearAndFree(agent.allocator);
         },
@@ -469,7 +490,7 @@ fn setConnectionState(agent: *Agent, state: ice.ConnectionState, now: i64) !void
         else => {},
     }
 
-    try agent.events_out.pushBack(agent.allocator, .{ .connection_state = agent.connection_state });
+    try agent.events_out.pushBack(.{ .connection_state = agent.connection_state });
 }
 
 fn handleStunMessage(agent: *Agent, message: stun.TransportMessage, now: i64, buffer: []u8) !ReadResult {
@@ -495,7 +516,7 @@ fn handleStunMessage(agent: *Agent, message: stun.TransportMessage, now: i64, bu
 
     if (!was_nominated) if (agent.nominated_pair) |pair| {
         try agent.setConnectionState(.connected, now);
-        try agent.events_out.pushBack(agent.allocator, .{ .nominated = pair.local.base });
+        try agent.events_out.pushBack(.{ .nominated = pair.local.base });
     };
 
     return .consumed;
@@ -506,7 +527,7 @@ fn handleAppData(agent: *Agent, sender: *const IpAddress, data: []const u8) !Rea
         .connected, .completed, .disconnected => return .{ .app_data = data },
         else => {
             for (agent.pairs.items) |*candidate_pair| {
-                const remote = &agent.remote_candidates.items[candidate_pair.remote];
+                const remote = &agent.remote_candidates[candidate_pair.remote];
                 if (remote.address.eql(sender)) return .{ .app_data = data };
             } else Logger.debug("Drop non stun message from unknown remote candidate: {f}", .{sender});
         },
@@ -542,7 +563,7 @@ fn handleRequest(agent: *Agent, msg: *const stun.Message, base_addr: *const IpAd
         }
     } else {
         const local_idx = agent.findLocalCandidate(base_addr, base_addr) orelse return error.NoLocalCandidate;
-        const local_candidate = agent.candidates.items[local_idx];
+        const local_candidate = agent.candidates[local_idx];
 
         const remote_idx: u32 = agent.findRemoteCandidate(from) orelse blk: {
             const candidate = Candidate{
@@ -551,8 +572,7 @@ fn handleRequest(agent: *Agent, msg: *const stun.Message, base_addr: *const IpAd
                 .candidate_type = .prflx,
                 .priority = stun_req.priority,
             };
-            try agent.remote_candidates.append(agent.allocator, candidate);
-            break :blk @intCast(agent.remote_candidates.items.len - 1);
+            break :blk @intCast(try agent.appendRemoteCandidate(candidate));
         };
 
         try agent.pairs.append(agent.allocator, .{
@@ -594,10 +614,9 @@ fn handleSuccessResponse(core: *Agent, msg: *const stun.Message, base_addr: *con
 
         const local_idx: u32 = core.findLocalCandidate(base_addr, &mapped_address) orelse blk: {
             const prflx_candidate: Candidate = .initPeerReflexive(base_addr.*, mapped_address);
-            try core.candidates.append(core.allocator, prflx_candidate);
-            break :blk @intCast(core.candidates.items.len - 1);
+            break :blk @intCast(try core.appendCandidate(prflx_candidate));
         };
-        const local_candidate = core.candidates.items[local_idx];
+        const local_candidate = core.candidates[local_idx];
         const remote_candidate = core.getPairRemote(candidate_pair);
 
         if (core.findCandidatePairByLocalAndRemote(&local_candidate, from)) |existing_candidate_pair| {
@@ -687,14 +706,14 @@ fn maybeSetNominatedField(core: *Agent, candidate_pair: *CandidatePair) void {
 }
 
 fn findLocalCandidate(core: *Agent, base: *const IpAddress, addr: *const IpAddress) ?u32 {
-    for (core.candidates.items, 0..) |candidate, idx| {
+    for (core.candidates[0..core.candidates_len], 0..) |candidate, idx| {
         if (candidate.base.eql(base) and candidate.address.eql(addr)) return @intCast(idx);
     }
     return null;
 }
 
 fn findRemoteCandidate(core: *Agent, addr: *const IpAddress) ?u32 {
-    for (core.remote_candidates.items, 0..) |candidate, idx| if (candidate.address.eql(addr)) return @intCast(idx);
+    for (core.remote_candidates[0..core.remote_candidates_len], 0..) |candidate, idx| if (candidate.address.eql(addr)) return @intCast(idx);
     return null;
 }
 
@@ -707,11 +726,11 @@ fn findCandidatePairByLocalAndRemote(core: *Agent, local: *const Candidate, remo
 }
 
 fn getPairLocal(core: *Agent, pair: *const CandidatePair) *const Candidate {
-    return &core.candidates.items[pair.local];
+    return &core.candidates[pair.local];
 }
 
 fn getPairRemote(core: *Agent, pair: *const CandidatePair) *const Candidate {
-    return &core.remote_candidates.items[pair.remote];
+    return &core.remote_candidates[pair.remote];
 }
 
 const testing = std.testing;
@@ -829,7 +848,7 @@ test "handleRequest: create peer reflexive candidate" {
     try testing.expectEqual(1, core.pairs.items.len);
 
     const candidate_pair = core.pairs.items[0];
-    const remote = core.remote_candidates.items[candidate_pair.remote];
+    const remote = core.remote_candidates[candidate_pair.remote];
     try testing.expect(remote.address.eql(&from));
     try testing.expectEqual(remote.priority, 0x9090);
 
@@ -848,8 +867,10 @@ test "handleRequest: nominate peer" {
     const base_addr = try IpAddress.parse("192.168.1.100", 1000);
     const from = try IpAddress.parse("192.168.1.120", 2000);
 
-    try agent.candidates.append(testing.allocator, .initHost(base_addr));
-    try agent.remote_candidates.append(testing.allocator, .initHost(from));
+    agent.candidates[0] = .initHost(base_addr);
+    agent.candidates_len = 1;
+    agent.remote_candidates[0] = .initHost(from);
+    agent.remote_candidates_len = 1;
     try agent.pairs.append(testing.allocator, .{
         .local = 0,
         .remote = 0,
@@ -930,15 +951,15 @@ test "addLocalCandidate: forms pairs with existing remote candidates" {
     try core.addRemoteCandidate(Candidate.initHost(try IpAddress.parse("192.168.1.10", 1000)));
     try core.addRemoteCandidate(Candidate.initHost(try IpAddress.parse("192.168.1.11", 1001)));
 
-    try testing.expectEqual(2, core.remote_candidates.items.len);
+    try testing.expectEqual(2, core.remote_candidates_len);
     try testing.expectEqual(0, core.pairs.items.len);
 
     const local = try IpAddress.parse("10.0.0.1", 2000);
     try core.addLocalAddrs(&.{local});
 
-    try testing.expectEqual(1, core.candidates.items.len);
+    try testing.expectEqual(1, core.candidates_len);
     try testing.expectEqual(2, core.pairs.items.len);
-    for (core.pairs.items) |pair| try testing.expect(core.candidates.items[pair.local].base.eql(&local));
+    for (core.pairs.items) |pair| try testing.expect(core.candidates[pair.local].base.eql(&local));
 
     try core.addLocalAddrs(&.{local});
     try testing.expectEqual(2, core.pairs.items.len);
@@ -951,15 +972,15 @@ test "addRemoteCandidate: forms pairs with existing local candidates" {
     try core.addLocalAddrs(&.{try IpAddress.parse("10.0.0.1", 2000)});
     try core.addLocalAddrs(&.{try IpAddress.parse("10.0.0.2", 2001)});
 
-    try testing.expectEqual(2, core.candidates.items.len);
+    try testing.expectEqual(2, core.candidates_len);
     try testing.expectEqual(0, core.pairs.items.len);
 
     const remote = try IpAddress.parse("192.168.1.10", 1000);
     try core.addRemoteCandidate(Candidate.initHost(remote));
 
-    try testing.expectEqual(1, core.remote_candidates.items.len);
+    try testing.expectEqual(1, core.remote_candidates_len);
     try testing.expectEqual(2, core.pairs.items.len);
-    for (core.pairs.items) |pair| try testing.expect(core.remote_candidates.items[pair.remote].address.eql(&remote));
+    for (core.pairs.items) |pair| try testing.expect(core.remote_candidates[pair.remote].address.eql(&remote));
 
     try core.addRemoteCandidate(Candidate.initHost(remote));
     try testing.expectEqual(2, core.pairs.items.len);
@@ -996,9 +1017,9 @@ test "addLocalCandidate: reports whether the candidate was added" {
     defer core.deinit();
 
     const candidate = Candidate.initHost(try IpAddress.parse("10.0.0.1", 2000));
-    try testing.expect(try core.addLocalCandidate(candidate));
-    try testing.expect(!try core.addLocalCandidate(candidate));
-    try testing.expectEqual(1, core.candidates.items.len);
+    try testing.expect(try core.addLocalCandidate(candidate) != null);
+    try testing.expectEqual(null, try core.addLocalCandidate(candidate));
+    try testing.expectEqual(1, core.candidates_len);
 }
 
 test "addServerReflexiveCandidate: skips candidate redundant with host" {
@@ -1009,16 +1030,16 @@ test "addServerReflexiveCandidate: skips candidate redundant with host" {
     try core.addLocalAddrs(&.{base});
 
     try testing.expectEqual(null, try core.addServerReflexiveCandidate(base, try IpAddress.parse("10.0.0.1", 3000)));
-    try testing.expectEqual(1, core.candidates.items.len);
+    try testing.expectEqual(1, core.candidates_len);
 
     const mapped = try IpAddress.parse("203.0.113.5", 3000);
     const srflx = try core.addServerReflexiveCandidate(base, mapped);
     try testing.expect(srflx != null);
     try testing.expect(srflx.?.address.eql(&mapped));
-    try testing.expectEqual(2, core.candidates.items.len);
+    try testing.expectEqual(2, core.candidates_len);
 
     try testing.expectEqual(null, try core.addServerReflexiveCandidate(base, mapped));
-    try testing.expectEqual(2, core.candidates.items.len);
+    try testing.expectEqual(2, core.candidates_len);
 }
 
 test "toggleRole: flips role, tie breaker and pair priorities" {
@@ -1071,8 +1092,10 @@ test "handleInput: forwards non-stun data from a known remote candidate pair" {
     const from = try IpAddress.parse("192.168.1.120", 2000);
     var resp_buffer: [64]u8 = undefined;
 
-    try core.candidates.append(testing.allocator, .initHost(base_addr));
-    try core.remote_candidates.append(testing.allocator, .initHost(from));
+    core.candidates[0] = .initHost(base_addr);
+    core.candidates_len = 1;
+    core.remote_candidates[0] = .initHost(from);
+    core.remote_candidates_len = 1;
     try core.pairs.append(testing.allocator, .{ .local = 0, .remote = 0, .status = .in_progress, .priority = 0 });
 
     const result = try core.handleRead(.{ .from = &from, .to = &base_addr, .data = "hello" }, 0, &resp_buffer);
@@ -1197,8 +1220,10 @@ test "handleInput: success response completes the pending request and marks the 
     const base_addr = try IpAddress.parse("192.168.1.100", 1000);
     const from = try IpAddress.parse("192.168.1.120", 2000);
 
-    try core.candidates.append(testing.allocator, .initHost(base_addr));
-    try core.remote_candidates.append(testing.allocator, .initHost(from));
+    core.candidates[0] = .initHost(base_addr);
+    core.candidates_len = 1;
+    core.remote_candidates[0] = .initHost(from);
+    core.remote_candidates_len = 1;
     try core.pairs.append(testing.allocator, .{ .local = 0, .remote = 0, .status = .in_progress, .priority = 0 });
     try core.pending_requests.append(testing.allocator, .{
         .transaction_id = 0x2,
@@ -1227,8 +1252,10 @@ test "handleInput: success response nominates the pair and transitions to connec
     const base_addr = try IpAddress.parse("192.168.1.100", 1000);
     const from = try IpAddress.parse("192.168.1.120", 2000);
 
-    try core.candidates.append(testing.allocator, .initHost(base_addr));
-    try core.remote_candidates.append(testing.allocator, .initHost(from));
+    core.candidates[0] = .initHost(base_addr);
+    core.candidates_len = 1;
+    core.remote_candidates[0] = .initHost(from);
+    core.remote_candidates_len = 1;
     try core.pairs.append(testing.allocator, .{
         .local = 0,
         .remote = 0,
@@ -1326,14 +1353,15 @@ test "handleTimeout: connected transitions to completed once keep_alive_deadline
 
     const base_addr = try IpAddress.parse("192.168.1.100", 1000);
     const from = try IpAddress.parse("192.168.1.120", 2000);
-    try core.remote_candidates.append(testing.allocator, .initHost(from));
+    core.remote_candidates[0] = .initHost(from);
+    core.remote_candidates_len = 1;
     try core.pairs.append(testing.allocator, .{ .local = 0, .remote = 0, .status = .succeeded, .priority = 0 });
     try core.pending_requests.append(testing.allocator, .{ .transaction_id = 0x1, .source = base_addr, .target = from });
 
     try core.handleTimeout(1000);
 
     try testing.expectEqual(.completed, core.connection_state);
-    try testing.expectEqual(0, core.remote_candidates.items.len);
+    try testing.expectEqual(0, core.remote_candidates_len);
     try testing.expectEqual(0, core.pairs.items.len);
     try testing.expectEqual(0, core.pending_requests.items.len);
     try testing.expectEqual(1000 + keep_alive_interval, core.keep_alive_deadline);
