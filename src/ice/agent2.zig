@@ -19,7 +19,6 @@ pub const Event = union(enum) {
     connection_state: ice.ConnectionState,
     gathering_state: ice.GatheringState,
     nominated: IpAddress,
-    data: []const u8,
     connectivity_check: void,
     consent_freshness: void,
     candidate: Candidate,
@@ -308,43 +307,32 @@ pub fn handleTimeout(agent: *Agent, now: i64) std.mem.Allocator.Error!void {
     }
 }
 
-pub fn handleRead(agent: *Agent, message: stun.TransportMessage, now: i64, buffer: []u8) !void {
-    if (agent.connection_state == .closed) return;
+pub const ReadResult = union(enum) {
+    app_data: []const u8,
+    consumed: void,
+};
 
+pub fn handleRead(agent: *Agent, message: stun.TransportMessage, now: i64, buffer: []u8) !ReadResult {
     if (!stun.isMessage(message.data)) {
-        try agent.handleAppData(message.from, message.data);
-        return;
+        return try agent.handleAppData(message.from, message.data);
     }
 
     switch (agent.connection_state) {
-        .completed, .failed => return,
-        else => {},
-    }
+        .completed, .disconnected, .failed => |state| {
+            agent.disconnected_connection_deadline = now + agent.disconnected_timeout;
+            if (state == .disconnected) try agent.setConnectionState(.completed, now);
+            if (try agent.handleConsentFreshness(message.from, message.data, buffer)) |resp| {
+                try agent.transmits.pushBack(.{
+                    .data = resp,
+                    .from = message.to,
+                    .to = message.from,
+                });
+            }
 
-    const was_nominated = agent.nominated_pair != null;
-    const msg = try stun.Message.parse(message.data);
-
-    switch (msg.header.message_type.class()) {
-        .request => {
-            const resp = try agent.handleRequest(&msg, message.to, message.from, buffer);
-            _ = agent.detectNominatedPair();
-            try agent.transmits.pushBack(.{
-                .data = resp,
-                .from = message.to,
-                .to = message.from,
-            });
+            return .consumed;
         },
-        .success_response => {
-            try agent.handleSuccessResponse(&msg, message.to, message.from);
-            _ = agent.detectNominatedPair();
-        },
-        else => {},
+        else => return agent.handleStunMessage(message, now, buffer),
     }
-
-    if (!was_nominated) if (agent.nominated_pair) |pair| {
-        try agent.setConnectionState(.connected, now);
-        try agent.events_out.pushBack(agent.allocator, .{ .nominated = pair.local.base });
-    };
 }
 
 pub fn pollEvent(core: *Agent) ?Event {
@@ -447,18 +435,47 @@ fn setConnectionState(agent: *Agent, state: ice.ConnectionState, now: i64) !void
     try agent.events_out.pushBack(agent.allocator, .{ .connection_state = agent.connection_state });
 }
 
-fn handleAppData(agent: *Agent, sender: *const IpAddress, data: []const u8) !void {
+fn handleStunMessage(agent: *Agent, message: stun.TransportMessage, now: i64, buffer: []u8) !ReadResult {
+    const was_nominated = agent.nominated_pair != null;
+    const msg = try stun.Message.parse(message.data);
+
+    switch (msg.header.message_type.class()) {
+        .request => {
+            const resp = try agent.handleRequest(&msg, message.to, message.from, buffer);
+            _ = agent.detectNominatedPair();
+            try agent.transmits.pushBack(.{
+                .data = resp,
+                .from = message.to,
+                .to = message.from,
+            });
+        },
+        .success_response => {
+            try agent.handleSuccessResponse(&msg, message.to, message.from);
+            _ = agent.detectNominatedPair();
+        },
+        else => {},
+    }
+
+    if (!was_nominated) if (agent.nominated_pair) |pair| {
+        try agent.setConnectionState(.connected, now);
+        try agent.events_out.pushBack(agent.allocator, .{ .nominated = pair.local.base });
+    };
+
+    return .consumed;
+}
+
+fn handleAppData(agent: *Agent, sender: *const IpAddress, data: []const u8) !ReadResult {
     switch (agent.connection_state) {
-        .connected, .completed => try agent.events_out.pushBack(agent.allocator, .{ .data = data }),
+        .connected, .completed, .disconnected => return .{ .app_data = data },
         else => {
             for (agent.pairs.items) |*candidate_pair| {
                 const remote = &agent.remote_candidates.items[candidate_pair.remote];
-                if (remote.address.eql(sender)) try agent.events_out.pushBack(agent.allocator, .{ .data = data });
-            } else {
-                Logger.warn("Drop non stun message from unknown remote candidate: {f}", .{sender});
-            }
+                if (remote.address.eql(sender)) return .{ .app_data = data };
+            } else Logger.debug("Drop non stun message from unknown remote candidate: {f}", .{sender});
         },
     }
+
+    return .consumed;
 }
 
 fn handleRequest(agent: *Agent, msg: *const stun.Message, base_addr: *const IpAddress, from: *const IpAddress, buffer: []u8) ![]const u8 {
@@ -998,8 +1015,9 @@ test "handleInput: drops non-stun data from an unknown remote before connected" 
     const from = try IpAddress.parse("192.168.1.120", 2000);
     var resp_buffer: [64]u8 = undefined;
 
-    try core.handleRead(.{ .from = &from, .to = &base_addr, .data = "hello" }, 0, &resp_buffer);
+    const result = try core.handleRead(.{ .from = &from, .to = &base_addr, .data = "hello" }, 0, &resp_buffer);
 
+    try testing.expectEqual(.consumed, std.meta.activeTag(result));
     try testing.expectEqual(null, core.pollEvent());
 }
 
@@ -1015,12 +1033,11 @@ test "handleInput: forwards non-stun data from a known remote candidate pair" {
     try core.remote_candidates.append(testing.allocator, .initHost(from));
     try core.pairs.append(testing.allocator, .{ .local = 0, .remote = 0, .status = .in_progress, .priority = 0 });
 
-    try core.handleRead(.{ .from = &from, .to = &base_addr, .data = "hello" }, 0, &resp_buffer);
+    const result = try core.handleRead(.{ .from = &from, .to = &base_addr, .data = "hello" }, 0, &resp_buffer);
 
-    const event = core.pollEvent() orelse return error.ExpectedEvent;
-    switch (event) {
-        .data => |data| try testing.expectEqualStrings("hello", data),
-        else => return error.UnexpectedEvent,
+    switch (result) {
+        .app_data => |data| try testing.expectEqualStrings("hello", data),
+        else => return error.UnexpectedResult,
     }
     try testing.expectEqual(null, core.pollEvent());
 }
@@ -1034,16 +1051,15 @@ test "handleInput: forwards non-stun data once connected regardless of sender" {
     const from = try IpAddress.parse("10.0.0.5", 4000);
     var resp_buffer: [64]u8 = undefined;
 
-    try core.handleRead(.{ .from = &from, .to = &base_addr, .data = "world" }, 0, &resp_buffer);
+    const result = try core.handleRead(.{ .from = &from, .to = &base_addr, .data = "world" }, 0, &resp_buffer);
 
-    const event = core.pollEvent() orelse return error.ExpectedEvent;
-    switch (event) {
-        .data => |data| try testing.expectEqualStrings("world", data),
-        else => return error.UnexpectedEvent,
+    switch (result) {
+        .app_data => |data| try testing.expectEqualStrings("world", data),
+        else => return error.UnexpectedResult,
     }
 }
 
-test "handleInput: ignores stun messages once the connection is completed" {
+test "handleInput: completed state answers stun requests via consent freshness" {
     var core = try testNewAgent(.controlled);
     defer core.deinit();
     core.connection_state = .completed;
@@ -1060,7 +1076,14 @@ test "handleInput: ignores stun messages once the connection is completed" {
         .username = core.credentials.username,
     }, core.credentials.password, &buffer);
 
-    try core.handleRead(.{ .from = &from, .to = &base_addr, .data = msg.bytes }, 0, &resp_buffer);
+    const result = try core.handleRead(.{ .from = &from, .to = &base_addr, .data = msg.bytes }, 0, &resp_buffer);
+
+    try testing.expectEqual(.consumed, std.meta.activeTag(result));
+    try testing.expectEqual(.completed, core.connection_state);
+
+    const resp = core.pollTransmit() orelse return error.ExpectedTransmit;
+    const resp_msg = try stun.Message.parse(resp.data);
+    try testing.expectEqual(.success_response, resp_msg.header.message_type.class());
 
     try testing.expectEqual(null, core.pollEvent());
 }
@@ -1082,7 +1105,7 @@ test "handleInput: stun request produces a response event" {
         .username = core.credentials.username,
     }, core.credentials.password, &buffer);
 
-    try core.handleRead(.{ .from = &from, .to = &base_addr, .data = msg.bytes }, 0, &resp_buffer);
+    _ = try core.handleRead(.{ .from = &from, .to = &base_addr, .data = msg.bytes }, 0, &resp_buffer);
 
     const resp = core.pollTransmit() orelse return error.ExpectedTransmit;
     const resp_msg = try stun.Message.parse(resp.data);
@@ -1110,7 +1133,7 @@ test "handleInput: role conflict switches role and produces a response" {
         .username = core.credentials.username,
     }, core.credentials.password, &buffer);
 
-    try core.handleRead(.{ .from = &from, .to = &base_addr, .data = msg.bytes }, 0, &resp_buffer);
+    _ = try core.handleRead(.{ .from = &from, .to = &base_addr, .data = msg.bytes }, 0, &resp_buffer);
 
     try testing.expectEqual(.controlling, core.role);
 
@@ -1148,7 +1171,7 @@ test "handleInput: success response completes the pending request and marks the 
     var resp_buffer: [64]u8 = undefined;
     const msg = try testBuildResponse(0x2, base_addr, core.remote_credentials.?.password, &buffer);
 
-    try core.handleRead(.{ .from = &from, .to = &base_addr, .data = msg.bytes }, 0, &resp_buffer);
+    _ = try core.handleRead(.{ .from = &from, .to = &base_addr, .data = msg.bytes }, 0, &resp_buffer);
 
     try testing.expectEqual(null, core.pollEvent());
 
@@ -1187,7 +1210,7 @@ test "handleInput: success response nominates the pair and transitions to connec
     var resp_buffer: [64]u8 = undefined;
     const msg = try testBuildResponse(0x2, base_addr, core.remote_credentials.?.password, &buffer);
 
-    try core.handleRead(.{ .from = &from, .to = &base_addr, .data = msg.bytes }, 0, &resp_buffer);
+    _ = try core.handleRead(.{ .from = &from, .to = &base_addr, .data = msg.bytes }, 0, &resp_buffer);
 
     try expectConnectionStateEvent(&core, .connected);
     try expectEvent(&core, .nominated);
