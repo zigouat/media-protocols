@@ -15,6 +15,39 @@ const SelectedPair = struct {
     remote: Candidate,
 };
 
+fn LocalCredentials(comptime size: u8) type {
+    return struct {
+        buffer: [size]u8,
+        user_len: u8,
+        pass_len: u8,
+
+        fn init(username: []const u8, password: []const u8) error{CredentialsTooLong}!@This() {
+            if (username.len + password.len > size) return error.CredentialsTooLong;
+            var credentials: @This() = undefined;
+            @memcpy(credentials.buffer[0..username.len], username);
+            @memcpy(credentials.buffer[username.len .. username.len + password.len], password);
+            credentials.user_len = @intCast(username.len);
+            credentials.pass_len = @intCast(password.len);
+            return credentials;
+        }
+
+        fn getUsername(self: *const @This()) []const u8 {
+            return self.buffer[0..self.user_len];
+        }
+
+        fn getPassword(self: *const @This()) []const u8 {
+            return self.buffer[self.user_len .. self.user_len + self.pass_len];
+        }
+
+        fn toIceCredentials(self: *const @This()) ice.Credentials {
+            return .{
+                .username = self.getUsername(),
+                .password = self.getPassword(),
+            };
+        }
+    };
+}
+
 pub const Event = union(enum) {
     connection_state: ice.ConnectionState,
     gathering_state: ice.GatheringState,
@@ -30,6 +63,9 @@ pub const max_binding_requests: usize = 7;
 pub const connectivity_check_interval: i64 = 200;
 pub const keep_alive_interval: i64 = 4 * std.time.ms_per_s;
 
+// Comptime values
+const auth_info_size: u8 = 64;
+
 allocator: std.mem.Allocator,
 connection_state: ice.ConnectionState = .new,
 gathering_state: ice.GatheringState = .new,
@@ -37,8 +73,8 @@ gathering_state: ice.GatheringState = .new,
 random: std.Random,
 
 role: ice.Role,
-credentials: ice.Credentials,
-remote_credentials: ?ice.Credentials = null,
+credentials: LocalCredentials(auth_info_size),
+remote_credentials: ?LocalCredentials(auth_info_size) = null,
 tie_breaker: u64,
 
 // Candidates and sockets
@@ -140,11 +176,11 @@ pub const Config = struct {
     disconnected_timeout: u32 = 5000,
 };
 
-pub fn init(allocator: std.mem.Allocator, config: Config) Agent {
+pub fn init(allocator: std.mem.Allocator, config: Config) error{CredentialsTooLong}!Agent {
     return .{
         .allocator = allocator,
         .role = config.role,
-        .credentials = config.credentials,
+        .credentials = try .init(config.credentials.username, config.credentials.password),
         .random = config.random,
         .tie_breaker = config.random.int(u64),
         .connectivity_check_deadline = std.math.maxInt(i64),
@@ -173,12 +209,14 @@ pub fn close(core: *Agent) void {
     core.pending_requests.clearAndFree(core.allocator);
     core.candidates.clearAndFree(core.allocator);
     core.remote_candidates.clearAndFree(core.allocator);
+}
 
-    core.credentials.deinit(core.allocator);
-    if (core.remote_credentials) |*remote| {
-        remote.deinit(core.allocator);
-        core.remote_credentials = null;
-    }
+pub fn getRemoteCredentials(core: *const Agent) ?ice.Credentials {
+    return if (core.remote_credentials) |*rc| rc.toIceCredentials() else null;
+}
+
+pub fn getLocalCredentials(core: *const Agent) ice.Credentials {
+    return core.credentials.toIceCredentials();
 }
 
 pub fn addLocalAddrs(core: *Agent, addrs: []const IpAddress) !void {
@@ -195,8 +233,7 @@ pub fn addLocalAddrs(core: *Agent, addrs: []const IpAddress) !void {
 }
 
 pub fn setRemoteCredentials(agent: *Agent, credentials: ice.Credentials, now: i64) !void {
-    if (agent.remote_credentials) |*remote| remote.deinit(agent.allocator);
-    agent.remote_credentials = try credentials.dupe(agent.allocator);
+    agent.remote_credentials = try .init(credentials.username, credentials.password);
     try agent.setConnectionState(.checking, now);
 }
 
@@ -208,17 +245,17 @@ pub fn addServerReflexiveCandidate(core: *Agent, base: IpAddress, mapped: IpAddr
     return if (try core.addLocalCandidate(candidate)) candidate else null;
 }
 
-pub fn handleConsentFreshness(core: *Agent, from: *const IpAddress, message: []const u8, buffer: []u8) !?[]const u8 {
+pub fn handleConsentFreshness(agent: *Agent, from: *const IpAddress, message: []const u8, buffer: []u8) !?[]const u8 {
     const msg = try stun.Message.parse(message);
     switch (msg.header.message_type.class()) {
         .request => {
             _ = try Messages.parseAndValidateStunRequest(
                 &msg,
-                core.credentials,
-                core.role,
-                core.tie_breaker,
+                agent.credentials.toIceCredentials(),
+                agent.role,
+                agent.tie_breaker,
             );
-            return try Messages.buildSuccessResponse(&msg, core.credentials.password, from, buffer);
+            return try Messages.buildSuccessResponse(&msg, agent.credentials.getPassword(), from, buffer);
         },
         else => {},
     }
@@ -370,14 +407,14 @@ pub fn detectNominatedPair(core: *Agent) ?CandidatePair {
 }
 
 pub fn buildBindingRequest(core: *Agent, tx_id: u96, use_candidate: bool, buffer: []u8) ![]const u8 {
-    var w = stun.Writer.init(buffer, .{ .password = core.remote_credentials.?.password });
+    var w = stun.Writer.init(buffer, .{ .password = core.remote_credentials.?.getPassword() });
     try w.writeHeader(.{
         .message_type = .fromClassAndMethod(.request, .binding),
         .transaction_id = tx_id,
         .message_length = 0,
     });
 
-    var username = [_][]const u8{ core.remote_credentials.?.username, ":", core.credentials.username };
+    var username = [_][]const u8{ core.remote_credentials.?.getUsername(), ":", core.credentials.getUsername() };
     try w.writeRaw(.username, &username);
     try w.writeAttribute(.{ .priority = ice.CandidateType.prflx.priority() });
     const role_attribute: stun.Attribute = switch (core.role) {
@@ -479,11 +516,21 @@ fn handleAppData(agent: *Agent, sender: *const IpAddress, data: []const u8) !Rea
 }
 
 fn handleRequest(agent: *Agent, msg: *const stun.Message, base_addr: *const IpAddress, from: *const IpAddress, buffer: []u8) ![]const u8 {
-    const stun_req = Messages.parseAndValidateStunRequest(msg, agent.credentials, agent.role, agent.tie_breaker) catch |err| switch (err) {
-        error.RoleConflict => return try Messages.buildRoleConflictErrorMessage(msg.header.transaction_id, agent.credentials.password, buffer),
+    const stun_req = Messages.parseAndValidateStunRequest(
+        msg,
+        agent.credentials.toIceCredentials(),
+        agent.role,
+        agent.tie_breaker,
+    ) catch |err| switch (err) {
+        error.RoleConflict => return try Messages.buildRoleConflictErrorMessage(msg.header.transaction_id, agent.credentials.getPassword(), buffer),
         error.SwitchRole => blk: {
             agent.toggleRole();
-            break :blk try Messages.parseAndValidateStunRequest(msg, agent.credentials, agent.role, agent.tie_breaker);
+            break :blk try Messages.parseAndValidateStunRequest(
+                msg,
+                agent.credentials.toIceCredentials(),
+                agent.role,
+                agent.tie_breaker,
+            );
         },
         else => |e| return e,
     };
@@ -517,7 +564,7 @@ fn handleRequest(agent: *Agent, msg: *const stun.Message, base_addr: *const IpAd
         });
     }
 
-    return try Messages.buildSuccessResponse(msg, agent.credentials.password, from, buffer);
+    return try Messages.buildSuccessResponse(msg, agent.credentials.getPassword(), from, buffer);
 }
 
 fn handleSuccessResponse(core: *Agent, msg: *const stun.Message, base_addr: *const IpAddress, from: *const IpAddress) !void {
@@ -536,7 +583,7 @@ fn handleSuccessResponse(core: *Agent, msg: *const stun.Message, base_addr: *con
     if (!pending_request.source.eql(base_addr) or !pending_request.target.eql(from)) return;
 
     if (core.findCandidatePair(base_addr, from)) |candidate_pair| {
-        const mapped_address = try Messages.parseAndValidateStunResponse(msg, core.remote_credentials.?);
+        const mapped_address = try Messages.parseAndValidateStunResponse(msg, core.remote_credentials.?.getPassword());
 
         if (mapped_address.eql(base_addr)) {
             candidate_pair.status = .succeeded;
@@ -671,14 +718,9 @@ const testing = std.testing;
 var rand = std.Random.DefaultPrng.init(0xDEADBEEF);
 
 fn testNewAgent(role: ice.Role) !Agent {
-    const credentials = try (ice.Credentials{
-        .username = "user",
-        .password = "VOkJxbRl1RmTxUk/WvJxBt",
-    }).dupe(testing.allocator);
-
     return Agent.init(testing.allocator, .{
         .role = role,
-        .credentials = credentials,
+        .credentials = .{ .username = "user", .password = "VOkJxbRl1RmTxUk/WvJxBt" },
         .random = rand.random(),
     });
 }
@@ -742,8 +784,8 @@ test "handleRequest: generate success response" {
     const msg = try testBuildRequest(.{
         .ice_controlling = 0x10000,
         .priority = 0x9090,
-        .username = core.credentials.username,
-    }, core.credentials.password, &buffer);
+        .username = core.credentials.getUsername(),
+    }, core.credentials.getPassword(), &buffer);
 
     const resp = try core.handleRequest(&msg, &base_addr, &from, &resp_buffer);
     const resp_msg = try stun.Message.parse(resp);
@@ -752,7 +794,7 @@ test "handleRequest: generate success response" {
     try testing.expectEqual(.binding, resp_msg.header.message_type.method());
     try testing.expectEqual(msg.header.transaction_id, resp_msg.header.transaction_id);
 
-    var it = resp_msg.iterateAttributes(core.credentials.password);
+    var it = resp_msg.iterateAttributes(core.credentials.getPassword());
     var attr = try it.next() orelse return error.ExpectedAttribute;
     try testing.expect(attr.xor_mapped_address.eql(&from));
 
@@ -779,8 +821,8 @@ test "handleRequest: create peer reflexive candidate" {
     const msg = try testBuildRequest(.{
         .ice_controlling = 0x10000,
         .priority = 0x9090,
-        .username = core.credentials.username,
-    }, core.credentials.password, &buffer);
+        .username = core.credentials.getUsername(),
+    }, core.credentials.getPassword(), &buffer);
 
     _ = try core.handleRequest(&msg, &base_addr, &from, &resp_buffer);
 
@@ -818,9 +860,9 @@ test "handleRequest: nominate peer" {
     const msg = try testBuildRequest(.{
         .ice_controlling = 0x10000,
         .priority = 0x9090,
-        .username = agent.credentials.username,
+        .username = agent.credentials.getUsername(),
         .use_candidate = true,
-    }, agent.credentials.password, &buffer);
+    }, agent.credentials.getPassword(), &buffer);
 
     _ = try agent.handleRequest(&msg, &base_addr, &from, &resp_buffer);
 
@@ -848,8 +890,8 @@ test "handleRequest: role conflict" {
         const msg = try testBuildRequest(.{
             .ice_controlled = std.math.maxInt(u64),
             .priority = 0x9090,
-            .username = core.credentials.username,
-        }, core.credentials.password, &buffer);
+            .username = core.credentials.getUsername(),
+        }, core.credentials.getPassword(), &buffer);
 
         const resp = try core.handleRequest(&msg, &base_addr, &from, &resp_buffer);
         const resp_msg = try stun.Message.parse(resp);
@@ -859,7 +901,7 @@ test "handleRequest: role conflict" {
         try testing.expectEqual(msg.header.transaction_id, resp_msg.header.transaction_id);
         try testing.expectEqual(.controlled, core.role);
 
-        var it = resp_msg.iterateAttributes(core.credentials.password);
+        var it = resp_msg.iterateAttributes(core.credentials.getPassword());
         const attr = (try it.next()).?;
         try testing.expectEqual(.error_code, @as(stun.AttributeType, attr));
         try testing.expectEqual(.role_conflict, attr.error_code.code);
@@ -870,8 +912,8 @@ test "handleRequest: role conflict" {
         const msg = try testBuildRequest(.{
             .ice_controlled = 0,
             .priority = 0x9090,
-            .username = core.credentials.username,
-        }, core.credentials.password, &buffer);
+            .username = core.credentials.getUsername(),
+        }, core.credentials.getPassword(), &buffer);
 
         const resp = try core.handleRequest(&msg, &base_addr, &from, &resp_buffer);
         const resp_msg = try stun.Message.parse(resp);
@@ -1073,8 +1115,8 @@ test "handleInput: completed state answers stun requests via consent freshness" 
     const msg = try testBuildRequest(.{
         .ice_controlling = 0x10000,
         .priority = 0x9090,
-        .username = core.credentials.username,
-    }, core.credentials.password, &buffer);
+        .username = core.credentials.getUsername(),
+    }, core.credentials.getPassword(), &buffer);
 
     const result = try core.handleRead(.{ .from = &from, .to = &base_addr, .data = msg.bytes }, 0, &resp_buffer);
 
@@ -1102,8 +1144,8 @@ test "handleInput: stun request produces a response event" {
     const msg = try testBuildRequest(.{
         .ice_controlling = 0x10000,
         .priority = 0x9090,
-        .username = core.credentials.username,
-    }, core.credentials.password, &buffer);
+        .username = core.credentials.getUsername(),
+    }, core.credentials.getPassword(), &buffer);
 
     _ = try core.handleRead(.{ .from = &from, .to = &base_addr, .data = msg.bytes }, 0, &resp_buffer);
 
@@ -1130,8 +1172,8 @@ test "handleInput: role conflict switches role and produces a response" {
     const msg = try testBuildRequest(.{
         .ice_controlled = 0,
         .priority = 0x9090,
-        .username = core.credentials.username,
-    }, core.credentials.password, &buffer);
+        .username = core.credentials.getUsername(),
+    }, core.credentials.getPassword(), &buffer);
 
     _ = try core.handleRead(.{ .from = &from, .to = &base_addr, .data = msg.bytes }, 0, &resp_buffer);
 
@@ -1150,10 +1192,7 @@ test "handleInput: success response completes the pending request and marks the 
     var core = try testNewAgent(.controlling);
     defer core.deinit();
 
-    core.remote_credentials = try (ice.Credentials{
-        .username = "ruser",
-        .password = "peer-password-0123456789",
-    }).dupe(testing.allocator);
+    core.remote_credentials = try .init("ruser", "peer-password-0123456789");
 
     const base_addr = try IpAddress.parse("192.168.1.100", 1000);
     const from = try IpAddress.parse("192.168.1.120", 2000);
@@ -1169,7 +1208,7 @@ test "handleInput: success response completes the pending request and marks the 
 
     var buffer: [1024]u8 = undefined;
     var resp_buffer: [64]u8 = undefined;
-    const msg = try testBuildResponse(0x2, base_addr, core.remote_credentials.?.password, &buffer);
+    const msg = try testBuildResponse(0x2, base_addr, core.remote_credentials.?.getPassword(), &buffer);
 
     _ = try core.handleRead(.{ .from = &from, .to = &base_addr, .data = msg.bytes }, 0, &resp_buffer);
 
@@ -1183,10 +1222,7 @@ test "handleInput: success response nominates the pair and transitions to connec
     var core = try testNewAgent(.controlled);
     defer core.deinit();
 
-    core.remote_credentials = try (ice.Credentials{
-        .username = "ruser",
-        .password = "peer-password-0123456789",
-    }).dupe(testing.allocator);
+    core.remote_credentials = try .init("ruser", "peer-password-0123456789");
 
     const base_addr = try IpAddress.parse("192.168.1.100", 1000);
     const from = try IpAddress.parse("192.168.1.120", 2000);
@@ -1208,7 +1244,7 @@ test "handleInput: success response nominates the pair and transitions to connec
 
     var buffer: [1024]u8 = undefined;
     var resp_buffer: [64]u8 = undefined;
-    const msg = try testBuildResponse(0x2, base_addr, core.remote_credentials.?.password, &buffer);
+    const msg = try testBuildResponse(0x2, base_addr, core.remote_credentials.?.getPassword(), &buffer);
 
     _ = try core.handleRead(.{ .from = &from, .to = &base_addr, .data = msg.bytes }, 0, &resp_buffer);
 
@@ -1402,10 +1438,10 @@ test "setRemoteCredentials: replaces and frees the previous value" {
     defer core.deinit();
 
     try core.setRemoteCredentials(.{ .username = "first", .password = "first-password-0123456789" }, 0);
-    try testing.expectEqualStrings("first", core.remote_credentials.?.username);
+    try testing.expectEqualStrings("first", core.remote_credentials.?.getUsername());
 
     try core.setRemoteCredentials(.{ .username = "second", .password = "second-password-0123456789" }, 0);
-    try testing.expectEqualStrings("second", core.remote_credentials.?.username);
-    try testing.expectEqualStrings("second-password-0123456789", core.remote_credentials.?.password);
+    try testing.expectEqualStrings("second", core.remote_credentials.?.getUsername());
+    try testing.expectEqualStrings("second-password-0123456789", core.remote_credentials.?.getPassword());
 }
 
