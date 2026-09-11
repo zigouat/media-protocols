@@ -9,11 +9,9 @@ const Candidate = ice.Candidate;
 const IpAddress = std.Io.net.IpAddress;
 const Logger = std.log.scoped(.ice);
 
-const SelectedPair = struct {
-    pair: CandidatePair,
-    pair_index: u8,
-    local: Candidate,
-    remote: RemoteCandidate,
+const NominatedPair = struct {
+    local: u8,
+    remote: u8,
 };
 
 const RemoteCandidate = struct {
@@ -97,9 +95,9 @@ pairs: std.ArrayList(CandidatePair) = .empty,
 pending_requests: std.ArrayList(PendingRequest) = .empty,
 // This is a peer for which a use-candidate request is sent, but we didn't
 // receive response yet.
-selected_pair: ?SelectedPair = null,
+selected_pair: ?u8 = null,
 // This the final pair selected by this agent or the remote one.
-nominated_pair: ?SelectedPair = null,
+nominated_pair: ?NominatedPair = null,
 
 failed_timeout: u32,
 disconnected_timeout: u32,
@@ -126,19 +124,23 @@ pub const ConnectivityChecks = struct {
 
         if (!self.nomination_done) {
             self.nomination_done = true;
-            if (agent.selected_pair) |*selected| {
+            if (agent.selected_pair) |selected_idx| {
+                const pair = &agent.pairs.items[selected_idx];
+                const local = agent.getPairLocal(pair);
+                const remote = agent.getPairRemote(pair);
+
                 const tx_id = agent.random.int(u96);
                 const payload = try agent.buildBindingRequest(tx_id, true, buffer);
 
                 try agent.pending_requests.append(agent.allocator, .{
                     .transaction_id = @bitCast(tx_id),
-                    .pair = selected.pair_index,
+                    .pair = selected_idx,
                 });
 
                 return stun.TransportMessage{
                     .data = payload,
-                    .from = &selected.local.base,
-                    .to = &selected.remote.address,
+                    .from = &local.base,
+                    .to = &remote.address,
                 };
             }
         }
@@ -187,7 +189,13 @@ pub const Config = struct {
     disconnected_timeout: u32 = 5000,
 };
 
-pub fn init(allocator: std.mem.Allocator, config: Config) !Agent {
+pub fn init(allocator: std.mem.Allocator, config: Config) error{ OutOfMemory, CredentialsTooLong }!Agent {
+    var pairs: std.ArrayList(CandidatePair) = try .initCapacity(allocator, initial_pairs_capacity);
+    errdefer pairs.deinit(allocator);
+
+    var pending_requests: std.ArrayList(PendingRequest) = try .initCapacity(allocator, initial_pending_requests_capacity);
+    errdefer pending_requests.deinit(allocator);
+
     return .{
         .allocator = allocator,
         .random = config.random,
@@ -204,8 +212,8 @@ pub fn init(allocator: std.mem.Allocator, config: Config) !Agent {
         .disconnected_timeout = config.disconnected_timeout,
         .events_out = .empty,
         .transmits = .empty,
-        .pairs = try .initCapacity(allocator, initial_pairs_capacity),
-        .pending_requests = try .initCapacity(allocator, initial_pending_requests_capacity),
+        .pairs = pairs,
+        .pending_requests = pending_requests,
     };
 }
 
@@ -232,6 +240,10 @@ pub fn getRemoteCredentials(core: *const Agent) ?ice.Credentials {
 
 pub fn getLocalCredentials(core: *const Agent) ice.Credentials {
     return core.credentials.toIceCredentials();
+}
+
+pub fn getNominatedRemoteAddress(core: *const Agent) ?IpAddress {
+    return if (core.nominated_pair) |nominated| core.remote_candidates[nominated.remote].address else null;
 }
 
 pub fn addLocalAddrs(core: *Agent, addrs: []const IpAddress) !void {
@@ -406,18 +418,12 @@ pub fn pollTimeout(core: *Agent) ?i64 {
     return if (deadline == std.math.maxInt(i64)) null else deadline;
 }
 
-pub fn detectNominatedPair(core: *Agent) ?CandidatePair {
-    if (core.role == .controlling or core.nominated_pair != null) return null;
-    for (core.pairs.items, 0..) |pair, idx| if (pair.nominated) {
-        core.nominated_pair = .{
-            .pair = pair,
-            .pair_index = @intCast(idx),
-            .local = core.getPairLocal(&pair).*,
-            .remote = core.getPairRemote(&pair).*,
-        };
-        return pair;
+pub fn detectNominatedPair(core: *Agent) void {
+    if (core.role == .controlling or core.nominated_pair != null) return;
+    for (core.pairs.items) |pair| if (pair.nominated) {
+        core.nominated_pair = .{ .local = @intCast(pair.local), .remote = @intCast(pair.remote) };
+        return;
     };
-    return null;
 }
 
 pub fn buildBindingRequest(core: *Agent, tx_id: u96, use_candidate: bool, buffer: []u8) ![]const u8 {
@@ -486,7 +492,6 @@ fn setConnectionState(agent: *Agent, state: ice.ConnectionState, now: i64) !void
         },
         .completed => {
             agent.connectivity_check_deadline = std.math.maxInt(i64);
-            agent.remote_candidates_len = 0;
             agent.pairs.clearAndFree(agent.allocator);
             agent.pending_requests.clearAndFree(agent.allocator);
         },
@@ -509,7 +514,7 @@ fn handleStunMessage(agent: *Agent, message: stun.TransportMessage, now: i64, bu
     switch (msg.header.message_type.class()) {
         .request => {
             const resp = try agent.handleRequest(&msg, message.to, message.from, buffer);
-            _ = agent.detectNominatedPair();
+            agent.detectNominatedPair();
             try agent.transmits.pushBack(.{
                 .data = resp,
                 .from = message.to,
@@ -518,14 +523,14 @@ fn handleStunMessage(agent: *Agent, message: stun.TransportMessage, now: i64, bu
         },
         .success_response => {
             try agent.handleSuccessResponse(&msg, message.to, message.from);
-            _ = agent.detectNominatedPair();
+            agent.detectNominatedPair();
         },
         else => {},
     }
 
-    if (!was_nominated) if (agent.nominated_pair) |pair| {
+    if (!was_nominated) if (agent.nominated_pair) |nominated| {
         try agent.setConnectionState(.connected, now);
-        try agent.events_out.pushBack(.{ .nominated = pair.local.base });
+        try agent.events_out.pushBack(.{ .nominated = agent.candidates[nominated.local].base });
     };
 
     return .consumed;
@@ -678,22 +683,17 @@ fn calculatePairPriority(l: u32, r: u32, role: ice.Role) u64 {
     return (@as(u64, 1) << 32) * @min(g, d) + 2 * @max(g, d) + last_part;
 }
 
-fn selectBestPair(core: *Agent) ?SelectedPair {
-    var selected_pair: ?CandidatePair = null;
-    var selected_idx: usize = 0;
+fn selectBestPair(core: *Agent) ?u8 {
+    var selected_idx: ?u8 = null;
+    var best_priority: u64 = 0;
     for (core.pairs.items, 0..) |candidate_pair, idx| if (candidate_pair.status == .succeeded) {
-        if (selected_pair == null or candidate_pair.priority > selected_pair.?.priority) {
-            selected_pair = candidate_pair;
-            selected_idx = idx;
+        if (selected_idx == null or candidate_pair.priority > best_priority) {
+            selected_idx = @intCast(idx);
+            best_priority = candidate_pair.priority;
         }
     };
 
-    return if (selected_pair) |pair| .{
-        .pair = pair,
-        .pair_index = @intCast(selected_idx),
-        .local = core.getPairLocal(&pair).*,
-        .remote = core.getPairRemote(&pair).*,
-    } else null;
+    return selected_idx;
 }
 
 fn findCandidatePair(core: *Agent, local: *const IpAddress, remote: *const IpAddress) ?*CandidatePair {
@@ -713,10 +713,12 @@ fn maybeSetNominatedField(core: *Agent, candidate_pair: *CandidatePair) void {
     if (candidate_pair.nominate_on_binding) {
         candidate_pair.nominate_on_binding = false;
         candidate_pair.nominated = true;
-    } else if (core.selected_pair != null and core.pairsEql(&core.selected_pair.?.pair, candidate_pair)) {
-        core.nominated_pair = core.selected_pair;
-        core.nominated_pair.?.pair.nominated = true;
-        core.selected_pair = null;
+    } else if (core.selected_pair) |selected_idx| {
+        if (core.pairsEql(&core.pairs.items[selected_idx], candidate_pair)) {
+            core.nominated_pair = .{ .local = @intCast(candidate_pair.local), .remote = @intCast(candidate_pair.remote) };
+            candidate_pair.nominated = true;
+            core.selected_pair = null;
+        }
     }
 }
 
@@ -1377,7 +1379,7 @@ test "handleTimeout: connected transitions to completed once keep_alive_deadline
     try core.handleTimeout(1000);
 
     try testing.expectEqual(.completed, core.connection_state);
-    try testing.expectEqual(0, core.remote_candidates_len);
+    try testing.expectEqual(1, core.remote_candidates_len);
     try testing.expectEqual(0, core.pairs.items.len);
     try testing.expectEqual(0, core.pending_requests.items.len);
     try testing.expectEqual(1000 + keep_alive_interval, core.keep_alive_deadline);
