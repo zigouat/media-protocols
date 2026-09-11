@@ -1,6 +1,5 @@
 pub const Agent = @import("agent.zig");
 pub const Agent2 = @import("agent2.zig");
-pub const TimerManager = @import("timer_manager.zig");
 
 const std = @import("std");
 const Io = std.Io;
