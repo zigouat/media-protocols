@@ -544,7 +544,7 @@ fn handleSuccessResponse(core: *Core, msg: *const stun.Message, base_addr: IpAdd
     if (!pending_request.source.eql(&base_addr) or !pending_request.target.eql(&from)) return;
 
     if (core.findCandidatePair(&base_addr, &from)) |candidate_pair| {
-        const mapped_address = try Messages.parseAndValidateStunResponse(msg, core.remote_credentials.?);
+        const mapped_address = try Messages.parseAndValidateStunResponse(msg, core.remote_credentials.?.password);
 
         if (mapped_address.eql(&base_addr)) {
             candidate_pair.status = .succeeded;

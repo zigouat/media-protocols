@@ -73,8 +73,8 @@ pub fn parseAndValidateStunRequest(
     return stun_request;
 }
 
-pub fn parseAndValidateStunResponse(msg: *const stun.Message, credentials: ice.Credentials) !IpAddress {
-    var it = msg.iterateAttributes(credentials.password);
+pub fn parseAndValidateStunResponse(msg: *const stun.Message, pass: []const u8) !IpAddress {
+    var it = msg.iterateAttributes(pass);
     var has_fingerprint: bool = false;
     var has_message_integrity = false;
     var maybe_addr: ?IpAddress = null;
@@ -263,7 +263,7 @@ test "parseAndValidateStunResponse: valid response" {
     var buffer: [256]u8 = undefined;
     const msg = try buildResponse(&buffer, addr, true, true);
 
-    const parsed = try parseAndValidateStunResponse(&msg, test_credentials);
+    const parsed = try parseAndValidateStunResponse(&msg, test_credentials.password);
     try testing.expect(parsed.eql(&addr));
 }
 
@@ -271,18 +271,18 @@ test "parseAndValidateStunResponse: missing fingerprint" {
     const addr = IpAddress{ .ip4 = .{ .bytes = .{ 192, 0, 2, 1 }, .port = 32853 } };
     var buffer: [256]u8 = undefined;
     const msg = try buildResponse(&buffer, addr, true, false);
-    try testing.expectError(error.InvalidStunMessage, parseAndValidateStunResponse(&msg, test_credentials));
+    try testing.expectError(error.InvalidStunMessage, parseAndValidateStunResponse(&msg, test_credentials.password));
 }
 
 test "parseAndValidateStunResponse: missing message integrity" {
     const addr = IpAddress{ .ip4 = .{ .bytes = .{ 192, 0, 2, 1 }, .port = 32853 } };
     var buffer: [256]u8 = undefined;
     const msg = try buildResponse(&buffer, addr, false, true);
-    try testing.expectError(error.InvalidStunMessage, parseAndValidateStunResponse(&msg, test_credentials));
+    try testing.expectError(error.InvalidStunMessage, parseAndValidateStunResponse(&msg, test_credentials.password));
 }
 
 test "parseAndValidateStunResponse: missing mapped address" {
     var buffer: [256]u8 = undefined;
     const msg = try buildResponse(&buffer, null, true, true);
-    try testing.expectError(error.MissingMappedAddress, parseAndValidateStunResponse(&msg, test_credentials));
+    try testing.expectError(error.MissingMappedAddress, parseAndValidateStunResponse(&msg, test_credentials.password));
 }
