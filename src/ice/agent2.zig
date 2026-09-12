@@ -111,9 +111,11 @@ fn calculatePairPriority(l: u32, r: u32, role: ice.Role) u64 {
 pub fn Agent(comptime config: struct {
     auth_info_size: u8 = 64,
     max_candidates: u8 = 16,
+    stun_config: stun.Client.ClientConfig = .{ .max_transactions = 1 },
 }) type {
     return struct {
         const Self = @This();
+        const StunClient = stun.Client.Client(config.stun_config);
 
         const max_events: u8 = 5;
         const initial_pairs_capacity: usize = @as(usize, config.max_candidates) * config.max_candidates / 2;
@@ -134,6 +136,7 @@ pub fn Agent(comptime config: struct {
         candidates_len: u8 = 0,
         remote_candidates: [config.max_candidates]RemoteCandidate = undefined,
         remote_candidates_len: u8 = 0,
+        stun_clients: std.ArrayList(StunClient) = .empty,
         pairs: std.ArrayList(CandidatePair) = .empty,
         pending_requests: std.ArrayList(PendingRequest) = .empty,
         // This is a peer for which a use-candidate request is sent, but we didn't
@@ -249,19 +252,18 @@ pub fn Agent(comptime config: struct {
 
         pub fn deinit(agent: *Self) void {
             agent.close();
-            agent.pairs.deinit(agent.allocator);
-            agent.pending_requests.deinit(agent.allocator);
             agent.events_out.clear();
             agent.transmits.clear();
         }
 
-        pub fn close(core: *Self) void {
-            core.connection_state = .closed;
+        pub fn close(agent: *Self) void {
+            agent.connection_state = .closed;
 
-            core.pairs.clearAndFree(core.allocator);
-            core.pending_requests.clearAndFree(core.allocator);
-            core.candidates_len = 0;
-            core.remote_candidates_len = 0;
+            agent.pairs.clearAndFree(agent.allocator);
+            agent.pending_requests.clearAndFree(agent.allocator);
+            agent.stun_clients.clearAndFree(agent.allocator);
+            agent.candidates_len = 0;
+            agent.remote_candidates_len = 0;
         }
 
         pub fn getRemoteCredentials(core: *const Self) ?ice.Credentials {
@@ -276,7 +278,11 @@ pub fn Agent(comptime config: struct {
             return if (core.nominated_pair) |nominated| core.remote_candidates[nominated.remote].address else null;
         }
 
-        pub fn addLocalAddrs(core: *Self, addrs: []const IpAddress) !void {
+        /// Add local addresses to the agent. This should be called after `addStunServer`.
+        pub fn addLocalAddrs(core: *Self, addrs: []const IpAddress, now: i64) !void {
+            core.gathering_state = .gathering;
+            try core.events_out.pushBack(.{ .gathering_state = core.gathering_state });
+
             var min_index: ?u8 = null;
             var max_index: ?u8 = null;
             for (addrs) |addr| {
@@ -287,10 +293,22 @@ pub fn Agent(comptime config: struct {
                 }
             }
 
-            // since there's no support for stun/turn servers, we can immediately transition to the "gathering done" state
-            core.gathering_state = .complete;
             if (min_index) |min| try core.events_out.pushBack(.{ .candidate = .{ min, max_index.? } });
-            try core.events_out.pushBack(.{ .gathering_state = core.gathering_state });
+
+            for (core.stun_clients.items) |*stun_client| {
+                try stun_client.bindingRequest(now);
+            }
+
+            try core.setGatheringCompleted();
+        }
+
+        pub fn addStunServer(agent: *Self, local: IpAddress, server: IpAddress) !void {
+            const stun_client = try agent.stun_clients.addOne(agent.allocator);
+            stun_client.* = StunClient.init(.{
+                .local_addr = local,
+                .remote_addr = server,
+                .random = agent.random,
+            });
         }
 
         pub fn setRemoteCredentials(agent: *Self, credentials: ice.Credentials, now: i64) !void {
@@ -298,12 +316,12 @@ pub fn Agent(comptime config: struct {
             try agent.setConnectionState(.checking, now);
         }
 
-        pub fn addServerReflexiveCandidate(core: *Self, base: IpAddress, mapped: IpAddress) !?Candidate {
+        pub fn addServerReflexiveCandidate(core: *Self, base: IpAddress, mapped: IpAddress) !?usize {
             for (core.candidates[0..core.candidates_len]) |candidate|
                 if (candidate.candidate_type == .host and ipEql(&candidate.base, &mapped)) return null;
 
             const candidate = Candidate.initServerReflexive(base, mapped);
-            return if (try core.addLocalCandidate(candidate)) |_| candidate else null;
+            return try core.addLocalCandidate(candidate);
         }
 
         pub fn handleConsentFreshness(agent: *Self, from: *const IpAddress, message: []const u8, buffer: []u8) !?[]const u8 {
@@ -379,8 +397,15 @@ pub fn Agent(comptime config: struct {
             return .{ .agent = agent };
         }
 
-        pub fn handleTimeout(agent: *Self, now: i64) error{Overflow}!void {
+        pub fn handleTimeout(agent: *Self, now: i64) error{ OutOfMemory, Overflow }!void {
             if (agent.connection_state == .closed) return;
+
+            var stun_idx: usize = 0;
+            while (stun_idx < agent.stun_clients.items.len) {
+                const stun_server = &agent.stun_clients.items[stun_idx];
+                try stun_server.handleTimeout(now);
+                if (!try agent.handleStunClientEvents(stun_idx)) stun_idx += 1;
+            }
 
             if (now >= agent.connectivity_check_deadline) {
                 agent.connectivity_check_deadline = now + connectivity_check_interval;
@@ -422,7 +447,20 @@ pub fn Agent(comptime config: struct {
 
                     return .consumed;
                 },
-                else => return agent.handleStunMessage(message, now, buffer),
+                else => {
+                    const index = blk: {
+                        for (agent.stun_clients.items, 0..) |*stun_server, i| {
+                            if (stun_server.local_addr.eql(message.to)) break :blk i;
+                        }
+
+                        break :blk null;
+                    } orelse return agent.handleStunMessage(message, now, buffer);
+
+                    const stun_server = &agent.stun_clients.items[index];
+                    try stun_server.handleRead(message.data);
+                    _ = try agent.handleStunClientEvents(index);
+                    return .consumed;
+                },
             }
         }
 
@@ -431,17 +469,24 @@ pub fn Agent(comptime config: struct {
         }
 
         pub fn pollTransmit(agent: *Self) ?stun.TransportMessage {
+            for (agent.stun_clients.items) |*stun_server| {
+                if (stun_server.pollTransmit()) |msg| return msg;
+            }
             return agent.transmits.popFront();
         }
 
-        pub fn pollTimeout(core: *Self) ?i64 {
-            if (core.connection_state == .closed) return null;
+        pub fn pollTimeout(agent: *Self) ?i64 {
+            if (agent.connection_state == .closed) return null;
             var deadline: i64 = std.math.maxInt(i64);
 
+            for (agent.stun_clients.items) |*stun_server| if (stun_server.pollTimeout()) |d| {
+                deadline = @min(deadline, d);
+            };
+
             for (&[_]i64{
-                core.connectivity_check_deadline,
-                core.keep_alive_deadline,
-                core.disconnected_connection_deadline,
+                agent.connectivity_check_deadline,
+                agent.keep_alive_deadline,
+                agent.disconnected_connection_deadline,
             }) |d| deadline = @min(deadline, d);
 
             return if (deadline == std.math.maxInt(i64)) null else deadline;
@@ -523,6 +568,7 @@ pub fn Agent(comptime config: struct {
                     agent.connectivity_check_deadline = std.math.maxInt(i64);
                     agent.pairs.clearAndFree(agent.allocator);
                     agent.pending_requests.clearAndFree(agent.allocator);
+                    agent.stun_clients.clearAndFree(agent.allocator);
                 },
                 .disconnected => agent.disconnected_connection_deadline = now + agent.failed_timeout,
                 .failed => {
@@ -563,6 +609,37 @@ pub fn Agent(comptime config: struct {
             };
 
             return .consumed;
+        }
+
+        fn handleStunClientEvents(agent: *Self, idx: usize) !bool {
+            const stun_client = &agent.stun_clients.items[idx];
+            // There's only one event
+            const event = stun_client.pollEvent() orelse return false;
+            switch (event) {
+                .mapped_address => {
+                    const mapped_address = event.mapped_address;
+                    if (try agent.addServerReflexiveCandidate(
+                        stun_client.local_addr,
+                        mapped_address,
+                    )) |index| try agent.events_out.pushBack(.{ .candidate = .{ @intCast(index), @intCast(index) } });
+
+                    _ = agent.stun_clients.swapRemove(idx);
+                },
+                .err => {
+                    Logger.debug("Stun server error for {f}: {}", .{ stun_client.remote_addr, event.err });
+                    _ = agent.stun_clients.swapRemove(idx);
+                },
+            }
+
+            try agent.setGatheringCompleted();
+            return true;
+        }
+
+        fn setGatheringCompleted(agent: *Self) !void {
+            if (agent.stun_clients.items.len == 0) {
+                agent.gathering_state = .complete;
+                try agent.events_out.pushBack(.{ .gathering_state = agent.gathering_state });
+            }
         }
 
         fn handleAppData(agent: *Self, sender: *const IpAddress, data: []const u8) !ReadResult {
@@ -807,6 +884,18 @@ fn testBuildResponse(tx_id: u96, addr: IpAddress, password: []const u8, buffer: 
     return try stun.Message.parse(w.final());
 }
 
+/// Unauthenticated STUN binding success response, as stun.Client expects.
+fn testStunBindingResponse(buffer: []u8, tx_id: u96, addr: IpAddress) ![]const u8 {
+    var w = stun.Writer.init(buffer, .{});
+    try w.writeHeader(.{
+        .message_type = .fromClassAndMethod(.success_response, .binding),
+        .transaction_id = tx_id,
+        .message_length = 0,
+    });
+    try w.writeAttribute(.{ .xor_mapped_address = addr });
+    return w.final();
+}
+
 fn expectEvent(core: *TestAgent, tag: std.meta.Tag(Event)) !void {
     const event = core.pollEvent() orelse return error.ExpectedEvent;
     if (std.meta.activeTag(event) != tag) return error.UnexpectedEvent;
@@ -829,7 +918,7 @@ test "handleRequest: generate success response" {
     const base_addr = try IpAddress.parse("192.168.1.100", 1000);
     const from = try IpAddress.parse("192.168.1.120", 2000);
 
-    try core.addLocalAddrs(&.{base_addr});
+    try core.addLocalAddrs(&.{base_addr}, 0);
 
     const msg = try testBuildRequest(.{
         .ice_controlling = 0x10000,
@@ -866,7 +955,7 @@ test "handleRequest: create peer reflexive candidate" {
     const base_addr = try IpAddress.parse("192.168.1.100", 1000);
     const from = try IpAddress.parse("192.168.1.120", 2000);
 
-    try core.addLocalAddrs(&.{base_addr});
+    try core.addLocalAddrs(&.{base_addr}, 0);
 
     const msg = try testBuildRequest(.{
         .ice_controlling = 0x10000,
@@ -936,7 +1025,7 @@ test "handleRequest: role conflict" {
 
     const base_addr = try IpAddress.parse("192.168.1.100", 1000);
     const from = try IpAddress.parse("192.168.1.120", 2000);
-    try core.addLocalAddrs(&.{base_addr});
+    try core.addLocalAddrs(&.{base_addr}, 0);
 
     {
         const msg = try testBuildRequest(.{
@@ -986,13 +1075,13 @@ test "addLocalCandidate: forms pairs with existing remote candidates" {
     try testing.expectEqual(0, core.pairs.items.len);
 
     const local = try IpAddress.parse("10.0.0.1", 2000);
-    try core.addLocalAddrs(&.{local});
+    try core.addLocalAddrs(&.{local}, 0);
 
     try testing.expectEqual(1, core.candidates_len);
     try testing.expectEqual(2, core.pairs.items.len);
     for (core.pairs.items) |pair| try testing.expect(core.candidates[pair.local].base.eql(&local));
 
-    try core.addLocalAddrs(&.{local});
+    try core.addLocalAddrs(&.{local}, 0);
     try testing.expectEqual(2, core.pairs.items.len);
 }
 
@@ -1000,8 +1089,10 @@ test "addRemoteCandidate: forms pairs with existing local candidates" {
     var core = try testNewAgent(.controlling);
     defer core.deinit();
 
-    try core.addLocalAddrs(&.{try IpAddress.parse("10.0.0.1", 2000)});
-    try core.addLocalAddrs(&.{try IpAddress.parse("10.0.0.2", 2001)});
+    try core.addLocalAddrs(&.{try IpAddress.parse("10.0.0.1", 2000)}, 0);
+    while (core.pollEvent()) |_| {}
+    try core.addLocalAddrs(&.{try IpAddress.parse("10.0.0.2", 2001)}, 0);
+    while (core.pollEvent()) |_| {}
 
     try testing.expectEqual(2, core.candidates_len);
     try testing.expectEqual(0, core.pairs.items.len);
@@ -1021,7 +1112,7 @@ test "addRemoteCandidate: skips pairing across differing address families" {
     var core = try testNewAgent(.controlling);
     defer core.deinit();
 
-    try core.addLocalAddrs(&.{try IpAddress.parse("10.0.0.1", 2000)});
+    try core.addLocalAddrs(&.{try IpAddress.parse("10.0.0.1", 2000)}, 0);
 
     try core.addRemoteCandidate(Candidate.initHost(try IpAddress.parse("2001:db8::10", 1000)));
     try testing.expectEqual(0, core.pairs.items.len);
@@ -1036,10 +1127,11 @@ test "addLocalCandidate: skips pairing across differing address families" {
 
     try core.addRemoteCandidate(Candidate.initHost(try IpAddress.parse("192.168.1.10", 1000)));
 
-    try core.addLocalAddrs(&.{try IpAddress.parse("2001:db8::1", 2000)});
+    try core.addLocalAddrs(&.{try IpAddress.parse("2001:db8::1", 2000)}, 0);
+    while (core.pollEvent()) |_| {}
     try testing.expectEqual(0, core.pairs.items.len);
 
-    try core.addLocalAddrs(&.{try IpAddress.parse("10.0.0.1", 2001)});
+    try core.addLocalAddrs(&.{try IpAddress.parse("10.0.0.1", 2001)}, 0);
     try testing.expectEqual(1, core.pairs.items.len);
 }
 
@@ -1058,19 +1150,110 @@ test "addServerReflexiveCandidate: skips candidate redundant with host" {
     defer core.deinit();
 
     const base = try IpAddress.parse("10.0.0.1", 2000);
-    try core.addLocalAddrs(&.{base});
+    try core.addLocalAddrs(&.{base}, 0);
 
     try testing.expectEqual(null, try core.addServerReflexiveCandidate(base, try IpAddress.parse("10.0.0.1", 3000)));
     try testing.expectEqual(1, core.candidates_len);
 
     const mapped = try IpAddress.parse("203.0.113.5", 3000);
-    const srflx = try core.addServerReflexiveCandidate(base, mapped);
-    try testing.expect(srflx != null);
-    try testing.expect(srflx.?.address.eql(&mapped));
+    const index = try core.addServerReflexiveCandidate(base, mapped);
+    try testing.expect(index != null);
+    try testing.expect(core.candidates[index.?].address.eql(&mapped));
     try testing.expectEqual(2, core.candidates_len);
 
     try testing.expectEqual(null, try core.addServerReflexiveCandidate(base, mapped));
     try testing.expectEqual(2, core.candidates_len);
+}
+
+test "addStunServer/addLocalAddrs: queues a binding request per server and reports its deadline" {
+    var core = try testNewAgent(.controlling);
+    defer core.deinit();
+
+    const local1 = try IpAddress.parse("10.0.0.10", 4000);
+    const server1 = try IpAddress.parse("203.0.113.1", 3478);
+    const local2 = try IpAddress.parse("10.0.0.11", 4001);
+    const server2 = try IpAddress.parse("203.0.113.2", 3478);
+
+    try core.addStunServer(local1, server1);
+    try core.addStunServer(local2, server2);
+    try core.addLocalAddrs(&.{}, 100);
+
+    const tm1 = core.pollTransmit() orelse return error.ExpectedTransmit;
+    try testing.expect(tm1.from.eql(&local1));
+    try testing.expect(tm1.to.eql(&server1));
+
+    const tm2 = core.pollTransmit() orelse return error.ExpectedTransmit;
+    try testing.expect(tm2.from.eql(&local2));
+    try testing.expect(tm2.to.eql(&server2));
+
+    try testing.expectEqual(null, core.pollTransmit());
+    try testing.expectEqual(.gathering, core.gathering_state);
+    try testing.expectEqual(100 + stun.Client.Client(.{}).base_rto, core.pollTimeout());
+}
+
+test "handleRead: stun server resolves to reflexive candidate; duplicate mapped address still completes gathering" {
+    var core = try testNewAgent(.controlling);
+    defer core.deinit();
+
+    const host_addr = try IpAddress.parse("10.0.0.1", 2000);
+    const local1 = try IpAddress.parse("10.0.0.10", 4000);
+    const server1 = try IpAddress.parse("203.0.113.1", 3478);
+    const local2 = try IpAddress.parse("10.0.0.11", 4001);
+    const server2 = try IpAddress.parse("203.0.113.2", 3478);
+
+    try core.addStunServer(local1, server1);
+    try core.addStunServer(local2, server2);
+    try core.addLocalAddrs(&.{host_addr}, 0);
+    while (core.pollEvent()) |_| {}
+
+    var resp_buffer: [64]u8 = undefined;
+
+    // Poll both requests before answering either: handleRead's swapRemove on
+    // a resolved server invalidates any transmit still held for another one.
+    const tm1 = core.pollTransmit() orelse return error.ExpectedTransmit;
+    const tx1 = (try stun.Message.parse(tm1.data)).header.transaction_id;
+    const tm2 = core.pollTransmit() orelse return error.ExpectedTransmit;
+    const tx2 = (try stun.Message.parse(tm2.data)).header.transaction_id;
+
+    var buf: [128]u8 = undefined;
+    const mapped = try IpAddress.parse("198.51.100.7", 55000);
+    const resp1 = try testStunBindingResponse(&buf, tx1, mapped);
+    _ = try core.handleRead(.{ .from = &server1, .to = &local1, .data = resp1 }, 0, &resp_buffer);
+
+    try expectEvent(&core, .candidate);
+    try testing.expectEqual(null, core.pollEvent()); // server2 still pending: gathering not complete yet
+    try testing.expectEqual(1, core.stun_clients.items.len);
+
+    // server2 maps back to the host candidate's own address: a duplicate.
+    const resp2 = try testStunBindingResponse(&buf, tx2, host_addr);
+    _ = try core.handleRead(.{ .from = &server2, .to = &local2, .data = resp2 }, 0, &resp_buffer);
+
+    try testing.expectEqual(0, core.stun_clients.items.len);
+    try expectEvent(&core, .gathering_state);
+    try testing.expectEqual(.complete, core.gathering_state);
+    try testing.expectEqual(null, core.pollEvent());
+}
+
+test "handleTimeout: stun server failure removes it and completes gathering" {
+    var core = try testNewAgent(.controlling);
+    defer core.deinit();
+
+    const local = try IpAddress.parse("10.0.0.10", 4000);
+    const server = try IpAddress.parse("203.0.113.1", 3478);
+    try core.addStunServer(local, server);
+    try core.addLocalAddrs(&.{}, 0);
+    while (core.pollEvent()) |_| {}
+    _ = core.pollTransmit(); // drain the initial binding request
+
+    var now: i64 = 0;
+    for (0..8) |_| {
+        now += 2000;
+        try core.handleTimeout(now);
+        _ = core.pollTransmit();
+    }
+
+    try testing.expectEqual(0, core.stun_clients.items.len);
+    try testing.expectEqual(.complete, core.gathering_state);
 }
 
 test "toggleRole: flips role, tie breaker and pair priorities" {
@@ -1080,7 +1263,7 @@ test "toggleRole: flips role, tie breaker and pair priorities" {
     const local_addr = try IpAddress.parse("10.0.0.1", 2000);
     const remote_addr = try IpAddress.parse("192.168.1.10", 1000);
 
-    try core.addLocalAddrs(&.{local_addr});
+    try core.addLocalAddrs(&.{local_addr}, 0);
     try core.addRemoteCandidate(Candidate.initServerReflexive(remote_addr, remote_addr));
 
     try testing.expectEqual(1, core.pairs.items.len);
@@ -1193,7 +1376,8 @@ test "handleInput: stun request produces a response event" {
 
     const base_addr = try IpAddress.parse("192.168.1.100", 1000);
     const from = try IpAddress.parse("192.168.1.120", 2000);
-    try core.addLocalAddrs(&.{base_addr});
+    try core.addLocalAddrs(&.{base_addr}, 0);
+    try expectEvent(&core, .gathering_state);
 
     const msg = try testBuildRequest(.{
         .ice_controlling = 0x10000,
@@ -1221,7 +1405,8 @@ test "handleInput: role conflict switches role and produces a response" {
 
     const base_addr = try IpAddress.parse("192.168.1.100", 1000);
     const from = try IpAddress.parse("192.168.1.120", 2000);
-    try core.addLocalAddrs(&.{base_addr});
+    try core.addLocalAddrs(&.{base_addr}, 0);
+    try expectEvent(&core, .gathering_state);
 
     const msg = try testBuildRequest(.{
         .ice_controlled = 0,

@@ -60,13 +60,15 @@ pub const Event = union(enum) {
 pub const Config = struct {
     local_addr: IpAddress,
     remote_addr: IpAddress,
-    random: *std.Random,
+    random: std.Random,
 };
 
-pub fn Client(comptime config: struct {
+pub const ClientConfig = struct {
     max_payload_size: u32 = 64,
     max_transactions: u32 = 8,
-}) type {
+};
+
+pub fn Client(comptime config: ClientConfig) type {
     return struct {
         const Self = @This();
 
@@ -75,7 +77,7 @@ pub fn Client(comptime config: struct {
 
         local_addr: IpAddress,
         remote_addr: IpAddress,
-        random: *std.Random,
+        random: std.Random,
         transactions: Transactions(config.max_transactions, config.max_payload_size),
         transmits: stun.BoundedDeque(stun.TransportMessage, config.max_transactions),
         events_out: stun.BoundedDeque(Event, config.max_transactions),
@@ -177,7 +179,7 @@ const test_remote_addr: IpAddress = .{ .ip4 = .loopback(2000) };
 
 const TestClient = Client(.{});
 
-fn testClient(random: *std.Random) TestClient {
+fn testClient(random: std.Random) TestClient {
     return TestClient.init(.{ .local_addr = test_local_addr, .remote_addr = test_remote_addr, .random = random });
 }
 
@@ -204,8 +206,7 @@ fn testBindingSuccessResponse(buffer: []u8, tx_id: u96, addr: IpAddress) ![]cons
 
 test "bindingRequest: queues transmit and stores transaction" {
     var prng = std.Random.DefaultPrng.init(std.testing.random_seed);
-    var random = prng.random();
-    var client = testClient(&random);
+    var client = testClient(prng.random());
 
     try client.bindingRequest(100);
 
@@ -228,8 +229,7 @@ test "bindingRequest: queues transmit and stores transaction" {
 
 test "handleRead: matches pending transaction and emits mapped_address event" {
     var prng = std.Random.DefaultPrng.init(std.testing.random_seed);
-    var random = prng.random();
-    var client = testClient(&random);
+    var client = testClient(prng.random());
 
     try client.bindingRequest(0);
     const tx_id = client.transactions.items[0].id;
@@ -247,8 +247,7 @@ test "handleRead: matches pending transaction and emits mapped_address event" {
 
 test "handleRead: unknown transaction produces no event" {
     var prng = std.Random.DefaultPrng.init(std.testing.random_seed);
-    var random = prng.random();
-    var client = testClient(&random);
+    var client = testClient(prng.random());
 
     var buf: [stun.header_size]u8 = undefined;
     try client.handleRead(try testBindingRequest(&buf, 0xABC));
@@ -258,16 +257,14 @@ test "handleRead: unknown transaction produces no event" {
 
 test "handleRead: invalid stun message returns error" {
     var prng = std.Random.DefaultPrng.init(std.testing.random_seed);
-    var random = prng.random();
-    var client = testClient(&random);
+    var client = testClient(prng.random());
 
     try testing.expectError(error.WrongMagicCookie, client.handleRead(&([_]u8{0} ** stun.header_size)));
 }
 
 test "handleTimeout: does nothing before the deadline" {
     var prng = std.Random.DefaultPrng.init(std.testing.random_seed);
-    var random = prng.random();
-    var client = testClient(&random);
+    var client = testClient(prng.random());
 
     try client.bindingRequest(0);
     _ = client.pollTransmit();
@@ -283,8 +280,7 @@ test "handleTimeout: does nothing before the deadline" {
 
 test "handleTimeout: retransmits and backs off before max attempts" {
     var prng = std.Random.DefaultPrng.init(std.testing.random_seed);
-    var random = prng.random();
-    var client = testClient(&random);
+    var client = testClient(prng.random());
 
     try client.bindingRequest(0);
     const original = client.pollTransmit() orelse return error.ExpectedTransmit;
@@ -308,8 +304,7 @@ test "handleTimeout: retransmits and backs off before max attempts" {
 
 test "handleTimeout: emits err event and drops transaction after max attempts" {
     var prng = std.Random.DefaultPrng.init(std.testing.random_seed);
-    var random = prng.random();
-    var client = testClient(&random);
+    var client = testClient(prng.random());
 
     try client.bindingRequest(0);
     _ = client.pollTransmit();
@@ -331,8 +326,7 @@ test "handleTimeout: emits err event and drops transaction after max attempts" {
 
 test "poll*: return null when empty" {
     var prng = std.Random.DefaultPrng.init(std.testing.random_seed);
-    var random = prng.random();
-    var client = testClient(&random);
+    var client = testClient(prng.random());
 
     try testing.expectEqual(null, client.pollEvent());
     try testing.expectEqual(null, client.pollTransmit());
