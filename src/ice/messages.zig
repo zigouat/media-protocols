@@ -23,6 +23,20 @@ pub fn builUnauthenticatedBindingRequest(buffer: []u8, tx_id: u96) ![]const u8 {
     return w.final();
 }
 
+pub fn validateConsentFreshnessRequest(msg: *const stun.Message, password: []const u8) !void {
+    var it = msg.iterateAttributes(password);
+    var has_fingerprint: bool = false;
+    var has_message_integrity = false;
+
+    while (try it.next()) |attribute| switch (attribute) {
+        .fingerprint => has_fingerprint = true,
+        .message_integrity => has_message_integrity = true,
+        else => {},
+    };
+
+    if (!has_fingerprint or !has_message_integrity) return error.InvalidStunMessage;
+}
+
 pub fn parseAndValidateStunRequest(
     msg: *const stun.Message,
     credentials: ice.Credentials,

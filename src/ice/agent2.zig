@@ -324,24 +324,6 @@ pub fn Agent(comptime config: struct {
             return try core.addLocalCandidate(candidate);
         }
 
-        pub fn handleConsentFreshness(agent: *Self, from: *const IpAddress, message: []const u8, buffer: []u8) !?[]const u8 {
-            const msg = try stun.Message.parse(message);
-            switch (msg.header.message_type.class()) {
-                .request => {
-                    _ = try Messages.parseAndValidateStunRequest(
-                        &msg,
-                        agent.credentials.toIceCredentials(),
-                        agent.role,
-                        agent.tie_breaker,
-                    );
-                    return try Messages.buildSuccessResponse(&msg, agent.credentials.getPassword(), from, buffer);
-                },
-                else => {},
-            }
-
-            return null;
-        }
-
         pub fn addRemoteCandidate(core: *Self, remote_candidate: Candidate) !void {
             const remote_idx = try core.appendRemoteCandidate(remote_candidate);
 
@@ -753,6 +735,19 @@ pub fn Agent(comptime config: struct {
                     .status = .succeeded,
                 });
             }
+        }
+
+        fn handleConsentFreshness(agent: *Self, from: *const IpAddress, message: []const u8, buffer: []u8) !?[]const u8 {
+            const msg = try stun.Message.parse(message);
+            switch (msg.header.message_type.class()) {
+                .request => {
+                    _ = try Messages.validateConsentFreshnessRequest(&msg, agent.credentials.getPassword());
+                    return try Messages.buildSuccessResponse(&msg, agent.credentials.getPassword(), from, buffer);
+                },
+                else => {},
+            }
+
+            return null;
         }
 
         fn pairsEql(core: *Self, pair1: *const CandidatePair, pair2: *const CandidatePair) bool {
@@ -1489,8 +1484,8 @@ test "handleInput: success response nominates the pair and transitions to connec
 
     _ = try core.handleRead(.{ .from = &from, .to = &base_addr, .data = msg.bytes }, 0, &resp_buffer);
 
-    try expectConnectionStateEvent(&core, .connected);
     try expectEvent(&core, .nominated);
+    try expectConnectionStateEvent(&core, .connected);
     try testing.expectEqual(null, core.pollEvent());
 
     try testing.expectEqual(.connected, core.connection_state);
