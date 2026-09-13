@@ -57,7 +57,6 @@ pub const Event = union(enum) {
     gathering_state: ice.GatheringState,
     nominated: NominatedPair,
     connectivity_check: void,
-    consent_freshness: void,
     candidate: struct { u8, u8 }, // range inclusive
 };
 
@@ -120,6 +119,7 @@ pub fn Agent(comptime config: struct {
         const max_events: u8 = 5;
         const initial_pairs_capacity: usize = @as(usize, config.max_candidates) * config.max_candidates / 2;
         const initial_pending_requests_capacity: usize = 16;
+        const payload_len: u8 = 128;
 
         allocator: std.mem.Allocator,
         random: std.Random,
@@ -136,9 +136,9 @@ pub fn Agent(comptime config: struct {
         candidates_len: u8 = 0,
         remote_candidates: [config.max_candidates]RemoteCandidate = undefined,
         remote_candidates_len: u8 = 0,
-        stun_clients: std.ArrayList(StunClient) = .empty,
         pairs: std.ArrayList(CandidatePair) = .empty,
         pending_requests: std.ArrayList(PendingRequest) = .empty,
+        stun_clients: std.ArrayList(StunClient) = .empty,
         // This is a peer for which a use-candidate request is sent, but we didn't
         // receive response yet.
         selected_pair: ?u8 = null,
@@ -154,6 +154,9 @@ pub fn Agent(comptime config: struct {
 
         events_out: stun.BoundedDeque(Event, max_events),
         transmits: stun.BoundedDeque(stun.TransportMessage, max_events),
+
+        connectivity_check_buffer: [payload_len]u8,
+        consent_freshness: bool,
 
         pub const ConnectivityChecks = struct {
             agent: *Self,
@@ -247,6 +250,8 @@ pub fn Agent(comptime config: struct {
                 .transmits = .empty,
                 .pairs = pairs,
                 .pending_requests = pending_requests,
+                .connectivity_check_buffer = undefined,
+                .consent_freshness = false,
             };
         }
 
@@ -399,7 +404,7 @@ pub fn Agent(comptime config: struct {
                 if (agent.connection_state == .connected) {
                     try agent.setConnectionState(.completed, now);
                 }
-                try agent.events_out.pushBack(.consent_freshness);
+                agent.consent_freshness = true;
             }
 
             if (now >= agent.disconnected_connection_deadline) {
@@ -454,6 +459,20 @@ pub fn Agent(comptime config: struct {
             for (agent.stun_clients.items) |*stun_server| {
                 if (stun_server.pollTransmit()) |msg| return msg;
             }
+
+            if (agent.consent_freshness) {
+                agent.consent_freshness = false;
+                if (agent.buildBindingRequest(
+                    agent.random.int(u96),
+                    false,
+                    &agent.connectivity_check_buffer,
+                )) |payload| {
+                    const local_addr = &agent.candidates[agent.nominated_pair.?.local].base;
+                    const remote_addr = &agent.remote_candidates[agent.nominated_pair.?.remote].address;
+                    return .{ .data = payload, .from = local_addr, .to = remote_addr };
+                } else |_| return agent.transmits.popFront();
+            }
+
             return agent.transmits.popFront();
         }
 
@@ -1559,10 +1578,14 @@ test "handleTimeout: connected transitions to completed once keep_alive_deadline
     core.connectivity_check_deadline = 100_000;
     core.disconnected_connection_deadline = 100_000;
     core.keep_alive_deadline = 1000;
+    core.remote_credentials = try .init("ruser", "peer-password-0123456789");
 
+    core.candidates[0] = .initHost(try IpAddress.parse("192.168.1.100", 1000));
+    core.candidates_len = 1;
     const from = try IpAddress.parse("192.168.1.120", 2000);
     core.remote_candidates[0] = testRemoteCandidate(from);
     core.remote_candidates_len = 1;
+    core.nominated_pair = .{ .local = 0, .remote = 0 };
     try core.pairs.append(testing.allocator, .{ .local = 0, .remote = 0, .status = .succeeded, .priority = 0 });
     try core.pending_requests.append(testing.allocator, .{ .transaction_id = @bitCast(@as(u96, 0x1)), .pair = 0 });
 
@@ -1575,42 +1598,48 @@ test "handleTimeout: connected transitions to completed once keep_alive_deadline
     try testing.expectEqual(1000 + keep_alive_interval, core.keep_alive_deadline);
 
     try expectConnectionStateEvent(&core, .completed);
-    try expectEvent(&core, .consent_freshness);
     try testing.expectEqual(null, core.pollEvent());
+
+    const tm = core.pollTransmit() orelse return error.ExpectedTransmit;
+    const msg = try stun.Message.parse(tm.data);
+    try testing.expectEqual(.request, msg.header.message_type.class());
+    try testing.expectEqual(.binding, msg.header.message_type.method());
+    try testing.expect(tm.from.eql(&core.candidates[0].base));
+    try testing.expect(tm.to.eql(&from));
+    try testing.expectEqual(null, core.pollTransmit());
 }
 
-test "handleTimeout: completed sends periodic consent_freshness without changing state" {
-    var core = try testNewAgent(.controlling);
-    defer core.deinit();
+test "handleTimeout: completed/disconnected request consent freshness without changing state" {
+    for ([_]ice.ConnectionState{ .completed, .disconnected }) |state| {
+        var core = try testNewAgent(.controlling);
+        defer core.deinit();
 
-    core.connection_state = .completed;
-    core.disconnected_connection_deadline = 100_000;
-    core.keep_alive_deadline = 1000;
+        core.connection_state = state;
+        core.disconnected_connection_deadline = 100_000;
+        core.keep_alive_deadline = 1000;
+        core.remote_credentials = try .init("ruser", "peer-password-0123456789");
 
-    try core.handleTimeout(1000);
+        core.candidates[0] = .initHost(try IpAddress.parse("192.168.1.100", 1000));
+        core.candidates_len = 1;
+        const from = try IpAddress.parse("192.168.1.120", 2000);
+        core.remote_candidates[0] = testRemoteCandidate(from);
+        core.remote_candidates_len = 1;
+        core.nominated_pair = .{ .local = 0, .remote = 0 };
 
-    try testing.expectEqual(.completed, core.connection_state);
-    try testing.expectEqual(1000 + keep_alive_interval, core.keep_alive_deadline);
+        try core.handleTimeout(1000);
 
-    try expectEvent(&core, .consent_freshness);
-    try testing.expectEqual(null, core.pollEvent());
-}
+        try testing.expectEqual(state, core.connection_state);
+        try testing.expectEqual(1000 + keep_alive_interval, core.keep_alive_deadline);
+        try testing.expectEqual(null, core.pollEvent());
 
-test "handleTimeout: disconnected sends periodic consent_freshness without changing state" {
-    var core = try testNewAgent(.controlling);
-    defer core.deinit();
-
-    core.connection_state = .disconnected;
-    core.disconnected_connection_deadline = 100_000;
-    core.keep_alive_deadline = 1000;
-
-    try core.handleTimeout(1000);
-
-    try testing.expectEqual(.disconnected, core.connection_state);
-    try testing.expectEqual(1000 + keep_alive_interval, core.keep_alive_deadline);
-
-    try expectEvent(&core, .consent_freshness);
-    try testing.expectEqual(null, core.pollEvent());
+        const tm = core.pollTransmit() orelse return error.ExpectedTransmit;
+        const msg = try stun.Message.parse(tm.data);
+        try testing.expectEqual(.request, msg.header.message_type.class());
+        try testing.expectEqual(.binding, msg.header.message_type.method());
+        try testing.expect(tm.from.eql(&core.candidates[0].base));
+        try testing.expect(tm.to.eql(&from));
+        try testing.expectEqual(null, core.pollTransmit());
+    }
 }
 
 test "handleTimeout: connected becomes disconnected after disconnected_timeout of silence and refreshes the failed deadline" {
