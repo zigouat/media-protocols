@@ -56,7 +56,6 @@ pub const Event = union(enum) {
     connection_state: ice.ConnectionState,
     gathering_state: ice.GatheringState,
     nominated: NominatedPair,
-    connectivity_check: void,
     candidate: struct { u8, u8 }, // range inclusive
 };
 
@@ -155,74 +154,14 @@ pub fn Agent(comptime config: struct {
         events_out: stun.BoundedDeque(Event, max_events),
         transmits: stun.BoundedDeque(stun.TransportMessage, max_events),
 
+        connectivity_check: ConnectivityChecks = .{ .done = true },
         connectivity_check_buffer: [payload_len]u8,
         consent_freshness: bool,
 
-        pub const ConnectivityChecks = struct {
-            agent: *Self,
+        const ConnectivityChecks = struct {
+            index: u16 = 0,
             nomination_done: bool = false,
-            index: usize = 0,
-
-            pub fn next(self: *ConnectivityChecks, buffer: []u8) !?stun.TransportMessage {
-                const agent = self.agent;
-
-                if (!self.nomination_done) {
-                    self.nomination_done = true;
-                    if (agent.selected_pair) |selected_idx| {
-                        const pair = &agent.pairs.items[selected_idx];
-                        const local = agent.getPairLocal(pair);
-                        const remote = agent.getPairRemote(pair);
-
-                        const tx_id = agent.random.int(u96);
-                        const payload = try agent.buildBindingRequest(tx_id, true, buffer);
-
-                        try agent.pending_requests.append(agent.allocator, .{
-                            .transaction_id = @bitCast(tx_id),
-                            .pair = selected_idx,
-                        });
-
-                        return stun.TransportMessage{
-                            .data = payload,
-                            .from = &local.base,
-                            .to = &remote.address,
-                        };
-                    }
-                }
-
-                while (self.index < agent.pairs.items.len) {
-                    const idx = self.index;
-                    const pair = &agent.pairs.items[idx];
-                    self.index += 1;
-                    switch (pair.status) {
-                        .waiting, .in_progress => {
-                            pair.conn_check_count += 1;
-                            if (pair.conn_check_count > max_binding_requests) {
-                                pair.status = .failed;
-                                continue;
-                            }
-
-                            const tx_id = agent.random.int(u96);
-                            const payload = try agent.buildBindingRequest(tx_id, false, buffer);
-                            const local = agent.getPairLocal(pair);
-                            const remote = agent.getPairRemote(pair);
-
-                            try agent.pending_requests.append(agent.allocator, .{
-                                .transaction_id = @bitCast(tx_id),
-                                .pair = @intCast(idx),
-                            });
-
-                            return stun.TransportMessage{
-                                .data = payload,
-                                .from = &local.base,
-                                .to = &remote.address,
-                            };
-                        },
-                        else => {},
-                    }
-                }
-
-                return null;
-            }
+            done: bool = false,
         };
 
         pub fn init(allocator: std.mem.Allocator, agent_config: Config) error{ OutOfMemory, CredentialsTooLong }!Self {
@@ -375,15 +314,6 @@ pub fn Agent(comptime config: struct {
             return idx;
         }
 
-        /// Begin a connectivity-check round. Returns null when a pair is already
-        /// nominated (nothing to do). Performs the controlling-side best-pair selection.
-        pub fn beginConnectivityChecks(agent: *Self) ?ConnectivityChecks {
-            if (agent.nominated_pair != null) return null;
-            if (agent.role == .controlling and agent.selected_pair == null)
-                agent.selected_pair = agent.selectBestPair();
-            return .{ .agent = agent };
-        }
-
         pub fn handleTimeout(agent: *Self, now: i64) error{ OutOfMemory, Overflow }!void {
             if (agent.connection_state == .closed) return;
 
@@ -396,7 +326,11 @@ pub fn Agent(comptime config: struct {
 
             if (now >= agent.connectivity_check_deadline) {
                 agent.connectivity_check_deadline = now + connectivity_check_interval;
-                try agent.events_out.pushBack(.connectivity_check);
+                if (agent.nominated_pair == null) agent.connectivity_check = .{};
+                if (agent.role == .controlling and agent.selected_pair == null) {
+                    agent.selected_pair = agent.selectBestPair();
+                    agent.connectivity_check = .{};
+                }
             }
 
             if (now >= agent.keep_alive_deadline) {
@@ -473,7 +407,7 @@ pub fn Agent(comptime config: struct {
                 } else |_| return agent.transmits.popFront();
             }
 
-            return agent.transmits.popFront();
+            return agent.nextConnectivityCheck() orelse agent.transmits.popFront();
         }
 
         pub fn pollTimeout(agent: *Self) ?i64 {
@@ -567,6 +501,7 @@ pub fn Agent(comptime config: struct {
                 },
                 .completed => {
                     agent.connectivity_check_deadline = std.math.maxInt(i64);
+                    agent.connectivity_check = .{ .done = true };
                     agent.pairs.clearAndFree(agent.allocator);
                     agent.pending_requests.clearAndFree(agent.allocator);
                     agent.stun_clients.clearAndFree(agent.allocator);
@@ -641,6 +576,77 @@ pub fn Agent(comptime config: struct {
                 agent.gathering_state = .complete;
                 try agent.events_out.pushBack(.{ .gathering_state = agent.gathering_state });
             }
+        }
+
+        fn nextConnectivityCheck(agent: *Self) ?stun.TransportMessage {
+            const check = &agent.connectivity_check;
+            if (check.done) return null;
+
+            if (!check.nomination_done) {
+                check.nomination_done = true;
+                if (agent.selected_pair) |selected_idx| {
+                    const pair = &agent.pairs.items[selected_idx];
+                    const local = agent.getPairLocal(pair);
+                    const remote = agent.getPairRemote(pair);
+
+                    const tx_id = agent.random.int(u96);
+                    const payload = agent.buildBindingRequest(
+                        tx_id,
+                        true,
+                        &agent.connectivity_check_buffer,
+                    ) catch return null;
+
+                    agent.pending_requests.append(agent.allocator, .{
+                        .transaction_id = @bitCast(tx_id),
+                        .pair = selected_idx,
+                    }) catch return null;
+
+                    return stun.TransportMessage{
+                        .data = payload,
+                        .from = &local.base,
+                        .to = &remote.address,
+                    };
+                }
+            }
+
+            while (check.index < agent.pairs.items.len) {
+                const idx = check.index;
+                const pair = &agent.pairs.items[idx];
+                check.index += 1;
+                switch (pair.status) {
+                    .waiting, .in_progress => {
+                        pair.conn_check_count += 1;
+                        if (pair.conn_check_count > max_binding_requests) {
+                            pair.status = .failed;
+                            continue;
+                        }
+
+                        const tx_id = agent.random.int(u96);
+                        const payload = agent.buildBindingRequest(
+                            tx_id,
+                            false,
+                            &agent.connectivity_check_buffer,
+                        ) catch return null;
+                        const local = agent.getPairLocal(pair);
+                        const remote = agent.getPairRemote(pair);
+
+                        agent.pending_requests.append(agent.allocator, .{
+                            .transaction_id = @bitCast(tx_id),
+                            .pair = @intCast(idx),
+                        }) catch return null;
+
+                        return stun.TransportMessage{
+                            .data = payload,
+                            .from = &local.base,
+                            .to = &remote.address,
+                        };
+                    },
+                    else => {},
+                }
+            }
+
+            check.done = true;
+            return null;
         }
 
         fn handleAppData(agent: *Self, sender: *const IpAddress, data: []const u8) !ReadResult {
@@ -1529,7 +1535,7 @@ test "handleTimeout: new connection starts checking and schedules a connectivity
     try testing.expectEqual(null, core.pollEvent());
 
     try core.handleTimeout(connectivity_check_interval);
-    try expectEvent(&core, .connectivity_check);
+    try testing.expect(!core.connectivity_check.done);
     try testing.expectEqual(null, core.pollEvent());
 }
 
@@ -1545,7 +1551,7 @@ test "handleTimeout: checking sends a connectivity_check every interval" {
 
     try core.handleTimeout(connectivity_check_interval);
     try testing.expectEqual(connectivity_check_interval * 2, core.connectivity_check_deadline);
-    try expectEvent(&core, .connectivity_check);
+    try testing.expect(!core.connectivity_check.done);
     try testing.expectEqual(null, core.pollEvent());
 }
 
@@ -1562,7 +1568,7 @@ test "handleTimeout: checking fails after failed_timeout without connecting" {
     try testing.expectEqual(.failed, core.connection_state);
     try testing.expectEqual(std.math.maxInt(i64), core.disconnected_connection_deadline);
 
-    try expectEvent(&core, .connectivity_check);
+    try testing.expect(!core.connectivity_check.done);
     try expectConnectionStateEvent(&core, .failed);
     try testing.expectEqual(null, core.pollEvent());
 
