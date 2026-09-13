@@ -1,5 +1,6 @@
 pub const Agent = @import("agent.zig");
 pub const Agent2 = @import("agent2.zig").Agent;
+pub const IfIterator = @import("if_iterator.zig");
 
 const std = @import("std");
 const Io = std.Io;
