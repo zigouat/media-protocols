@@ -604,8 +604,8 @@ pub fn Agent(comptime config: struct {
             }
 
             if (!was_nominated) if (agent.nominated_pair) |nominated| {
-                try agent.setConnectionState(.connected, now);
                 try agent.events_out.pushBack(.{ .nominated = nominated });
+                try agent.setConnectionState(.connected, now);
             };
 
             return .consumed;
