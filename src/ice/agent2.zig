@@ -741,7 +741,7 @@ pub fn Agent(comptime config: struct {
             const msg = try stun.Message.parse(message);
             switch (msg.header.message_type.class()) {
                 .request => {
-                    _ = try Messages.validateConsentFreshnessRequest(&msg, agent.credentials.getPassword());
+                    try Messages.validateConsentFreshnessRequest(&msg, agent.credentials.getPassword());
                     return try Messages.buildSuccessResponse(&msg, agent.credentials.getPassword(), from, buffer);
                 },
                 else => {},
