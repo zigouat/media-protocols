@@ -526,11 +526,7 @@ pub fn Agent(comptime config: struct {
                 .request => {
                     const resp = try agent.handleRequest(&msg, message.to, message.from, buffer);
                     agent.detectNominatedPair();
-                    try agent.transmits.pushBack(.{
-                        .data = resp,
-                        .from = message.to,
-                        .to = message.from,
-                    });
+                    try agent.transmits.pushBack(resp);
                 },
                 .success_response => {
                     try agent.handleSuccessResponse(&msg, message.to, message.from);
@@ -663,14 +659,27 @@ pub fn Agent(comptime config: struct {
             return .consumed;
         }
 
-        fn handleRequest(agent: *Self, msg: *const stun.Message, base_addr: *const IpAddress, from: *const IpAddress, buffer: []u8) ![]const u8 {
+        fn handleRequest(
+            agent: *Self,
+            msg: *const stun.Message,
+            base_addr: *const IpAddress,
+            from: *const IpAddress,
+            buffer: []u8,
+        ) !stun.TransportMessage {
             const stun_req = Messages.parseAndValidateStunRequest(
                 msg,
                 agent.credentials.toIceCredentials(),
                 agent.role,
                 agent.tie_breaker,
             ) catch |err| switch (err) {
-                error.RoleConflict => return try Messages.buildRoleConflictErrorMessage(msg.header.transaction_id, agent.credentials.getPassword(), buffer),
+                error.RoleConflict => {
+                    const resp = try Messages.buildRoleConflictErrorMessage(msg.header.transaction_id, agent.credentials.getPassword(), buffer);
+                    return stun.TransportMessage{
+                        .data = resp,
+                        .from = base_addr,
+                        .to = from,
+                    };
+                },
                 error.SwitchRole => blk: {
                     agent.toggleRole();
                     break :blk try Messages.parseAndValidateStunRequest(
@@ -711,7 +720,12 @@ pub fn Agent(comptime config: struct {
                 });
             }
 
-            return try Messages.buildSuccessResponse(msg, agent.credentials.getPassword(), from, buffer);
+            const resp = try Messages.buildSuccessResponse(msg, agent.credentials.getPassword(), from, buffer);
+            return stun.TransportMessage{
+                .data = resp,
+                .from = base_addr,
+                .to = from,
+            };
         }
 
         fn handleSuccessResponse(core: *Self, msg: *const stun.Message, base_addr: *const IpAddress, from: *const IpAddress) !void {
@@ -947,7 +961,7 @@ test "handleRequest: generate success response" {
     }, core.credentials.getPassword(), &buffer);
 
     const resp = try core.handleRequest(&msg, &base_addr, &from, &resp_buffer);
-    const resp_msg = try stun.Message.parse(resp);
+    const resp_msg = try stun.Message.parse(resp.data);
 
     try testing.expectEqual(.success_response, resp_msg.header.message_type.class());
     try testing.expectEqual(.binding, resp_msg.header.message_type.method());
@@ -1055,7 +1069,7 @@ test "handleRequest: role conflict" {
         }, core.credentials.getPassword(), &buffer);
 
         const resp = try core.handleRequest(&msg, &base_addr, &from, &resp_buffer);
-        const resp_msg = try stun.Message.parse(resp);
+        const resp_msg = try stun.Message.parse(resp.data);
 
         try testing.expectEqual(.error_response, resp_msg.header.message_type.class());
         try testing.expectEqual(.binding, resp_msg.header.message_type.method());
@@ -1077,7 +1091,7 @@ test "handleRequest: role conflict" {
         }, core.credentials.getPassword(), &buffer);
 
         const resp = try core.handleRequest(&msg, &base_addr, &from, &resp_buffer);
-        const resp_msg = try stun.Message.parse(resp);
+        const resp_msg = try stun.Message.parse(resp.data);
 
         try testing.expectEqual(.success_response, resp_msg.header.message_type.class());
         try testing.expectEqual(.controlling, core.role);
