@@ -1,7 +1,7 @@
+pub const turn = @import("turn_client2.zig");
 pub const BoundedDeque = @import("bounded_deque.zig").BoundedDeque;
 pub const Client = @import("client.zig");
 pub const TurnClient = @import("turn_client.zig");
-pub const TurnClient2 = @import("turn_client2.zig").TurnClient;
 
 const std = @import("std");
 const Io = std.Io;
@@ -145,6 +145,26 @@ pub const Message = struct {
             .header = header,
             .bytes = msg,
         };
+    }
+
+    pub fn isDataIndication(msg: *const Message) bool {
+        return msg.header.message_type.method() == .data and msg.header.message_type.class() == .indication;
+    }
+
+    pub fn parseDataIndication(msg: *const Message) error{InvalidMessage}!struct { Io.net.IpAddress, []const u8 } {
+        var it = msg.iterateAttributes(&.{});
+
+        var addr: ?Io.net.IpAddress = null;
+        var data: ?[]const u8 = null;
+
+        while (it.next() catch return error.InvalidMessage) |attr| switch (attr) {
+            .data => |d| data = d,
+            .xor_peer_address => |peer_addr| addr = peer_addr,
+            else => {},
+        };
+
+        if (addr == null or data == null) return error.InvalidMessage;
+        return .{ addr.?, data.? };
     }
 };
 
@@ -1253,6 +1273,69 @@ test "Message.iterateAttributes: send indication" {
     try testing.expectEqualStrings("hello", attribute.data);
 
     try testing.expectEqual(null, try it.next());
+}
+
+test "Message.isDataIndication/parseDataIndication" {
+    const peer = Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 192, 0, 2, 1 }, .port = 32853 } };
+
+    var buffer: [1024]u8 = undefined;
+    {
+        var w = Writer.init(&buffer, .{});
+        try w.writeHeader(.{
+            .message_type = .fromClassAndMethod(.request, .binding),
+            .transaction_id = 0,
+            .message_length = 0,
+        });
+
+        const binding_request = try Message.parse(w.final());
+        try testing.expect(!binding_request.isDataIndication());
+    }
+
+    var w = Writer.init(&buffer, .{});
+    try w.writeHeader(.{
+        .message_type = .fromClassAndMethod(.indication, .data),
+        .transaction_id = 0,
+        .message_length = 0,
+    });
+    try w.writeAttribute(.{ .xor_peer_address = peer });
+    try w.writeAttribute(.{ .data = "hello" });
+
+    const data_indication = try Message.parse(w.final());
+    try testing.expect(data_indication.isDataIndication());
+
+    const addr, const data = try data_indication.parseDataIndication();
+    try testing.expect(addr.eql(&peer));
+    try testing.expectEqualStrings("hello", data);
+}
+
+test "Message.parseDataIndication: missing peer address or data is invalid" {
+    var buffer: [1024]u8 = undefined;
+
+    {
+        var w = Writer.init(&buffer, .{});
+        try w.writeHeader(.{
+            .message_type = .fromClassAndMethod(.indication, .data),
+            .transaction_id = 0,
+            .message_length = 0,
+        });
+        try w.writeAttribute(.{ .data = "hello" });
+
+        const msg = try Message.parse(w.final());
+        try testing.expectError(error.InvalidMessage, msg.parseDataIndication());
+    }
+
+    {
+        var w = Writer.init(&buffer, .{});
+        try w.writeHeader(.{
+            .message_type = .fromClassAndMethod(.indication, .data),
+            .transaction_id = 0,
+            .message_length = 0,
+        });
+        try w.writeAttribute(.{ .xor_peer_address = .{ .ip4 = .{ .bytes = .{ 192, 0, 2, 1 }, .port = 1 } } });
+
+        const msg = try Message.parse(w.final());
+        try testing.expectError(error.InvalidMessage, msg.parseDataIndication());
+    }
 }
 
 test "Writer: write channel bind request" {
