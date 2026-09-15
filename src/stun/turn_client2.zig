@@ -314,7 +314,18 @@ pub fn TurnClient(comptime config: Config) type {
                 tr.attempt += 1;
                 if (tr.attempt >= max_attempts) {
                     c.transactions.remove(idx);
-                    try c.events_out.pushBack(.{ .allocation_failed = StunError.Timeout });
+                    switch (tr.method) {
+                        .allocate => try c.events_out.pushBack(.{ .allocation_failed = StunError.Timeout }),
+                        .refresh => try c.events_out.pushBack(.{ .allocation_refresh_failed = StunError.Timeout }),
+                        .create_permission => {
+                            const peer_address = c.getXorPeerAddress(idx, tr.payload_len);
+                            try c.events_out.pushBack(.{ .permission_failed = .{
+                                .address = peer_address,
+                                .err = StunError.Timeout,
+                            } });
+                        },
+                        else => {},
+                    }
                 } else {
                     tr.deadline = now + @as(i64, tr.attempt + 1) * base_rto;
                     try c.transmits.pushBack(.{
@@ -887,5 +898,95 @@ test "createPermission: unauthorized then a hard failure emits permission_failed
             try std.testing.expectEqual(error.Forbidden, failure.err);
         },
         else => return error.UnexpectedEvent,
+    }
+}
+
+test "hasAllocation: reflects the allocation lifecycle" {
+    var r = std.Random.DefaultPrng.init(std.testing.random_seed);
+    var c = testClient(r.random());
+
+    try std.testing.expect(!c.hasAllocation());
+
+    try c.createAllocation(0);
+    const out = c.pollTransmit() orelse return error.ExpectedOutput;
+    const request = try stun.Message.parse(out.data);
+
+    var response_buf: [1024]u8 = undefined;
+    var w = stun.Writer.init(&response_buf, .{});
+    try writeHeader(&w, .success_response, .allocate, request.header.transaction_id);
+    try w.writeAttributes(&.{
+        .{ .xor_relayed_address = try IpAddress.parse("203.0.113.9", 40000) },
+        .{ .xor_mapped_address = try IpAddress.parse("198.51.100.1", 5000) },
+        .{ .lifetime = 600 },
+    });
+    try c.handleRead(w.final(), 0);
+
+    try std.testing.expect(c.hasAllocation());
+
+    var buffer: [1024]u8 = undefined;
+    try c.deleteAllocation(&buffer);
+    try std.testing.expect(!c.hasAllocation());
+}
+
+test "handleTimeout: exhausting retries emits the failure event for the transaction's method" {
+    // allocate: never answered, exhausts retries as allocation_failed.
+    {
+        var r = std.Random.DefaultPrng.init(std.testing.random_seed);
+        var c = testClient(r.random());
+
+        try c.createAllocation(0);
+
+        var now: i64 = 0;
+        for (0..TestTurnClient.max_attempts) |_| {
+            now = (c.pollTimeout() orelse return error.ExpectedTimeout) + 1;
+            try c.handleTimeout(now);
+        }
+
+        const event = c.pollEvent() orelse return error.ExpectedEvent;
+        try std.testing.expectEqual(StunError.Timeout, event.allocation_failed);
+    }
+
+    // refresh: active allocation whose refresh transaction times out.
+    {
+        var r = std.Random.DefaultPrng.init(std.testing.random_seed);
+        var c = testClient(r.random());
+        c.allocation_lifetime = 600;
+        c.allocation_refresh_deadline = 1;
+
+        var now: i64 = 1;
+        try c.handleTimeout(now);
+        _ = c.pollTransmit() orelse return error.ExpectedOutput;
+
+        for (0..TestTurnClient.max_attempts) |_| {
+            now = (c.pollTimeout() orelse return error.ExpectedTimeout) + 1;
+            try c.handleTimeout(now);
+        }
+
+        const event = c.pollEvent() orelse return error.ExpectedEvent;
+        try std.testing.expectEqual(StunError.Timeout, event.allocation_refresh_failed);
+    }
+
+    // create_permission: exhausts retries and reports the peer address.
+    {
+        var r = std.Random.DefaultPrng.init(std.testing.random_seed);
+        var c = testClient(r.random());
+
+        const peer = try IpAddress.parse("192.0.2.1", 3478);
+        try c.createPermission(peer, 0);
+
+        var now: i64 = 0;
+        for (0..TestTurnClient.max_attempts) |_| {
+            now = (c.pollTimeout() orelse return error.ExpectedTimeout) + 1;
+            try c.handleTimeout(now);
+        }
+
+        const event = c.pollEvent() orelse return error.ExpectedEvent;
+        switch (event) {
+            .permission_failed => |failure| {
+                try std.testing.expect(failure.address.eql(&peer));
+                try std.testing.expectEqual(StunError.Timeout, failure.err);
+            },
+            else => return error.UnexpectedEvent,
+        }
     }
 }

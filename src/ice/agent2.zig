@@ -367,7 +367,7 @@ pub fn Agent(comptime config: struct {
             if (now >= agent.connectivity_check_deadline) {
                 agent.connectivity_check_deadline = now + connectivity_check_interval;
                 if (agent.nominated_pair == null) agent.connectivity_check = .{};
-                if (agent.role == .controlling and agent.selected_pair == null) {
+                if (agent.role == .controlling and agent.nominated_pair == null and agent.selected_pair == null) {
                     agent.selected_pair = agent.selectBestPair();
                     agent.connectivity_check = .{};
                 }
@@ -409,17 +409,21 @@ pub fn Agent(comptime config: struct {
                 .data = data,
             };
 
+            for (agent.turn_clients.items, 0..) |*turn_client, i| {
+                if (turn_client.local_addr.eql(new_message.to) and turn_client.remote_addr.eql(new_message.from)) {
+                    try turn_client.handleRead(new_message.data, now);
+                    _ = try agent.handleTurnClientEvents(i, now);
+                    return .consumed;
+                }
+            }
+
             switch (agent.connection_state) {
                 .completed, .disconnected, .failed => |state| {
                     agent.disconnected_connection_deadline = now + agent.disconnected_timeout;
                     msg = stun.Message.parse(new_message.data) catch return .consumed;
                     if (state == .disconnected) try agent.setConnectionState(.completed, now);
-                    if (try agent.handleConsentFreshness(&msg, new_message.from, buffer)) |resp| {
-                        try agent.transmits.pushBack(.{
-                            .data = resp,
-                            .from = new_message.to,
-                            .to = new_message.from,
-                        });
+                    if (try agent.handleConsentFreshness(&msg, new_message.to, new_message.from, buffer)) |resp| {
+                        try agent.transmits.pushBack(resp);
                     }
 
                     return .consumed;
@@ -429,14 +433,6 @@ pub fn Agent(comptime config: struct {
                         if (stun_server.local_addr.eql(new_message.to)) {
                             try stun_server.handleRead(new_message.data);
                             _ = try agent.handleStunClientEvents(i);
-                            return .consumed;
-                        }
-                    }
-
-                    for (agent.turn_clients.items, 0..) |*turn_client, i| {
-                        if (turn_client.local_addr.eql(new_message.to) and turn_client.remote_addr.eql(new_message.from)) {
-                            try turn_client.handleRead(new_message.data, now);
-                            _ = try agent.handleTurnClientEvents(i, now);
                             return .consumed;
                         }
                     }
@@ -469,7 +465,7 @@ pub fn Agent(comptime config: struct {
                     const local_candidate = &agent.candidates[agent.nominated_pair.?.local];
                     const remote_addr = &agent.remote_candidates[agent.nominated_pair.?.remote].address;
                     return agent.maybeWrapInTurnMessage(
-                        local_candidate,
+                        &local_candidate.base,
                         remote_addr,
                         &agent.connectivity_check_buffer,
                         payload.len,
@@ -576,9 +572,17 @@ pub fn Agent(comptime config: struct {
                 .completed => {
                     agent.connectivity_check_deadline = std.math.maxInt(i64);
                     agent.connectivity_check = .{ .done = true };
+                    agent.disconnected_connection_deadline = now + agent.disconnected_timeout;
                     agent.pairs.clearAndFree(agent.allocator);
                     agent.pending_requests.clearAndFree(agent.allocator);
                     agent.stun_clients.clearAndFree(agent.allocator);
+
+                    const local_candidate = &agent.candidates[agent.nominated_pair.?.local];
+                    if (agent.findTurnClient(&local_candidate.base)) |turn_client| {
+                        const client = turn_client.*;
+                        agent.turn_clients.shrinkAndFree(agent.allocator, 1);
+                        agent.turn_clients.items[0] = client;
+                    } else agent.turn_clients.clearAndFree(agent.allocator);
                 },
                 .disconnected => agent.disconnected_connection_deadline = now + agent.failed_timeout,
                 .failed => {
@@ -669,11 +673,12 @@ pub fn Agent(comptime config: struct {
                     delete_entry = true;
                     break;
                 },
+                .allocation_refresh_failed => {},
                 .permission_created => |addr| {
                     Logger.debug("Turn server permission created for {f}: {f}", .{ turn_client.remote_addr, addr });
                 },
                 .permission_failed => |err| {
-                    Logger.warn("Turn server permission failed for {f}: {}", .{ err.address, err.err });
+                    Logger.debug("Turn server permission failed for {f}: {}", .{ err.address, err.err });
                     for (agent.pairs.items) |*pair| {
                         const local_addr = agent.getPairLocal(pair).base;
                         const remote_addr = agent.getPairRemote(pair).address;
@@ -751,7 +756,7 @@ pub fn Agent(comptime config: struct {
             ) catch return null;
 
             const msg = agent.maybeWrapInTurnMessage(
-                local,
+                &local.base,
                 remote,
                 &agent.connectivity_check_buffer,
                 payload.len,
@@ -848,23 +853,22 @@ pub fn Agent(comptime config: struct {
             }
 
             const resp = try Messages.buildSuccessResponse(msg, agent.credentials.getPassword(), from, buffer);
-            return try agent.maybeWrapInTurnMessage(local_candidate, from, buffer, resp.len);
+            return try agent.maybeWrapInTurnMessage(&local_candidate.base, from, buffer, resp.len);
         }
 
         fn maybeWrapInTurnMessage(
             agent: *Self,
-            candidate: *const Candidate,
+            local: *const IpAddress,
             remote: *const IpAddress,
             buffer: []u8,
             data_len: usize,
         ) !stun.TransportMessage {
-            if (candidate.candidate_type != .relay) return stun.TransportMessage{
+            const turn_client = agent.findTurnClient(local) orelse return stun.TransportMessage{
                 .data = buffer[0..data_len],
-                .from = &candidate.base,
+                .from = local,
                 .to = remote,
             };
 
-            const turn_client = agent.findTurnClient(&candidate.base).?;
             const offset, const size = turn_client.getDataFrameSize(remote, data_len);
             if (size > buffer.len) return error.BufferTooSmall;
             @memmove(buffer[offset .. offset + data_len], buffer[0..data_len]);
@@ -872,7 +876,7 @@ pub fn Agent(comptime config: struct {
 
             return stun.TransportMessage{
                 .data = buffer[0..size],
-                .from = &candidate.base,
+                .from = local,
                 .to = &turn_client.remote_addr,
             };
         }
@@ -925,11 +929,12 @@ pub fn Agent(comptime config: struct {
             }
         }
 
-        fn handleConsentFreshness(agent: *Self, msg: *const stun.Message, from: *const IpAddress, buffer: []u8) !?[]const u8 {
+        fn handleConsentFreshness(agent: *Self, msg: *const stun.Message, to: *const IpAddress, from: *const IpAddress, buffer: []u8) !?stun.TransportMessage {
             switch (msg.header.message_type.class()) {
                 .request => {
                     try Messages.validateConsentFreshnessRequest(msg, agent.credentials.getPassword());
-                    return try Messages.buildSuccessResponse(msg, agent.credentials.getPassword(), from, buffer);
+                    const resp = try Messages.buildSuccessResponse(msg, agent.credentials.getPassword(), from, buffer);
+                    return try agent.maybeWrapInTurnMessage(to, from, buffer, resp.len);
                 },
                 else => {},
             }
@@ -974,15 +979,15 @@ pub fn Agent(comptime config: struct {
             return pair;
         }
 
-        fn maybeSetNominatedField(core: *Self, candidate_pair: *CandidatePair) void {
+        fn maybeSetNominatedField(agent: *Self, candidate_pair: *CandidatePair) void {
             if (candidate_pair.nominate_on_binding) {
                 candidate_pair.nominate_on_binding = false;
                 candidate_pair.nominated = true;
-            } else if (core.selected_pair) |selected_idx| {
-                if (core.pairsEql(&core.pairs.items[selected_idx], candidate_pair)) {
-                    core.nominated_pair = .{ .local = @intCast(candidate_pair.local), .remote = @intCast(candidate_pair.remote) };
+            } else if (agent.selected_pair) |selected_idx| {
+                if (agent.pairsEql(&agent.pairs.items[selected_idx], candidate_pair)) {
+                    agent.nominated_pair = .{ .local = @intCast(candidate_pair.local), .remote = @intCast(candidate_pair.remote) };
                     candidate_pair.nominated = true;
-                    core.selected_pair = null;
+                    agent.selected_pair = null;
                 }
             }
         }
@@ -1075,6 +1080,59 @@ fn testStunBindingResponse(buffer: []u8, tx_id: u96, addr: IpAddress) ![]const u
         .message_length = 0,
     });
     try w.writeAttribute(.{ .xor_mapped_address = addr });
+    return w.final();
+}
+
+fn testTurnAllocateSuccessResponse(buffer: []u8, tx_id: u96, relayed: IpAddress, mapped: IpAddress, lifetime: u32) ![]const u8 {
+    var w = stun.Writer.init(buffer, .{});
+    try w.writeHeader(.{
+        .message_type = .fromClassAndMethod(.success_response, .allocate),
+        .transaction_id = tx_id,
+        .message_length = 0,
+    });
+    try w.writeAttributes(&.{
+        .{ .xor_relayed_address = relayed },
+        .{ .xor_mapped_address = mapped },
+        .{ .lifetime = lifetime },
+    });
+    return w.final();
+}
+
+fn testTurnChallengeResponse(buffer: []u8, tx_id: u96, method: stun.Method) ![]const u8 {
+    var w = stun.Writer.init(buffer, .{});
+    try w.writeHeader(.{
+        .message_type = .fromClassAndMethod(.error_response, method),
+        .transaction_id = tx_id,
+        .message_length = 0,
+    });
+    try w.writeAttributes(&.{
+        .{ .error_code = .{ .code = .unauthorized, .reason = "Unauthorized" } },
+        .{ .realm = "realm" },
+        .{ .nonce = "nonce" },
+    });
+    return w.final();
+}
+
+fn testTurnErrorResponse(buffer: []u8, tx_id: u96, method: stun.Method, code: stun.StunErrorCode, reason: []const u8) ![]const u8 {
+    var w = stun.Writer.init(buffer, .{});
+    try w.writeHeader(.{
+        .message_type = .fromClassAndMethod(.error_response, method),
+        .transaction_id = tx_id,
+        .message_length = 0,
+    });
+    try w.writeAttribute(.{ .error_code = .{ .code = code, .reason = reason } });
+    return w.final();
+}
+
+fn testTurnDataIndication(buffer: []u8, peer: IpAddress, data: []const u8) ![]const u8 {
+    var w = stun.Writer.init(buffer, .{});
+    try w.writeHeader(.{
+        .message_type = .fromClassAndMethod(.indication, .data),
+        .transaction_id = 0,
+        .message_length = 0,
+    });
+    try w.writeAttribute(.{ .xor_peer_address = peer });
+    try w.writeAttribute(.{ .data = data });
     return w.final();
 }
 
@@ -1876,4 +1934,297 @@ test "setRemoteCredentials: replaces and frees the previous value" {
     try core.setRemoteCredentials(.{ .username = "second", .password = "second-password-0123456789" }, 0);
     try testing.expectEqualStrings("second", core.remote_credentials.?.getUsername());
     try testing.expectEqualStrings("second-password-0123456789", core.remote_credentials.?.getPassword());
+}
+
+test "addTurnServer/addLocalAddrs: queues an allocate request and keeps gathering incomplete until it resolves" {
+    var core = try testNewAgent(.controlling);
+    defer core.deinit();
+
+    const local = try IpAddress.parse("10.0.0.10", 4000);
+    const server = try IpAddress.parse("203.0.113.1", 3478);
+
+    try core.addTurnServer(local, server, "turnuser", "turnpass");
+    try core.addLocalAddrs(&.{}, 0);
+
+    const tm = core.pollTransmit() orelse return error.ExpectedTransmit;
+    try testing.expect(tm.from.eql(&local));
+    try testing.expect(tm.to.eql(&server));
+    try testing.expectEqual(null, core.pollTransmit());
+
+    try testing.expectEqual(.gathering, core.gathering_state);
+}
+
+test "handleTurnClientEvents: successful allocation adds a relay candidate, creates a permission for the paired remote, and completes gathering" {
+    var core = try testNewAgent(.controlling);
+    defer core.deinit();
+
+    const local = try IpAddress.parse("10.0.0.10", 4000);
+    const server = try IpAddress.parse("203.0.113.1", 3478);
+    const remote = try IpAddress.parse("192.168.1.10", 1000);
+
+    try core.addTurnServer(local, server, "turnuser", "turnpass");
+    try core.addRemoteCandidate(Candidate.initHost(remote), 0);
+    try core.addLocalAddrs(&.{}, 0);
+    while (core.pollEvent()) |_| {}
+
+    var response_buf: [1024]u8 = undefined;
+    const out = core.pollTransmit() orelse return error.ExpectedTransmit;
+    const request = try stun.Message.parse(out.data);
+
+    const relayed = try IpAddress.parse("203.0.113.9", 40000);
+    const mapped = try IpAddress.parse("198.51.100.1", 5000);
+    const resp = try testTurnAllocateSuccessResponse(&response_buf, request.header.transaction_id, relayed, mapped, 600);
+
+    const result = try core.handleRead(.{ .from = &server, .to = &local, .data = resp }, 0, &response_buf);
+    try testing.expectEqual(.consumed, std.meta.activeTag(result));
+
+    try testing.expectEqual(1, core.candidates_len);
+    try testing.expectEqual(.relay, core.candidates[0].candidate_type);
+
+    var saw_candidate = false;
+    var saw_gathering_complete = false;
+    while (core.pollEvent()) |event| switch (event) {
+        .candidate => saw_candidate = true,
+        .gathering_state => |s| if (s == .complete) {
+            saw_gathering_complete = true;
+        },
+        else => {},
+    };
+    try testing.expect(saw_candidate);
+    try testing.expect(saw_gathering_complete);
+    try testing.expectEqual(.complete, core.gathering_state);
+
+    const permission_tm = core.pollTransmit() orelse return error.ExpectedTransmit;
+    const permission_msg = try stun.Message.parse(permission_tm.data);
+    try testing.expectEqual(.create_permission, permission_msg.header.message_type.method());
+
+    var it = permission_msg.iterateAttributes(&.{});
+    const attr = try it.next() orelse return error.ExpectedAttribute;
+    try testing.expect(attr.xor_peer_address.eql(&remote));
+}
+
+test "addRemoteCandidate: pairs with a relay candidate and creates a permission" {
+    var core = try testNewAgent(.controlling);
+    defer core.deinit();
+
+    const local = try IpAddress.parse("10.0.0.10", 4000);
+    const server = try IpAddress.parse("203.0.113.1", 3478);
+    const relayed = try IpAddress.parse("203.0.113.9", 40000);
+
+    try core.addTurnServer(local, server, "turnuser", "turnpass");
+    _ = try core.addLocalCandidate(.initRelay(local, relayed));
+
+    const remote = try IpAddress.parse("192.168.1.10", 1000);
+    try core.addRemoteCandidate(Candidate.initHost(remote), 0);
+
+    try testing.expectEqual(1, core.pairs.items.len);
+
+    const out = core.pollTransmit() orelse return error.ExpectedTransmit;
+    const msg = try stun.Message.parse(out.data);
+    try testing.expectEqual(.create_permission, msg.header.message_type.method());
+
+    var it = msg.iterateAttributes(&.{});
+    const attr = try it.next() orelse return error.ExpectedAttribute;
+    try testing.expect(attr.xor_peer_address.eql(&remote));
+}
+
+test "handleRead: unwraps a TURN data indication before further processing" {
+    var core = try testNewAgent(.controlled);
+    defer core.deinit();
+
+    const local = try IpAddress.parse("10.0.0.10", 4000);
+    const server = try IpAddress.parse("203.0.113.1", 3478);
+    const relayed = try IpAddress.parse("203.0.113.9", 40000);
+    const peer = try IpAddress.parse("192.168.1.120", 2000);
+
+    try core.addTurnServer(local, server, "turnuser", "turnpass");
+
+    core.candidates[0] = .initRelay(local, relayed);
+    core.candidates_len = 1;
+    core.remote_candidates[0] = testRemoteCandidate(peer);
+    core.remote_candidates_len = 1;
+    try core.pairs.append(testing.allocator, .{
+        .local = 0,
+        .remote = 0,
+        .status = .in_progress,
+        .priority = 0,
+    });
+
+    var buffer: [1024]u8 = undefined;
+    var indication_buf: [1024]u8 = undefined;
+    var resp_buffer: [1024]u8 = undefined;
+
+    {
+        const inner = try testBuildRequest(.{
+            .ice_controlling = 0x10000,
+            .priority = 0x9090,
+            .username = core.credentials.getUsername(),
+        }, core.credentials.getPassword(), &buffer);
+
+        const indication = try testTurnDataIndication(&indication_buf, peer, inner.bytes);
+
+        const result = try core.handleRead(.{ .from = &server, .to = &local, .data = indication }, 0, &resp_buffer);
+        try testing.expectEqual(.consumed, std.meta.activeTag(result));
+
+        const tm = core.pollTransmit() orelse return error.ExpectedTransmit;
+        try testing.expect(tm.from.eql(&local));
+        try testing.expect(tm.to.eql(&server));
+    }
+
+    {
+        const indication = try testTurnDataIndication(&indication_buf, peer, "hello");
+        const result = try core.handleRead(.{ .from = &server, .to = &local, .data = indication }, 0, &resp_buffer);
+        switch (result) {
+            .app_data => |data| try testing.expectEqualStrings("hello", data),
+            .consumed => return error.UnexpectedResult,
+        }
+    }
+}
+
+test "maybeWrapInTurnMessage: relay candidate responses are wrapped as a TURN send indication addressed to the server" {
+    var core = try testNewAgent(.controlled);
+    defer core.deinit();
+
+    var buffer: [1024]u8 = undefined;
+    var resp_buffer: [1024]u8 = undefined;
+
+    const local = try IpAddress.parse("10.0.0.10", 4000);
+    const server = try IpAddress.parse("203.0.113.1", 3478);
+    const relayed = try IpAddress.parse("203.0.113.9", 40000);
+    const from = try IpAddress.parse("192.168.1.120", 2000);
+
+    try core.addTurnServer(local, server, "turnuser", "turnpass");
+
+    core.candidates[0] = .initRelay(local, relayed);
+    core.candidates_len = 1;
+    core.remote_candidates[0] = testRemoteCandidate(from);
+    core.remote_candidates_len = 1;
+    try core.pairs.append(testing.allocator, .{
+        .local = 0,
+        .remote = 0,
+        .status = .in_progress,
+        .priority = 0,
+    });
+
+    const msg = try testBuildRequest(.{
+        .ice_controlling = 0x10000,
+        .priority = 0x9090,
+        .username = core.credentials.getUsername(),
+    }, core.credentials.getPassword(), &buffer);
+
+    const resp = try core.handleRequest(&msg, &local, &from, &resp_buffer);
+
+    try testing.expect(resp.from.eql(&local));
+    try testing.expect(resp.to.eql(&server));
+
+    const resp_msg = try stun.Message.parse(resp.data);
+    try testing.expectEqual(.indication, resp_msg.header.message_type.class());
+    try testing.expectEqual(.send, resp_msg.header.message_type.method());
+
+    var it = resp_msg.iterateAttributes(&.{});
+    const attr = try it.next() orelse return error.ExpectedAttribute;
+    try testing.expect(attr.xor_peer_address.eql(&from));
+}
+
+test "handleTurnClientEvents: allocation_failed removes the turn client and gathering still completes" {
+    var core = try testNewAgent(.controlling);
+    defer core.deinit();
+
+    const local = try IpAddress.parse("10.0.0.10", 4000);
+    const server = try IpAddress.parse("203.0.113.1", 3478);
+
+    try core.addTurnServer(local, server, "turnuser", "turnpass");
+    try core.addLocalAddrs(&.{}, 0);
+    while (core.pollEvent()) |_| {}
+
+    var response_buf: [1024]u8 = undefined;
+
+    // Unauthenticated request answered with a challenge: retried, authenticated this time.
+    {
+        const out = core.pollTransmit() orelse return error.ExpectedTransmit;
+        const request = try stun.Message.parse(out.data);
+        const resp = try testTurnChallengeResponse(&response_buf, request.header.transaction_id, .allocate);
+        _ = try core.handleRead(.{ .from = &server, .to = &local, .data = resp }, 0, &response_buf);
+    }
+
+    // Authenticated retry gets a hard failure: emits allocation_failed immediately.
+    {
+        const out = core.pollTransmit() orelse return error.ExpectedTransmit;
+        const request = try stun.Message.parse(out.data);
+        const resp = try testTurnErrorResponse(&response_buf, request.header.transaction_id, .allocate, .server_error, "Server Error");
+        _ = try core.handleRead(.{ .from = &server, .to = &local, .data = resp }, 0, &response_buf);
+    }
+
+    try testing.expectEqual(0, core.turn_clients.items.len);
+    try testing.expectEqual(.complete, core.gathering_state);
+}
+
+test "handleTurnClientEvents: permission_failed marks the matching candidate pair as failed" {
+    var core = try testNewAgent(.controlling);
+    defer core.deinit();
+
+    const local = try IpAddress.parse("10.0.0.10", 4000);
+    const server = try IpAddress.parse("203.0.113.1", 3478);
+    const remote = try IpAddress.parse("192.168.1.10", 1000);
+
+    try core.addTurnServer(local, server, "turnuser", "turnpass");
+    try core.addRemoteCandidate(Candidate.initHost(remote), 0);
+    try core.addLocalAddrs(&.{}, 0);
+    while (core.pollEvent()) |_| {}
+
+    var response_buf: [1024]u8 = undefined;
+
+    {
+        const out = core.pollTransmit() orelse return error.ExpectedTransmit;
+        const request = try stun.Message.parse(out.data);
+        const relayed = try IpAddress.parse("203.0.113.9", 40000);
+        const mapped = try IpAddress.parse("198.51.100.1", 5000);
+        const resp = try testTurnAllocateSuccessResponse(&response_buf, request.header.transaction_id, relayed, mapped, 600);
+        _ = try core.handleRead(.{ .from = &server, .to = &local, .data = resp }, 0, &response_buf);
+    }
+    while (core.pollEvent()) |_| {}
+
+    try testing.expectEqual(1, core.pairs.items.len);
+    try testing.expectEqual(.waiting, core.pairs.items[0].status);
+
+    const out = core.pollTransmit() orelse return error.ExpectedTransmit;
+    const request = try stun.Message.parse(out.data);
+    const resp = try testTurnErrorResponse(&response_buf, request.header.transaction_id, .create_permission, .forbidden, "Forbidden");
+    _ = try core.handleRead(.{ .from = &server, .to = &local, .data = resp }, 0, &response_buf);
+
+    try testing.expectEqual(.failed, core.pairs.items[0].status);
+}
+
+test "handleTimeout: transitioning to completed keeps only the turn client backing the nominated pair" {
+    var core = try testNewAgent(.controlling);
+    defer core.deinit();
+
+    core.connection_state = .connected;
+    core.connectivity_check_deadline = 100_000;
+    core.disconnected_connection_deadline = 100_000;
+    core.keep_alive_deadline = 1000;
+    core.remote_credentials = try .init("ruser", "peer-password-0123456789");
+
+    const local1 = try IpAddress.parse("10.0.0.10", 4000);
+    const server1 = try IpAddress.parse("203.0.113.1", 3478);
+    const local2 = try IpAddress.parse("10.0.0.11", 4001);
+    const server2 = try IpAddress.parse("203.0.113.2", 3478);
+
+    try core.addTurnServer(local1, server1, "turnuser", "turnpass");
+    try core.addTurnServer(local2, server2, "turnuser", "turnpass");
+
+    core.candidates[0] = .initRelay(local1, try IpAddress.parse("203.0.113.9", 40000));
+    core.candidates_len = 1;
+    const from = try IpAddress.parse("192.168.1.120", 2000);
+    core.remote_candidates[0] = testRemoteCandidate(from);
+    core.remote_candidates_len = 1;
+    core.nominated_pair = .{ .local = 0, .remote = 0 };
+    try core.pairs.append(testing.allocator, .{ .local = 0, .remote = 0, .status = .succeeded, .priority = 0 });
+    try core.pending_requests.append(testing.allocator, .{ .transaction_id = @bitCast(@as(u96, 0x1)), .pair = 0 });
+
+    try core.handleTimeout(1000);
+
+    try testing.expectEqual(.completed, core.connection_state);
+    try testing.expectEqual(1, core.turn_clients.items.len);
+    try testing.expect(core.turn_clients.items[0].local_addr.eql(&local1));
 }
