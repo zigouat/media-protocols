@@ -110,10 +110,12 @@ pub fn Agent(comptime config: struct {
     auth_info_size: u8 = 64,
     max_candidates: u8 = 16,
     stun_config: stun.Client.ClientConfig = .{ .max_transactions = 1 },
+    turn_config: stun.turn.Config = .{},
 }) type {
     return struct {
         const Self = @This();
         const StunClient = stun.Client.Client(config.stun_config);
+        const TurnClient = stun.turn.TurnClient(config.turn_config);
 
         const max_events: u8 = 5;
         const initial_pairs_capacity: usize = @as(usize, config.max_candidates) * config.max_candidates / 2;
@@ -138,6 +140,7 @@ pub fn Agent(comptime config: struct {
         pairs: std.ArrayList(CandidatePair) = .empty,
         pending_requests: std.ArrayList(PendingRequest) = .empty,
         stun_clients: std.ArrayList(StunClient) = .empty,
+        turn_clients: std.ArrayList(TurnClient) = .empty,
         // This is a peer for which a use-candidate request is sent, but we didn't
         // receive response yet.
         selected_pair: ?u8 = null,
@@ -206,6 +209,7 @@ pub fn Agent(comptime config: struct {
             agent.pairs.clearAndFree(agent.allocator);
             agent.pending_requests.clearAndFree(agent.allocator);
             agent.stun_clients.clearAndFree(agent.allocator);
+            agent.turn_clients.clearAndFree(agent.allocator);
             agent.candidates_len = 0;
             agent.remote_candidates_len = 0;
         }
@@ -223,27 +227,31 @@ pub fn Agent(comptime config: struct {
         }
 
         /// Add local addresses to the agent. This should be called after `addStunServer`.
-        pub fn addLocalAddrs(core: *Self, addrs: []const IpAddress, now: i64) !void {
-            core.gathering_state = .gathering;
-            try core.events_out.pushBack(.{ .gathering_state = core.gathering_state });
+        pub fn addLocalAddrs(agent: *Self, addrs: []const IpAddress, now: i64) !void {
+            agent.gathering_state = .gathering;
+            try agent.events_out.pushBack(.{ .gathering_state = agent.gathering_state });
 
             var min_index: ?u8 = null;
             var max_index: ?u8 = null;
             for (addrs) |addr| {
                 const candidate = Candidate.initHost(addr);
-                if (try core.addLocalCandidate(candidate)) |idx| {
+                if (try agent.addLocalCandidate(candidate)) |idx| {
                     if (min_index == null) min_index = @intCast(idx);
                     max_index = @intCast(idx);
                 }
             }
 
-            if (min_index) |min| try core.events_out.pushBack(.{ .candidate = .{ min, max_index.? } });
+            if (min_index) |min| try agent.events_out.pushBack(.{ .candidate = .{ min, max_index.? } });
 
-            for (core.stun_clients.items) |*stun_client| {
+            for (agent.stun_clients.items) |*stun_client| {
                 try stun_client.bindingRequest(now);
             }
 
-            try core.setGatheringCompleted();
+            for (agent.turn_clients.items) |*turn_client| {
+                try turn_client.createAllocation(now);
+            }
+
+            try agent.setGatheringCompleted();
         }
 
         pub fn addStunServer(agent: *Self, local: IpAddress, server: IpAddress) !void {
@@ -252,6 +260,23 @@ pub fn Agent(comptime config: struct {
                 .local_addr = local,
                 .remote_addr = server,
                 .random = agent.random,
+            });
+        }
+
+        pub fn addTurnServer(
+            agent: *Self,
+            local: IpAddress,
+            server: IpAddress,
+            username: []const u8,
+            password: []const u8,
+        ) !void {
+            const stun_client = try agent.turn_clients.addOne(agent.allocator);
+            stun_client.* = TurnClient.init(.{
+                .local_addr = local,
+                .remote_addr = server,
+                .random = agent.random,
+                .username = username,
+                .password = password,
             });
         }
 
@@ -268,7 +293,7 @@ pub fn Agent(comptime config: struct {
             return try core.addLocalCandidate(candidate);
         }
 
-        pub fn addRemoteCandidate(core: *Self, remote_candidate: Candidate) !void {
+        pub fn addRemoteCandidate(core: *Self, remote_candidate: Candidate, now: i64) !void {
             const remote_idx = try core.appendRemoteCandidate(remote_candidate);
 
             outer_loop: for (core.candidates[0..core.candidates_len], 0..) |candidate, local_idx| {
@@ -285,6 +310,14 @@ pub fn Agent(comptime config: struct {
                     .remote = @intCast(remote_idx),
                     .priority = calculatePairPriority(candidate.priority, remote_candidate.priority, core.role),
                 });
+
+                if (candidate.candidate_type == .relay) {
+                    if (core.findTurnClient(&candidate.base)) |turn_client| {
+                        turn_client.createPermission(remote_candidate.address, now) catch |err| {
+                            Logger.warn("Cannot create permissions for {f}: {}\n", .{ remote_candidate.address, err });
+                        };
+                    }
+                }
             }
         }
 
@@ -320,8 +353,15 @@ pub fn Agent(comptime config: struct {
             var stun_idx: usize = 0;
             while (stun_idx < agent.stun_clients.items.len) {
                 const stun_server = &agent.stun_clients.items[stun_idx];
-                try stun_server.handleTimeout(now);
+                stun_server.handleTimeout(now) catch continue;
                 if (!try agent.handleStunClientEvents(stun_idx)) stun_idx += 1;
+            }
+
+            var turn_idx: usize = 0;
+            while (turn_idx < agent.turn_clients.items.len) {
+                const turn_server = &agent.turn_clients.items[turn_idx];
+                turn_server.handleTimeout(now) catch continue;
+                if (!try agent.handleTurnClientEvents(turn_idx, now)) turn_idx += 1;
             }
 
             if (now >= agent.connectivity_check_deadline) {
@@ -354,33 +394,54 @@ pub fn Agent(comptime config: struct {
                 return try agent.handleAppData(message.from, message.data);
             }
 
+            // Ignore malformed stun messages.
+            var msg = stun.Message.parse(message.data) catch return .consumed;
+
+            const peer, const data = if (msg.isDataIndication())
+                msg.parseDataIndication() catch return .consumed
+            else
+                .{ message.from.*, message.data };
+            if (!stun.isMessage(data)) return .{ .app_data = data };
+
+            const new_message = stun.TransportMessage{
+                .from = &peer,
+                .to = message.to,
+                .data = data,
+            };
+
             switch (agent.connection_state) {
                 .completed, .disconnected, .failed => |state| {
                     agent.disconnected_connection_deadline = now + agent.disconnected_timeout;
+                    msg = stun.Message.parse(new_message.data) catch return .consumed;
                     if (state == .disconnected) try agent.setConnectionState(.completed, now);
-                    if (try agent.handleConsentFreshness(message.from, message.data, buffer)) |resp| {
+                    if (try agent.handleConsentFreshness(&msg, new_message.from, buffer)) |resp| {
                         try agent.transmits.pushBack(.{
                             .data = resp,
-                            .from = message.to,
-                            .to = message.from,
+                            .from = new_message.to,
+                            .to = new_message.from,
                         });
                     }
 
                     return .consumed;
                 },
                 else => {
-                    const index = blk: {
-                        for (agent.stun_clients.items, 0..) |*stun_server, i| {
-                            if (stun_server.local_addr.eql(message.to)) break :blk i;
+                    for (agent.stun_clients.items, 0..) |*stun_server, i| {
+                        if (stun_server.local_addr.eql(new_message.to)) {
+                            try stun_server.handleRead(new_message.data);
+                            _ = try agent.handleStunClientEvents(i);
+                            return .consumed;
                         }
+                    }
 
-                        break :blk null;
-                    } orelse return agent.handleStunMessage(message, now, buffer);
+                    for (agent.turn_clients.items, 0..) |*turn_client, i| {
+                        if (turn_client.local_addr.eql(new_message.to) and turn_client.remote_addr.eql(new_message.from)) {
+                            try turn_client.handleRead(new_message.data, now);
+                            _ = try agent.handleTurnClientEvents(i, now);
+                            return .consumed;
+                        }
+                    }
 
-                    const stun_server = &agent.stun_clients.items[index];
-                    try stun_server.handleRead(message.data);
-                    _ = try agent.handleStunClientEvents(index);
-                    return .consumed;
+                    return agent.handleStunMessage(new_message, now, buffer);
                 },
             }
         }
@@ -390,8 +451,12 @@ pub fn Agent(comptime config: struct {
         }
 
         pub fn pollTransmit(agent: *Self) ?stun.TransportMessage {
-            for (agent.stun_clients.items) |*stun_server| {
-                if (stun_server.pollTransmit()) |msg| return msg;
+            for (agent.stun_clients.items) |*stun_client| {
+                if (stun_client.pollTransmit()) |msg| return msg;
+            }
+
+            for (agent.turn_clients.items) |*turn_client| {
+                if (turn_client.pollTransmit()) |msg| return msg;
             }
 
             if (agent.consent_freshness) {
@@ -401,9 +466,14 @@ pub fn Agent(comptime config: struct {
                     false,
                     &agent.connectivity_check_buffer,
                 )) |payload| {
-                    const local_addr = &agent.candidates[agent.nominated_pair.?.local].base;
+                    const local_candidate = &agent.candidates[agent.nominated_pair.?.local];
                     const remote_addr = &agent.remote_candidates[agent.nominated_pair.?.remote].address;
-                    return .{ .data = payload, .from = local_addr, .to = remote_addr };
+                    return agent.maybeWrapInTurnMessage(
+                        local_candidate,
+                        remote_addr,
+                        &agent.connectivity_check_buffer,
+                        payload.len,
+                    ) catch return agent.transmits.popFront();
                 } else |_| return agent.transmits.popFront();
             }
 
@@ -414,7 +484,11 @@ pub fn Agent(comptime config: struct {
             if (agent.connection_state == .closed) return null;
             var deadline: i64 = std.math.maxInt(i64);
 
-            for (agent.stun_clients.items) |*stun_server| if (stun_server.pollTimeout()) |d| {
+            for (agent.stun_clients.items) |*stun_client| if (stun_client.pollTimeout()) |d| {
+                deadline = @min(deadline, d);
+            };
+
+            for (agent.turn_clients.items) |*turn_client| if (turn_client.pollTimeout()) |d| {
                 deadline = @min(deadline, d);
             };
 
@@ -567,8 +641,64 @@ pub fn Agent(comptime config: struct {
             return true;
         }
 
+        fn handleTurnClientEvents(agent: *Self, idx: usize, now: i64) !bool {
+            const turn_client = &agent.turn_clients.items[idx];
+            var delete_entry: bool = false;
+            while (turn_client.pollEvent()) |event| switch (event) {
+                .allocated => |allocation| {
+                    const relayed_address = allocation.relayed_address;
+                    const index = try agent.addLocalCandidate(.initRelay(
+                        turn_client.local_addr,
+                        relayed_address,
+                    )) orelse {
+                        delete_entry = true;
+                        break;
+                    };
+                    try agent.events_out.pushBack(.{ .candidate = .{ @intCast(index), @intCast(index) } });
+
+                    for (agent.pairs.items) |*pair| {
+                        if (pair.local != index) continue;
+                        const remote_addr = agent.getPairRemote(pair).address;
+                        turn_client.createPermission(remote_addr, now) catch |err| {
+                            Logger.warn("Cannot create permissions for {f}: {}\n", .{ remote_addr, err });
+                        };
+                    }
+                },
+                .allocation_failed => |err| {
+                    Logger.debug("Turn server allocation failed for {f}: {}", .{ turn_client.remote_addr, err });
+                    delete_entry = true;
+                    break;
+                },
+                .permission_created => |addr| {
+                    Logger.debug("Turn server permission created for {f}: {f}", .{ turn_client.remote_addr, addr });
+                },
+                .permission_failed => |err| {
+                    Logger.warn("Turn server permission failed for {f}: {}", .{ err.address, err.err });
+                    for (agent.pairs.items) |*pair| {
+                        const local_addr = agent.getPairLocal(pair).base;
+                        const remote_addr = agent.getPairRemote(pair).address;
+                        if (local_addr.eql(&turn_client.local_addr) and remote_addr.eql(&err.address)) {
+                            pair.status = .failed;
+                            continue;
+                        }
+                    }
+                },
+                else => {},
+            };
+
+            if (delete_entry) _ = agent.turn_clients.swapRemove(idx);
+            try agent.setGatheringCompleted();
+            return delete_entry;
+        }
+
         fn setGatheringCompleted(agent: *Self) !void {
-            if (agent.stun_clients.items.len == 0) {
+            const stun_completed = agent.stun_clients.items.len == 0;
+            const turn_completed = blk: {
+                for (agent.turn_clients.items) |*turn_client| if (!turn_client.hasAllocation()) break :blk false;
+                break :blk true;
+            };
+
+            if (stun_completed and turn_completed) {
                 agent.gathering_state = .complete;
                 try agent.events_out.pushBack(.{ .gathering_state = agent.gathering_state });
             }
@@ -582,26 +712,7 @@ pub fn Agent(comptime config: struct {
                 check.nomination_done = true;
                 if (agent.selected_pair) |selected_idx| {
                     const pair = &agent.pairs.items[selected_idx];
-                    const local = agent.getPairLocal(pair);
-                    const remote = agent.getPairRemote(pair);
-
-                    const tx_id = agent.random.int(u96);
-                    const payload = agent.buildBindingRequest(
-                        tx_id,
-                        true,
-                        &agent.connectivity_check_buffer,
-                    ) catch return null;
-
-                    agent.pending_requests.append(agent.allocator, .{
-                        .transaction_id = @bitCast(tx_id),
-                        .pair = selected_idx,
-                    }) catch return null;
-
-                    return stun.TransportMessage{
-                        .data = payload,
-                        .from = &local.base,
-                        .to = &remote.address,
-                    };
+                    if (agent.buildConnectivityCheckBindingRequest(pair, selected_idx)) |msg| return msg;
                 }
             }
 
@@ -617,31 +728,45 @@ pub fn Agent(comptime config: struct {
                             continue;
                         }
 
-                        const tx_id = agent.random.int(u96);
-                        const payload = agent.buildBindingRequest(
-                            tx_id,
-                            false,
-                            &agent.connectivity_check_buffer,
-                        ) catch return null;
-                        const local = agent.getPairLocal(pair);
-                        const remote = agent.getPairRemote(pair);
-
-                        agent.pending_requests.append(agent.allocator, .{
-                            .transaction_id = @bitCast(tx_id),
-                            .pair = @intCast(idx),
-                        }) catch return null;
-
-                        return stun.TransportMessage{
-                            .data = payload,
-                            .from = &local.base,
-                            .to = &remote.address,
-                        };
+                        const msg = agent.buildConnectivityCheckBindingRequest(pair, idx) orelse continue;
+                        return msg;
                     },
                     else => {},
                 }
             }
 
             check.done = true;
+            return null;
+        }
+
+        fn buildConnectivityCheckBindingRequest(agent: *Self, pair: *const CandidatePair, idx: u16) ?stun.TransportMessage {
+            const tx_id = agent.random.int(u96);
+            const local = agent.getPairLocal(pair);
+            const remote = &agent.getPairRemote(pair).address;
+
+            const payload = agent.buildBindingRequest(
+                tx_id,
+                agent.selected_pair != null and agent.selected_pair.? == idx,
+                &agent.connectivity_check_buffer,
+            ) catch return null;
+
+            const msg = agent.maybeWrapInTurnMessage(
+                local,
+                remote,
+                &agent.connectivity_check_buffer,
+                payload.len,
+            ) catch return null;
+
+            agent.pending_requests.append(agent.allocator, .{
+                .transaction_id = @bitCast(tx_id),
+                .pair = idx,
+            }) catch return null;
+
+            return msg;
+        }
+
+        fn findTurnClient(agent: *Self, addr: *const IpAddress) ?*TurnClient {
+            for (agent.turn_clients.items) |*turn_client| if (turn_client.local_addr.eql(addr)) return turn_client;
             return null;
         }
 
@@ -692,14 +817,16 @@ pub fn Agent(comptime config: struct {
                 else => |e| return e,
             };
 
+            var local_candidate: *const Candidate = undefined;
             if (agent.findCandidatePair(base_addr, from)) |candidate_pair| {
+                local_candidate = agent.getPairLocal(candidate_pair);
                 switch (candidate_pair.status) {
                     .succeeded => candidate_pair.nominated |= stun_req.use_candidate,
                     else => candidate_pair.nominate_on_binding |= stun_req.use_candidate,
                 }
             } else {
                 const local_idx = agent.findLocalCandidate(base_addr, base_addr) orelse return error.NoLocalCandidate;
-                const local_candidate = agent.candidates[local_idx];
+                local_candidate = &agent.candidates[local_idx];
 
                 const remote_idx: u32 = agent.findRemoteCandidate(from) orelse blk: {
                     const candidate = Candidate{
@@ -721,10 +848,32 @@ pub fn Agent(comptime config: struct {
             }
 
             const resp = try Messages.buildSuccessResponse(msg, agent.credentials.getPassword(), from, buffer);
+            return try agent.maybeWrapInTurnMessage(local_candidate, from, buffer, resp.len);
+        }
+
+        fn maybeWrapInTurnMessage(
+            agent: *Self,
+            candidate: *const Candidate,
+            remote: *const IpAddress,
+            buffer: []u8,
+            data_len: usize,
+        ) !stun.TransportMessage {
+            if (candidate.candidate_type != .relay) return stun.TransportMessage{
+                .data = buffer[0..data_len],
+                .from = &candidate.base,
+                .to = remote,
+            };
+
+            const turn_client = agent.findTurnClient(&candidate.base).?;
+            const offset, const size = turn_client.getDataFrameSize(remote, data_len);
+            if (size > buffer.len) return error.BufferTooSmall;
+            @memmove(buffer[offset .. offset + data_len], buffer[0..data_len]);
+            turn_client.writeDataHeader(remote, buffer, data_len);
+
             return stun.TransportMessage{
-                .data = resp,
-                .from = base_addr,
-                .to = from,
+                .data = buffer[0..size],
+                .from = &candidate.base,
+                .to = &turn_client.remote_addr,
             };
         }
 
@@ -776,12 +925,11 @@ pub fn Agent(comptime config: struct {
             }
         }
 
-        fn handleConsentFreshness(agent: *Self, from: *const IpAddress, message: []const u8, buffer: []u8) !?[]const u8 {
-            const msg = try stun.Message.parse(message);
+        fn handleConsentFreshness(agent: *Self, msg: *const stun.Message, from: *const IpAddress, buffer: []u8) !?[]const u8 {
             switch (msg.header.message_type.class()) {
                 .request => {
-                    try Messages.validateConsentFreshnessRequest(&msg, agent.credentials.getPassword());
-                    return try Messages.buildSuccessResponse(&msg, agent.credentials.getPassword(), from, buffer);
+                    try Messages.validateConsentFreshnessRequest(msg, agent.credentials.getPassword());
+                    return try Messages.buildSuccessResponse(msg, agent.credentials.getPassword(), from, buffer);
                 },
                 else => {},
             }
@@ -1102,8 +1250,8 @@ test "addLocalCandidate: forms pairs with existing remote candidates" {
     var core = try testNewAgent(.controlling);
     defer core.deinit();
 
-    try core.addRemoteCandidate(Candidate.initHost(try IpAddress.parse("192.168.1.10", 1000)));
-    try core.addRemoteCandidate(Candidate.initHost(try IpAddress.parse("192.168.1.11", 1001)));
+    try core.addRemoteCandidate(Candidate.initHost(try IpAddress.parse("192.168.1.10", 1000)), 0);
+    try core.addRemoteCandidate(Candidate.initHost(try IpAddress.parse("192.168.1.11", 1001)), 0);
 
     try testing.expectEqual(2, core.remote_candidates_len);
     try testing.expectEqual(0, core.pairs.items.len);
@@ -1132,13 +1280,13 @@ test "addRemoteCandidate: forms pairs with existing local candidates" {
     try testing.expectEqual(0, core.pairs.items.len);
 
     const remote = try IpAddress.parse("192.168.1.10", 1000);
-    try core.addRemoteCandidate(Candidate.initHost(remote));
+    try core.addRemoteCandidate(Candidate.initHost(remote), 0);
 
     try testing.expectEqual(1, core.remote_candidates_len);
     try testing.expectEqual(2, core.pairs.items.len);
     for (core.pairs.items) |pair| try testing.expect(core.remote_candidates[pair.remote].address.eql(&remote));
 
-    try core.addRemoteCandidate(Candidate.initHost(remote));
+    try core.addRemoteCandidate(Candidate.initHost(remote), 0);
     try testing.expectEqual(2, core.pairs.items.len);
 }
 
@@ -1148,10 +1296,10 @@ test "addRemoteCandidate: skips pairing across differing address families" {
 
     try core.addLocalAddrs(&.{try IpAddress.parse("10.0.0.1", 2000)}, 0);
 
-    try core.addRemoteCandidate(Candidate.initHost(try IpAddress.parse("2001:db8::10", 1000)));
+    try core.addRemoteCandidate(Candidate.initHost(try IpAddress.parse("2001:db8::10", 1000)), 0);
     try testing.expectEqual(0, core.pairs.items.len);
 
-    try core.addRemoteCandidate(Candidate.initHost(try IpAddress.parse("192.168.1.10", 1001)));
+    try core.addRemoteCandidate(Candidate.initHost(try IpAddress.parse("192.168.1.10", 1001)), 0);
     try testing.expectEqual(1, core.pairs.items.len);
 }
 
@@ -1159,7 +1307,7 @@ test "addLocalCandidate: skips pairing across differing address families" {
     var core = try testNewAgent(.controlling);
     defer core.deinit();
 
-    try core.addRemoteCandidate(Candidate.initHost(try IpAddress.parse("192.168.1.10", 1000)));
+    try core.addRemoteCandidate(Candidate.initHost(try IpAddress.parse("192.168.1.10", 1000)), 0);
 
     try core.addLocalAddrs(&.{try IpAddress.parse("2001:db8::1", 2000)}, 0);
     while (core.pollEvent()) |_| {}
@@ -1298,7 +1446,7 @@ test "toggleRole: flips role, tie breaker and pair priorities" {
     const remote_addr = try IpAddress.parse("192.168.1.10", 1000);
 
     try core.addLocalAddrs(&.{local_addr}, 0);
-    try core.addRemoteCandidate(Candidate.initServerReflexive(remote_addr, remote_addr));
+    try core.addRemoteCandidate(Candidate.initServerReflexive(remote_addr, remote_addr), 0);
 
     try testing.expectEqual(1, core.pairs.items.len);
     const controlling_priority = core.pairs.items[0].priority;

@@ -202,16 +202,18 @@ fn Permissions(comptime max_permissions: u16) type {
 pub const TurnClientConfig = struct {
     local_addr: IpAddress,
     remote_addr: IpAddress,
-    random: *std.Random,
+    random: std.Random,
     username: []const u8,
     password: []const u8,
 };
 
-pub fn TurnClient(comptime config: struct {
+pub const Config = struct {
     max_payload_size: u32 = 384,
     max_transactions: u32 = 8,
     max_permissions: u16 = 16,
-}) type {
+};
+
+pub fn TurnClient(comptime config: Config) type {
     return struct {
         const Self = @This();
 
@@ -221,7 +223,7 @@ pub fn TurnClient(comptime config: struct {
 
         local_addr: IpAddress,
         remote_addr: IpAddress,
-        random: *std.Random,
+        random: std.Random,
         username: []const u8,
         password: []const u8,
 
@@ -256,6 +258,10 @@ pub fn TurnClient(comptime config: struct {
         pub fn createAllocation(c: *Self, now: i64) Error!void {
             if (c.allocation_refresh_deadline != 0) return error.AllocationAlreadyExists;
             try c.newAllocateRequest(now, false);
+        }
+
+        pub fn hasAllocation(c: *Self) bool {
+            return c.allocation_refresh_deadline != 0;
         }
 
         pub fn deleteAllocation(c: *Self, buffer: []u8) !void {
@@ -337,7 +343,7 @@ pub fn TurnClient(comptime config: struct {
             }
         }
 
-        /// Get the header size of a TURN message for user data.
+        /// Get the header size and the total size of a TURN message for user data.
         ///
         /// Each message to a turn server needs to be prefixed by channel number or
         /// encapsulated in send indication.
@@ -385,7 +391,7 @@ pub fn TurnClient(comptime config: struct {
             return c.events_out.popFront();
         }
 
-        pub fn pollOutput(c: *Self) ?stun.TransportMessage {
+        pub fn pollTransmit(c: *Self) ?stun.TransportMessage {
             return c.transmits.popFront();
         }
 
@@ -506,6 +512,7 @@ pub fn TurnClient(comptime config: struct {
             const tr = try c.buildCreatePermissionRequest(addresses, buffer, now);
 
             c.transactions.items[idx] = tr;
+
             try c.transmits.pushBack(.{
                 .from = &c.local_addr,
                 .to = &c.remote_addr,
@@ -691,7 +698,7 @@ fn writeHeader(w: *stun.Writer, class: stun.Class, method: stun.Method, tx_id: u
 
 const TestTurnClient = TurnClient(.{});
 
-fn testClient(random: *std.Random) TestTurnClient {
+fn testClient(random: std.Random) TestTurnClient {
     return TestTurnClient.init(.{
         .local_addr = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 12345 } },
         .remote_addr = .{ .ip4 = .{ .bytes = .{ 192, 0, 2, 1 }, .port = 3478 } },
@@ -703,16 +710,14 @@ fn testClient(random: *std.Random) TestTurnClient {
 
 test "createAllocation: queues an unauthenticated allocate request" {
     var r = std.Random.DefaultPrng.init(std.testing.random_seed);
-    var random = r.random();
-
-    var c = testClient(&random);
+    var c = testClient(r.random());
 
     try c.createAllocation(0);
 
-    const out = c.pollOutput() orelse return error.ExpectedOutput;
+    const out = c.pollTransmit() orelse return error.ExpectedOutput;
     try std.testing.expect(out.from.eql(&c.local_addr));
     try std.testing.expect(out.to.eql(&c.remote_addr));
-    try std.testing.expectEqual(null, c.pollOutput());
+    try std.testing.expectEqual(null, c.pollTransmit());
 
     const msg = try stun.Message.parse(out.data);
     try std.testing.expectEqual(.request, msg.header.message_type.class());
@@ -730,9 +735,7 @@ test "createAllocation: queues an unauthenticated allocate request" {
 
 test "createAllocation: registers a transaction with a retransmit deadline" {
     var r = std.Random.DefaultPrng.init(std.testing.random_seed);
-    var random = r.random();
-
-    var c = testClient(&random);
+    var c = testClient(r.random());
 
     try c.createAllocation(1000);
 
@@ -751,44 +754,36 @@ test "createAllocation: registers a transaction with a retransmit deadline" {
 
 test "createAllocation: fails when an allocation already exists" {
     var r = std.Random.DefaultPrng.init(std.testing.random_seed);
-    var random = r.random();
-
-    var c = testClient(&random);
+    var c = testClient(r.random());
 
     c.allocation_refresh_deadline = 5000;
     try std.testing.expectError(error.AllocationAlreadyExists, c.createAllocation(0));
-    try std.testing.expectEqual(null, c.pollOutput());
+    try std.testing.expectEqual(null, c.pollTransmit());
 }
 
 test "createAllocation: fails when no transaction slot is free" {
     var r = std.Random.DefaultPrng.init(std.testing.random_seed);
-    var random = r.random();
-
-    var c = testClient(&random);
+    var c = testClient(r.random());
 
     c.transactions.current_index = c.transactions.items.len;
 
     try std.testing.expectError(error.TooManyTransactions, c.createAllocation(0));
-    try std.testing.expectEqual(null, c.pollOutput());
+    try std.testing.expectEqual(null, c.pollTransmit());
 }
 
 test "deleteAllocation: does nothing without an active allocation" {
     var r = std.Random.DefaultPrng.init(std.testing.random_seed);
-    var random = r.random();
-
-    var c = testClient(&random);
+    var c = testClient(r.random());
 
     var buffer: [1024]u8 = undefined;
     try c.deleteAllocation(&buffer);
 
-    try std.testing.expectEqual(null, c.pollOutput());
+    try std.testing.expectEqual(null, c.pollTransmit());
 }
 
 test "deleteAllocation: queues a refresh request with lifetime zero and clears the deadline" {
     var r = std.Random.DefaultPrng.init(std.testing.random_seed);
-    var random = r.random();
-
-    var c = testClient(&random);
+    var c = testClient(r.random());
     c.allocation_refresh_deadline = 5000;
 
     var buffer: [1024]u8 = undefined;
@@ -796,10 +791,10 @@ test "deleteAllocation: queues a refresh request with lifetime zero and clears t
 
     try std.testing.expectEqual(0, c.allocation_refresh_deadline);
 
-    const out = c.pollOutput() orelse return error.ExpectedOutput;
+    const out = c.pollTransmit() orelse return error.ExpectedOutput;
     try std.testing.expect(out.from.eql(&c.local_addr));
     try std.testing.expect(out.to.eql(&c.remote_addr));
-    try std.testing.expectEqual(null, c.pollOutput());
+    try std.testing.expectEqual(null, c.pollTransmit());
 
     const msg = try stun.Message.parse(out.data);
     try std.testing.expectEqual(.request, msg.header.message_type.class());
@@ -812,15 +807,13 @@ test "deleteAllocation: queues a refresh request with lifetime zero and clears t
 
 test "createPermission: queues a create_permission request for the peer address" {
     var r = std.Random.DefaultPrng.init(std.testing.random_seed);
-    var random = r.random();
-
-    var c = testClient(&random);
+    var c = testClient(r.random());
 
     const peer = try IpAddress.parse("192.0.2.1", 3478);
     try c.createPermission(peer, 0);
 
-    const out = c.pollOutput() orelse return error.ExpectedOutput;
-    try std.testing.expectEqual(null, c.pollOutput());
+    const out = c.pollTransmit() orelse return error.ExpectedOutput;
+    try std.testing.expectEqual(null, c.pollTransmit());
 
     const msg = try stun.Message.parse(out.data);
     try std.testing.expectEqual(.request, msg.header.message_type.class());
@@ -833,14 +826,12 @@ test "createPermission: queues a create_permission request for the peer address"
 
 test "createPermission: success response emits permission_created" {
     var r = std.Random.DefaultPrng.init(std.testing.random_seed);
-    var random = r.random();
-
-    var c = testClient(&random);
+    var c = testClient(r.random());
 
     const peer = try IpAddress.parse("192.0.2.1", 3478);
     try c.createPermission(peer, 0);
 
-    const out = c.pollOutput() orelse return error.ExpectedOutput;
+    const out = c.pollTransmit() orelse return error.ExpectedOutput;
     const request = try stun.Message.parse(out.data);
 
     var response_buf: [1024]u8 = undefined;
@@ -858,14 +849,12 @@ test "createPermission: success response emits permission_created" {
 
 test "createPermission: unauthorized then a hard failure emits permission_failed" {
     var r = std.Random.DefaultPrng.init(std.testing.random_seed);
-    var random = r.random();
-
-    var c = testClient(&random);
+    var c = testClient(r.random());
 
     const peer = try IpAddress.parse("192.0.2.1", 3478);
     try c.createPermission(peer, 0);
 
-    var out = c.pollOutput() orelse return error.ExpectedOutput;
+    var out = c.pollTransmit() orelse return error.ExpectedOutput;
     var request = try stun.Message.parse(out.data);
 
     var response_buf: [1024]u8 = undefined;
@@ -881,7 +870,7 @@ test "createPermission: unauthorized then a hard failure emits permission_failed
     }
     try std.testing.expectEqual(null, c.pollEvent());
 
-    out = c.pollOutput() orelse return error.ExpectedOutput;
+    out = c.pollTransmit() orelse return error.ExpectedOutput;
     request = try stun.Message.parse(out.data);
 
     {
