@@ -1,6 +1,7 @@
 pub const agent = @import("agent2.zig");
 pub const Agent = @import("agent.zig");
 pub const IfIterator = @import("if_iterator.zig");
+pub const ParsedServerUrl = @import("parsed_server_url.zig");
 
 const std = @import("std");
 const Io = std.Io;
