@@ -697,6 +697,7 @@ pub fn Agent(comptime config: struct {
         }
 
         fn setGatheringCompleted(agent: *Self) !void {
+            if (agent.gathering_state == .complete) return;
             const stun_completed = agent.stun_clients.items.len == 0;
             const turn_completed = blk: {
                 for (agent.turn_clients.items) |*turn_client| if (!turn_client.hasAllocation()) break :blk false;
