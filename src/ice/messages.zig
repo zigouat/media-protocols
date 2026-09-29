@@ -122,7 +122,20 @@ pub fn buildSuccessResponse(
     return w.final();
 }
 
-pub fn buildRoleConflictErrorMessage(transaction_id: u96, pwd: []const u8, buffer: []u8) ![]const u8 {
+pub fn buildSuccessResponse2(tx_id: [12]u8, password: []const u8, from: *const IpAddress, buffer: []u8) stun.Writer.Error![]const u8 {
+    var w = stun.Writer.init(buffer, .{ .password = password });
+    try w.writeHeader(.{
+        .message_type = .fromClassAndMethod(.success_response, .binding),
+        .transaction_id = @bitCast(tx_id),
+        .message_length = 0,
+    });
+    try w.writeAttribute(.{ .xor_mapped_address = from.* });
+    try w.writeAttribute(.{ .message_integrity = &.{} });
+    try w.writeAttribute(.fingerprint);
+    return w.final();
+}
+
+pub fn buildRoleConflictErrorMessage(transaction_id: u96, pwd: []const u8, buffer: []u8) stun.Writer.Error![]const u8 {
     var w = stun.Writer.init(buffer, .{ .password = pwd });
     try w.writeHeader(.{
         .message_type = .fromClassAndMethod(.error_response, .binding),
