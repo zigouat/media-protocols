@@ -7,8 +7,7 @@ const IpAddress = std.Io.net.IpAddress;
 pub const Error = error{
     AllocationAlreadyExists,
     TooManyTransactions,
-    Overflow,
-} || std.Io.Writer.Error;
+} || std.Io.Writer.Error || std.mem.Allocator.Error;
 
 pub const StunError = error{
     BadRequest,

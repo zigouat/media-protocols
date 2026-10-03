@@ -467,10 +467,8 @@ pub fn Agent(comptime config: struct {
                 );
             }
 
-            for (agent.stun_clients.items) |*stun_client| if (stun_client.pollTransmit()) |msg| {
-                if (msg.data.len > buffer.len) return error.WriteFailed;
-                @memcpy(buffer[0..msg.data.len], msg.data);
-                return .{ .from = msg.from, .to = msg.to, .data = buffer[0..msg.data.len] };
+            for (agent.stun_clients.items) |*stun_client| if (try stun_client.pollTransmit(buffer)) |msg| {
+                return msg;
             };
 
             for (agent.turn_clients.items) |*turn_client| if (turn_client.pollTransmit()) |msg| {

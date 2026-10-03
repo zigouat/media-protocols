@@ -10,8 +10,8 @@ pub fn BoundedDeque(comptime T: type, comptime capacity: usize) type {
 
         pub const empty: Self = .{ .buffer = undefined, .head = 0, .len = 0 };
 
-        pub fn pushBack(self: *Self, value: T) error{Overflow}!void {
-            if (self.len == capacity) return error.Overflow;
+        pub fn pushBack(self: *Self, value: T) error{OutOfMemory}!void {
+            if (self.len == capacity) return error.OutOfMemory;
             self.buffer[(self.head + self.len) % capacity] = value;
             self.len += 1;
         }
@@ -42,11 +42,11 @@ test "pushBack/popFront: preserves FIFO order" {
     try std.testing.expectEqual(@as(?u32, 3), deque.popFront());
 }
 
-test "pushBack: returns error.Overflow when full" {
+test "pushBack: returns error.OutOfMemory when full" {
     var deque: BoundedDeque(u32, 2) = .empty;
     try deque.pushBack(1);
     try deque.pushBack(2);
-    try std.testing.expectError(error.Overflow, deque.pushBack(3));
+    try std.testing.expectError(error.OutOfMemory, deque.pushBack(3));
 }
 
 test "popFront: returns null when empty" {
