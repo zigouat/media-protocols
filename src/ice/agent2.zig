@@ -7,6 +7,7 @@ const Messages = @import("messages.zig");
 const Candidate = ice.Candidate;
 const IpAddress = std.Io.net.IpAddress;
 const Logger = std.log.scoped(.ice);
+const AllocError = std.mem.Allocator.Error;
 
 pub const NominatedPair = struct {
     local: u8,
@@ -231,7 +232,7 @@ pub fn Agent(comptime config: struct {
         }
 
         /// Add local addresses to the agent. This should be called after `addStunServer`.
-        pub fn addLocalAddrs(agent: *Self, addrs: []const IpAddress, now: i64) !void {
+        pub fn addLocalAddrs(agent: *Self, addrs: []const IpAddress, now: i64) AllocError!void {
             agent.gathering_state = .gathering;
             try agent.events_out.pushBack(.{ .gathering_state = agent.gathering_state });
 
@@ -252,13 +253,16 @@ pub fn Agent(comptime config: struct {
             }
 
             for (agent.turn_clients.items) |*turn_client| {
-                try turn_client.createAllocation(now);
+                turn_client.createAllocation(now) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    else => {},
+                };
             }
 
             try agent.setGatheringCompleted();
         }
 
-        pub fn addStunServer(agent: *Self, local: IpAddress, server: IpAddress) !void {
+        pub fn addStunServer(agent: *Self, local: IpAddress, server: IpAddress) AllocError!void {
             const stun_client = try agent.stun_clients.addOne(agent.allocator);
             stun_client.* = StunClient.init(.{
                 .local_addr = local,
@@ -273,7 +277,7 @@ pub fn Agent(comptime config: struct {
             server: IpAddress,
             username: []const u8,
             password: []const u8,
-        ) !void {
+        ) AllocError!void {
             const stun_client = try agent.turn_clients.addOne(agent.allocator);
             stun_client.* = TurnClient.init(.{
                 .local_addr = local,
@@ -284,12 +288,12 @@ pub fn Agent(comptime config: struct {
             });
         }
 
-        pub fn setRemoteCredentials(agent: *Self, credentials: ice.Credentials, now: i64) !void {
+        pub fn setRemoteCredentials(agent: *Self, credentials: ice.Credentials, now: i64) (AllocError || error{CredentialsTooLong})!void {
             agent.remote_credentials = try .init(credentials.username, credentials.password);
             try agent.setConnectionState(.checking, now);
         }
 
-        pub fn addServerReflexiveCandidate(core: *Self, base: IpAddress, mapped: IpAddress) !?usize {
+        pub fn addServerReflexiveCandidate(core: *Self, base: IpAddress, mapped: IpAddress) AllocError!?usize {
             for (core.candidates[0..core.candidates_len]) |candidate|
                 if (candidate.candidate_type == .host and ipEql(&candidate.base, &mapped)) return null;
 
@@ -297,7 +301,7 @@ pub fn Agent(comptime config: struct {
             return try core.addLocalCandidate(candidate);
         }
 
-        pub fn addRemoteCandidate(core: *Self, remote_candidate: Candidate, now: i64) !void {
+        pub fn addRemoteCandidate(core: *Self, remote_candidate: Candidate, now: i64) AllocError!void {
             const remote_idx = try core.appendRemoteCandidate(remote_candidate);
 
             outer_loop: for (core.candidates[0..core.candidates_len], 0..) |candidate, local_idx| {
@@ -326,7 +330,7 @@ pub fn Agent(comptime config: struct {
         }
 
         /// Returns `false` if an identical candidate already exists.
-        pub fn addLocalCandidate(core: *Self, candidate: Candidate) !?usize {
+        pub fn addLocalCandidate(core: *Self, candidate: Candidate) AllocError!?usize {
             for (core.candidates[0..core.candidates_len]) |*existing| if (existing.eql(&candidate)) return null;
 
             const idx = try core.appendCandidate(candidate);
@@ -351,7 +355,7 @@ pub fn Agent(comptime config: struct {
             return idx;
         }
 
-        pub fn handleTimeout(agent: *Self, now: i64) error{ OutOfMemory, Overflow }!void {
+        pub fn handleTimeout(agent: *Self, now: i64) AllocError!void {
             if (agent.connection_state == .closed) return;
 
             var stun_idx: usize = 0;
@@ -395,7 +399,7 @@ pub fn Agent(comptime config: struct {
 
         pub fn handleRead(agent: *Self, message: stun.TransportMessage, now: i64) !ReadResult {
             if (!stun.isMessage(message.data)) {
-                return try agent.handleAppData(message.from, message.data);
+                return agent.handleAppData(message.from, message.data);
             }
 
             // Ignore malformed stun messages.
@@ -415,7 +419,8 @@ pub fn Agent(comptime config: struct {
 
             for (agent.turn_clients.items, 0..) |*turn_client, i| {
                 if (turn_client.local_addr.eql(new_message.to) and turn_client.remote_addr.eql(new_message.from)) {
-                    try turn_client.handleRead(new_message.data, now);
+                    // ignore malformed messages
+                    turn_client.handleRead(new_message.data, now) catch return .consumed;
                     _ = try agent.handleTurnClientEvents(i, now);
                     return .consumed;
                 }
@@ -435,7 +440,7 @@ pub fn Agent(comptime config: struct {
                 else => {
                     for (agent.stun_clients.items, 0..) |*stun_server, i| {
                         if (stun_server.local_addr.eql(new_message.to)) {
-                            try stun_server.handleRead(new_message.data);
+                            stun_server.handleRead(new_message.data) catch return .consumed;
                             _ = try agent.handleStunClientEvents(i);
                             return .consumed;
                         }
@@ -560,16 +565,16 @@ pub fn Agent(comptime config: struct {
             }
         }
 
-        fn appendCandidate(core: *Self, candidate: Candidate) error{Overflow}!usize {
-            if (core.candidates_len >= config.max_candidates) return error.Overflow;
+        fn appendCandidate(core: *Self, candidate: Candidate) error{OutOfMemory}!usize {
+            if (core.candidates_len >= config.max_candidates) return error.OutOfMemory;
             const idx = core.candidates_len;
             core.candidates[idx] = candidate;
             core.candidates_len += 1;
             return idx;
         }
 
-        fn appendRemoteCandidate(core: *Self, candidate: Candidate) error{Overflow}!usize {
-            if (core.remote_candidates_len >= config.max_candidates) return error.Overflow;
+        fn appendRemoteCandidate(core: *Self, candidate: Candidate) AllocError!usize {
+            if (core.remote_candidates_len >= config.max_candidates) return error.OutOfMemory;
             const idx = core.remote_candidates_len;
             core.remote_candidates[idx] = .{ .address = candidate.address, .candidate_type = candidate.candidate_type, .priority = candidate.priority };
             core.remote_candidates_len += 1;
@@ -801,7 +806,7 @@ pub fn Agent(comptime config: struct {
             return null;
         }
 
-        fn handleAppData(agent: *Self, sender: *const IpAddress, data: []const u8) !ReadResult {
+        fn handleAppData(agent: *Self, sender: *const IpAddress, data: []const u8) ReadResult {
             switch (agent.connection_state) {
                 .connected, .completed, .disconnected => return .{ .app_data = data },
                 else => {
@@ -963,10 +968,10 @@ pub fn Agent(comptime config: struct {
         fn handleConsentFreshness(agent: *Self, msg: *const stun.Message, to: *const IpAddress, from: *const IpAddress) !?Response {
             switch (msg.header.message_type.class()) {
                 .request => {
-                    try Messages.validateConsentFreshnessRequest(msg, agent.credentials.getPassword());
+                    Messages.validateConsentFreshnessRequest(msg, agent.credentials.getPassword()) catch return null;
                     return .{
                         .tx_id = @bitCast(msg.header.transaction_id),
-                        .local = agent.findLocalBase(to) orelse return error.NoLocalCandidate,
+                        .local = agent.findLocalBase(to) orelse return null,
                         .remote = from.*,
                     };
                 },

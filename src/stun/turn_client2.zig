@@ -6,7 +6,6 @@ const IpAddress = std.Io.net.IpAddress;
 
 pub const Error = error{
     AllocationAlreadyExists,
-    TooManyTransactions,
 } || std.Io.Writer.Error || std.mem.Allocator.Error;
 
 pub const StunError = error{
@@ -124,8 +123,8 @@ fn Transactions(comptime max_transactions: u32, comptime max_payload_size: u32) 
 
         const init = Self{ .items = undefined, .req_payload = undefined, .current_index = 0 };
 
-        fn add(self: *Self) error{TooManyTransactions}!struct { usize, []u8 } {
-            if (self.current_index >= max_transactions) return error.TooManyTransactions;
+        fn add(self: *Self) error{OutOfMemory}!struct { usize, []u8 } {
+            if (self.current_index >= max_transactions) return error.OutOfMemory;
             const idx = self.current_index;
             self.current_index += 1;
             return .{ idx, self.getBuffer(idx, max_payload_size) };
@@ -777,7 +776,7 @@ test "createAllocation: fails when no transaction slot is free" {
 
     c.transactions.current_index = c.transactions.items.len;
 
-    try std.testing.expectError(error.TooManyTransactions, c.createAllocation(0));
+    try std.testing.expectError(error.OutOfMemory, c.createAllocation(0));
     try std.testing.expectEqual(null, c.pollTransmit());
 }
 
