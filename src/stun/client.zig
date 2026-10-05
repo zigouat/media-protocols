@@ -2,6 +2,7 @@ const std = @import("std");
 const stun = @import("stun.zig");
 
 const IpAddress = std.Io.net.IpAddress;
+const AllocError = std.mem.Allocator.Error;
 
 const Transaction = struct {
     id: [12]u8,
@@ -24,7 +25,7 @@ fn Transactions(comptime max_transactions: u32) type {
 
         const init = Self{ .items = @splat(.empty), .current_index = 0 };
 
-        fn add(self: *Self) error{OutOfMemory}!u32 {
+        fn add(self: *Self) AllocError!u32 {
             if (self.current_index >= max_transactions) return error.OutOfMemory;
             const idx = self.current_index;
             self.current_index += 1;
@@ -90,7 +91,7 @@ pub fn Client(comptime config: ClientConfig) type {
             };
         }
 
-        pub fn bindingRequest(c: *Self, now: i64) !void {
+        pub fn bindingRequest(c: *Self, now: i64) AllocError!void {
             const id = try c.transactions.add();
             const tr = &c.transactions.items[id];
             tr.id = @bitCast(c.random.int(u96));
@@ -99,16 +100,19 @@ pub fn Client(comptime config: ClientConfig) type {
             try c.transmits.pushBack(@intCast(id));
         }
 
-        pub fn handleRead(c: *Self, data: []const u8) !void {
-            const msg = try stun.Message.parse(data);
+        pub fn handleRead(c: *Self, data: []const u8) AllocError!bool {
+            const msg = stun.Message.parse(data) catch return false;
             if (c.transactions.find(msg.header.transaction_id)) |idx| {
                 c.transactions.remove(idx);
-                const mapped_addr = try getMappedAddress(&msg) orelse return;
+                const mapped_addr = (getMappedAddress(&msg) catch return false) orelse return false;
                 try c.events.pushBack(.{ .mapped_address = mapped_addr });
+                return true;
             }
+
+            return false;
         }
 
-        pub fn handleTimeout(c: *Self, now: i64) !void {
+        pub fn handleTimeout(c: *Self, now: i64) AllocError!void {
             var idx: usize = c.transactions.current_index;
             while (idx > 0) {
                 idx -= 1;
@@ -233,7 +237,7 @@ test "StunClient.handleRead: matches pending transaction and emits mapped_addres
 
     const expected_addr: IpAddress = .{ .ip4 = .{ .bytes = .{ 192, 0, 2, 1 }, .port = 32853 } };
     var buf: [64]u8 = undefined;
-    try client.handleRead(try testBindingSuccessResponse(&buf, @bitCast(tx_id), expected_addr));
+    _ = try client.handleRead(try testBindingSuccessResponse(&buf, @bitCast(tx_id), expected_addr));
 
     try testing.expectEqual(0, client.transactions.current_index);
     const event = client.pollEvent() orelse return error.ExpectedEvent;
@@ -246,16 +250,16 @@ test "StunClient.handleRead: unknown transaction produces no event" {
     var client = testClient(prng.random());
 
     var buf: [stun.header_size]u8 = undefined;
-    try client.handleRead(try testBindingRequest(&buf, 0xABC));
-
+    const processed = try client.handleRead(try testBindingRequest(&buf, 0xABC));
+    try testing.expect(!processed);
     try testing.expectEqual(null, client.pollEvent());
 }
 
-test "StunClient.handleRead: invalid stun message returns error" {
+test "StunClient.handleRead: invalid stun message not processed" {
     var prng = std.Random.DefaultPrng.init(std.testing.random_seed);
     var client = testClient(prng.random());
 
-    try testing.expectError(error.WrongMagicCookie, client.handleRead(&([_]u8{0} ** stun.header_size)));
+    try testing.expect(!try client.handleRead(&([_]u8{0} ** stun.header_size)));
 }
 
 test "StunClient.handleTimeout: does nothing before the deadline" {
