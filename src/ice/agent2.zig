@@ -439,11 +439,10 @@ pub fn Agent(comptime config: struct {
                 },
                 else => {
                     for (agent.stun_clients.items, 0..) |*stun_server, i| {
-                        if (stun_server.local_addr.eql(new_message.to)) {
-                            stun_server.handleRead(new_message.data) catch return .consumed;
+                        if (stun_server.local_addr.eql(new_message.to)) if (try stun_server.handleRead(new_message.data)) {
                             _ = try agent.handleStunClientEvents(i);
                             return .consumed;
-                        }
+                        };
                     }
 
                     return agent.handleStunMessage(new_message, now);
@@ -476,10 +475,8 @@ pub fn Agent(comptime config: struct {
                 return msg;
             };
 
-            for (agent.turn_clients.items) |*turn_client| if (turn_client.pollTransmit()) |msg| {
-                if (msg.data.len > buffer.len) return error.WriteFailed;
-                @memcpy(buffer[0..msg.data.len], msg.data);
-                return .{ .from = msg.from, .to = msg.to, .data = buffer[0..msg.data.len] };
+            for (agent.turn_clients.items) |*turn_client| if (try turn_client.pollTransmit(buffer)) |msg| {
+                return msg;
             };
 
             if (agent.consent_freshness) {

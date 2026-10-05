@@ -4,9 +4,9 @@ const BoundedDeque = @import("bounded_deque.zig").BoundedDeque;
 
 const IpAddress = std.Io.net.IpAddress;
 
-pub const Error = error{
-    AllocationAlreadyExists,
-} || std.Io.Writer.Error || std.mem.Allocator.Error;
+pub const AllocError = std.mem.Allocator.Error;
+
+pub const AllocationError = AllocError || error{AllocationAlreadyExists};
 
 pub const StunError = error{
     BadRequest,
@@ -54,6 +54,7 @@ pub const Event = union(enum) {
     allocation_refresh_failed: StunError,
     permission_failed: PermissionFailure,
     permission_created: IpAddress,
+    permission_refresh_failed: StunError,
 };
 
 fn AuthInfo(comptime size: u16) type {
@@ -94,59 +95,58 @@ fn AuthInfo(comptime size: u16) type {
 }
 
 const Transaction = struct {
+    const Method = enum {
+        allocate,
+        create_permission,
+        refresh_allocation,
+        refresh_permission,
+    };
+
     id: u96,
-    method: stun.Method,
+    method: Method,
     authenticated: bool,
     attempt: u8,
-    payload_len: u32,
     deadline: i64,
+    permission: IpAddress,
 
-    fn init(id: u96, method: stun.Method, deadline: i64) Transaction {
+    fn init(id: u96, method: Method, deadline: i64) Transaction {
         return Transaction{
             .id = id,
             .method = method,
             .authenticated = true,
             .attempt = 0,
-            .payload_len = 0,
             .deadline = deadline,
+            .permission = undefined,
         };
     }
 };
 
-fn Transactions(comptime max_transactions: u32, comptime max_payload_size: u32) type {
+fn Transactions(comptime max_transactions: u32) type {
     return struct {
         const Self = @This();
 
         items: [max_transactions]Transaction,
-        req_payload: [max_payload_size * max_transactions]u8,
         current_index: u32,
 
-        const init = Self{ .items = undefined, .req_payload = undefined, .current_index = 0 };
+        const init = Self{ .items = undefined, .current_index = 0 };
 
-        fn add(self: *Self) error{OutOfMemory}!struct { usize, []u8 } {
+        fn add(self: *Self) AllocError!u32 {
             if (self.current_index >= max_transactions) return error.OutOfMemory;
             const idx = self.current_index;
             self.current_index += 1;
-            return .{ idx, self.getBuffer(idx, max_payload_size) };
+            return idx;
         }
 
         fn remove(self: *Self, idx: usize) void {
             self.current_index -= 1;
             const last = self.current_index;
             if (idx == last) return;
-
             self.items[idx] = self.items[last];
-            @memcpy(self.getBuffer(idx, max_payload_size), self.getBuffer(last, max_payload_size));
         }
 
         fn find(self: *Self, tx_id: u96) ?usize {
             for (self.items[0..self.current_index], 0..) |tr, idx| if (tr.id == tx_id) return idx;
             return null;
-        }
-
-        fn getBuffer(self: *Self, index: usize, payload_len: u32) []u8 {
-            const start = index * max_payload_size;
-            return self.req_payload[start .. start + payload_len];
         }
 
         fn slice(self: *Self) []Transaction {
@@ -162,9 +162,9 @@ fn Permissions(comptime max_permissions: u16) type {
 
         const init = @This(){ .addresses = undefined, .current_index = 0 };
 
-        fn add(self: *@This(), address: IpAddress) error{Overflow}!bool {
+        fn add(self: *@This(), address: IpAddress) AllocError!bool {
             if (self.contains(address) != null) return false;
-            if (self.current_index >= max_permissions) return error.Overflow;
+            if (self.current_index >= max_permissions) return error.OutOfMemory;
             self.addresses[self.current_index] = address;
             self.current_index += 1;
             return true;
@@ -206,9 +206,13 @@ pub const TurnClientConfig = struct {
 };
 
 pub const Config = struct {
-    max_payload_size: u32 = 384,
     max_transactions: u32 = 8,
     max_permissions: u16 = 16,
+};
+
+const Transmit = union(enum) {
+    transaction: u32,
+    delete_allocation,
 };
 
 pub fn TurnClient(comptime config: Config) type {
@@ -226,9 +230,9 @@ pub fn TurnClient(comptime config: Config) type {
         password: []const u8,
 
         auth_info: AuthInfo(128),
-        transactions: Transactions(config.max_transactions, config.max_payload_size),
+        transactions: Transactions(config.max_transactions),
         events_out: BoundedDeque(Event, config.max_transactions),
-        transmits: BoundedDeque(stun.TransportMessage, config.max_transactions),
+        transmits: BoundedDeque(Transmit, config.max_transactions),
         permissions: Permissions(config.max_permissions),
 
         allocation_lifetime: u32,
@@ -253,7 +257,7 @@ pub fn TurnClient(comptime config: Config) type {
             };
         }
 
-        pub fn createAllocation(c: *Self, now: i64) Error!void {
+        pub fn createAllocation(c: *Self, now: i64) AllocationError!void {
             if (c.allocation_refresh_deadline != 0) return error.AllocationAlreadyExists;
             try c.newAllocateRequest(now, false);
         }
@@ -262,37 +266,22 @@ pub fn TurnClient(comptime config: Config) type {
             return c.allocation_refresh_deadline != 0;
         }
 
-        pub fn deleteAllocation(c: *Self, buffer: []u8) !void {
+        pub fn deleteAllocation(c: *Self) AllocError!void {
             if (c.allocation_refresh_deadline == 0) return;
-
-            const id = c.random.int(u96);
-            var w = stun.Writer.init(buffer, .{ .password = c.auth_info.getKey() });
-            try writeHeader(&w, .request, .refresh, id);
-            try w.writeAttributes(&.{
-                .{ .lifetime = 0 },
-                .{ .username = c.username },
-                .{ .realm = c.auth_info.getRealm() },
-                .{ .nonce = c.auth_info.getNonce() },
-                .{ .message_integrity = &.{} },
-                .fingerprint,
-            });
-
-            const msg = w.final();
+            c.transactions = .init;
+            c.permissions = .init;
+            c.transmits.clear();
             c.allocation_refresh_deadline = 0;
-
-            try c.transmits.pushBack(.{
-                .from = &c.local_addr,
-                .to = &c.remote_addr,
-                .data = msg,
-            });
+            c.permission_refresh_deadline = 0;
+            try c.transmits.pushBack(.delete_allocation);
         }
 
-        pub fn createPermission(c: *Self, address: IpAddress, now: i64) !void {
+        pub fn createPermission(c: *Self, address: IpAddress, now: i64) AllocError!void {
             if (c.permissions.contains(address) != null) return;
-            try c.newCreatePermissionRequest(&.{address}, now);
+            try c.newCreatePermissionRequest(address, now);
         }
 
-        pub fn handleTimeout(c: *Self, now: i64) Error!void {
+        pub fn handleTimeout(c: *Self, now: i64) AllocError!void {
             if (c.allocation_refresh_deadline != 0 and now >= c.allocation_refresh_deadline) {
                 c.allocation_refresh_deadline = now + (c.allocation_lifetime / 2) * std.time.ms_per_s;
                 try c.newRefreshRequest(now);
@@ -300,10 +289,10 @@ pub fn TurnClient(comptime config: Config) type {
 
             if (c.permission_refresh_deadline != 0 and now >= c.permission_refresh_deadline) {
                 c.permission_refresh_deadline = now + permission_refresh_interval;
-                try c.newCreatePermissionRequest(c.permissions.slice(), now);
+                try c.newRefreshPermissionRequest(now);
             }
 
-            var idx: usize = c.transactions.current_index;
+            var idx: u32 = c.transactions.current_index;
             while (idx > 0) {
                 idx -= 1;
                 const tr = &c.transactions.items[idx];
@@ -311,26 +300,22 @@ pub fn TurnClient(comptime config: Config) type {
 
                 tr.attempt += 1;
                 if (tr.attempt >= max_attempts) {
+                    const expired = tr.*;
                     c.transactions.remove(idx);
-                    switch (tr.method) {
+                    switch (expired.method) {
                         .allocate => try c.events_out.pushBack(.{ .allocation_failed = StunError.Timeout }),
-                        .refresh => try c.events_out.pushBack(.{ .allocation_refresh_failed = StunError.Timeout }),
+                        .refresh_allocation => try c.events_out.pushBack(.{ .allocation_refresh_failed = StunError.Timeout }),
                         .create_permission => {
-                            const peer_address = c.getXorPeerAddress(idx, tr.payload_len);
                             try c.events_out.pushBack(.{ .permission_failed = .{
-                                .address = peer_address,
+                                .address = expired.permission,
                                 .err = StunError.Timeout,
                             } });
                         },
-                        else => {},
+                        .refresh_permission => try c.failPermissionRefresh(StunError.Timeout),
                     }
                 } else {
                     tr.deadline = now + @as(i64, tr.attempt + 1) * base_rto;
-                    try c.transmits.pushBack(.{
-                        .from = &c.local_addr,
-                        .to = &c.remote_addr,
-                        .data = c.transactions.getBuffer(idx, tr.payload_len),
-                    });
+                    try c.transmits.pushBack(.{ .transaction = idx });
                 }
             }
         }
@@ -339,16 +324,13 @@ pub fn TurnClient(comptime config: Config) type {
             const msg = try stun.Message.parse(buffer);
             const idx = c.transactions.find(msg.header.transaction_id) orelse return;
             const tr = c.transactions.items[idx];
-            // Read anything the handler needs from the request buffer before it's
-            // overwritten by the swap-remove below.
-            const peer_address = if (tr.method == .create_permission) c.getXorPeerAddress(idx, tr.payload_len) else undefined;
             c.transactions.remove(idx);
 
             switch (tr.method) {
                 .allocate => try c.handleAllocateResponse(&tr, &msg, now),
-                .refresh => try c.handleRefreshResponse(&tr, &msg, now),
-                .create_permission => try c.handleCreatePermissionResponse(peer_address, &tr, &msg, now),
-                else => {},
+                .refresh_allocation => try c.handleRefreshResponse(&msg, now),
+                .create_permission => try c.handleCreatePermissionResponse(&tr, &msg, now),
+                .refresh_permission => try c.handleRefreshPermissionResponse(&msg, now),
             }
         }
 
@@ -400,8 +382,26 @@ pub fn TurnClient(comptime config: Config) type {
             return c.events_out.popFront();
         }
 
-        pub fn pollTransmit(c: *Self) ?stun.TransportMessage {
-            return c.transmits.popFront();
+        pub fn pollTransmit(c: *Self, buffer: []u8) error{WriteFailed}!?stun.TransportMessage {
+            const transmit = c.transmits.peekFront() orelse return null;
+            const data = switch (transmit) {
+                .delete_allocation => try c.buildDeleteAllocationRequest(buffer),
+                .transaction => |idx| blk: {
+                    const tr = &c.transactions.items[idx];
+                    break :blk switch (tr.method) {
+                        .allocate => try c.buildAllocateRequest(tr, buffer),
+                        .refresh_allocation => try c.buildRefreshRequest(tr, buffer),
+                        .create_permission, .refresh_permission => try c.buildCreatePermissionRequest(tr, buffer),
+                    };
+                },
+            };
+            _ = c.transmits.popFront();
+
+            return stun.TransportMessage{
+                .from = &c.local_addr,
+                .to = &c.remote_addr,
+                .data = data,
+            };
         }
 
         fn handleAllocateResponse(c: *Self, tr: *const Transaction, msg: *const stun.Message, now: i64) !void {
@@ -426,9 +426,7 @@ pub fn TurnClient(comptime config: Config) type {
             }
         }
 
-        fn handleRefreshResponse(c: *Self, tr: *const Transaction, msg: *const stun.Message, now: i64) !void {
-            _ = tr;
-
+        fn handleRefreshResponse(c: *Self, msg: *const stun.Message, now: i64) !void {
             switch (msg.header.message_type.class()) {
                 .error_response => {
                     c.applyChallenge(msg) catch |err| switch (err) {
@@ -458,25 +456,26 @@ pub fn TurnClient(comptime config: Config) type {
             }
         }
 
-        fn handleCreatePermissionResponse(c: *Self, address: IpAddress, tr: *const Transaction, msg: *const stun.Message, now: i64) !void {
-            _ = tr;
-
+        fn handleCreatePermissionResponse(c: *Self, tr: *const Transaction, msg: *const stun.Message, now: i64) !void {
             switch (msg.header.message_type.class()) {
                 .error_response => {
                     c.applyChallenge(msg) catch |err| switch (err) {
                         error.OutOfMemory => return error.OutOfMemory,
                         error.Discard => return,
                         else => |e| {
-                            try c.events_out.pushBack(.{ .permission_failed = .{ .address = address, .err = e } });
+                            try c.events_out.pushBack(.{ .permission_failed = .{
+                                .address = tr.permission,
+                                .err = e,
+                            } });
                             return;
                         },
                     };
-                    try c.newCreatePermissionRequest(&.{address}, now);
+                    try c.newCreatePermissionRequest(tr.permission, now);
                 },
                 .success_response => {
-                    const added = c.permissions.add(address) catch {
+                    const added = c.permissions.add(tr.permission) catch {
                         try c.events_out.pushBack(.{ .permission_failed = .{
-                            .address = address,
+                            .address = tr.permission,
                             .err = StunError.TooManyPermissions,
                         } });
                         return;
@@ -484,7 +483,7 @@ pub fn TurnClient(comptime config: Config) type {
 
                     // Do not store event for permissions that were already present or refreshed.
                     if (added) {
-                        try c.events_out.pushBack(.{ .permission_created = address });
+                        try c.events_out.pushBack(.{ .permission_created = tr.permission });
                         if (c.permission_refresh_deadline == 0) c.permission_refresh_deadline = now + permission_refresh_interval;
                     }
                 },
@@ -492,41 +491,47 @@ pub fn TurnClient(comptime config: Config) type {
             }
         }
 
-        fn newAllocateRequest(c: *Self, now: i64, authenticated: bool) !void {
-            const idx, const buffer = try c.transactions.add();
-            const new_tr = try c.buildAllocateRequest(buffer, now, authenticated);
+        fn handleRefreshPermissionResponse(c: *Self, msg: *const stun.Message, now: i64) !void {
+            if (msg.header.message_type.class() != .error_response) return;
 
-            c.transactions.items[idx] = new_tr;
-            try c.transmits.pushBack(.{
-                .from = &c.local_addr,
-                .to = &c.remote_addr,
-                .data = c.transactions.getBuffer(idx, new_tr.payload_len),
-            });
+            c.applyChallenge(msg) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.Discard => return,
+                else => |e| return c.failPermissionRefresh(e),
+            };
+            try c.newRefreshPermissionRequest(now);
+        }
+
+        fn failPermissionRefresh(c: *Self, err: StunError) AllocError!void {
+            c.permissions = .init;
+            c.permission_refresh_deadline = 0;
+            try c.events_out.pushBack(.{ .permission_refresh_failed = err });
+        }
+
+        fn newAllocateRequest(c: *Self, now: i64, authenticated: bool) !void {
+            const idx = try c.transactions.add();
+            c.transactions.items[idx] = Transaction.init(c.random.int(u96), .allocate, now + base_rto);
+            c.transactions.items[idx].authenticated = authenticated;
+            try c.transmits.pushBack(.{ .transaction = idx });
         }
 
         fn newRefreshRequest(c: *Self, now: i64) !void {
-            const idx, const buffer = try c.transactions.add();
-            const tr = try c.buildRefreshRequest(buffer, now);
-
-            c.transactions.items[idx] = tr;
-            try c.transmits.pushBack(.{
-                .from = &c.local_addr,
-                .to = &c.remote_addr,
-                .data = c.transactions.getBuffer(idx, tr.payload_len),
-            });
+            const idx = try c.transactions.add();
+            c.transactions.items[idx] = Transaction.init(c.random.int(u96), .refresh_allocation, now + base_rto);
+            try c.transmits.pushBack(.{ .transaction = idx });
         }
 
-        fn newCreatePermissionRequest(c: *Self, addresses: []const IpAddress, now: i64) !void {
-            const idx, const buffer = try c.transactions.add();
-            const tr = try c.buildCreatePermissionRequest(addresses, buffer, now);
+        fn newCreatePermissionRequest(c: *Self, address: IpAddress, now: i64) !void {
+            const idx = try c.transactions.add();
+            c.transactions.items[idx] = Transaction.init(c.random.int(u96), .create_permission, now + base_rto);
+            c.transactions.items[idx].permission = address;
+            try c.transmits.pushBack(.{ .transaction = idx });
+        }
 
-            c.transactions.items[idx] = tr;
-
-            try c.transmits.pushBack(.{
-                .from = &c.local_addr,
-                .to = &c.remote_addr,
-                .data = c.transactions.getBuffer(idx, tr.payload_len),
-            });
+        fn newRefreshPermissionRequest(c: *Self, now: i64) !void {
+            const idx = try c.transactions.add();
+            c.transactions.items[idx] = Transaction.init(c.random.int(u96), .refresh_permission, now + base_rto);
+            try c.transmits.pushBack(.{ .transaction = idx });
         }
 
         /// Extracts REALM/NONCE from a 401/438 error response and derives the long-term credentials key.
@@ -554,24 +559,13 @@ pub fn TurnClient(comptime config: Config) type {
             try c.auth_info.init(nonce.?, realm.?, c.username, c.password);
         }
 
-        fn buildAllocateRequest(c: *Self, buffer: []u8, now: i64, authenticated: bool) !Transaction {
-            const tx_id = c.random.int(u96);
-
-            var transaction = Transaction{
-                .id = tx_id,
-                .method = .allocate,
-                .authenticated = authenticated,
-                .attempt = 0,
-                .payload_len = 0,
-                .deadline = now + base_rto,
-            };
-
-            var w = stun.Writer.init(buffer, .{ .password = if (authenticated) c.auth_info.getKey() else null });
-            try writeHeader(&w, .request, .allocate, tx_id);
+        fn buildAllocateRequest(c: *Self, tr: *const Transaction, buffer: []u8) ![]const u8 {
+            var w = stun.Writer.init(buffer, .{ .password = if (tr.authenticated) c.auth_info.getKey() else null });
+            try writeHeader(&w, .request, .allocate, tr.id);
             try w.writeAttribute(.{ .requested_transport = .udp });
             try w.writeAttribute(.{ .requested_address_family = std.meta.activeTag(c.local_addr) });
 
-            if (authenticated) {
+            if (tr.authenticated) {
                 try w.writeAttributes(&.{
                     .{ .username = c.username },
                     .{ .realm = c.auth_info.getRealm() },
@@ -581,20 +575,10 @@ pub fn TurnClient(comptime config: Config) type {
                 });
             }
 
-            transaction.payload_len = @intCast(w.final().len);
-            return transaction;
+            return w.final();
         }
 
-        fn buildRefreshRequest(c: *Self, buffer: []u8, now: i64) !Transaction {
-            var tr = Transaction{
-                .id = c.random.int(u96),
-                .method = .refresh,
-                .authenticated = true,
-                .attempt = 0,
-                .payload_len = 0,
-                .deadline = now + base_rto,
-            };
-
+        fn buildRefreshRequest(c: *Self, tr: *const Transaction, buffer: []u8) ![]const u8 {
             var w = stun.Writer.init(buffer, .{ .password = c.auth_info.getKey() });
             try writeHeader(&w, .request, .refresh, tr.id);
             try w.writeAttributes(&.{
@@ -606,16 +590,18 @@ pub fn TurnClient(comptime config: Config) type {
                 .fingerprint,
             });
 
-            tr.payload_len = @intCast(w.final().len);
-            return tr;
+            return w.final();
         }
 
-        fn buildCreatePermissionRequest(c: *Self, addresses: []const IpAddress, buffer: []u8, now: i64) !Transaction {
-            var tr = Transaction.init(c.random.int(u96), .create_permission, now + base_rto);
-
+        fn buildCreatePermissionRequest(c: *Self, tr: *const Transaction, buffer: []u8) ![]const u8 {
             var w = stun.Writer.init(buffer, .{ .password = c.auth_info.getKey() });
             try writeHeader(&w, .request, .create_permission, tr.id);
-            for (addresses) |addr| try w.writeAttribute(.{ .xor_peer_address = addr });
+            switch (tr.method) {
+                .create_permission => try w.writeAttribute(.{ .xor_peer_address = tr.permission }),
+                .refresh_permission => for (c.permissions.slice()) |addr| try w.writeAttribute(.{ .xor_peer_address = addr }),
+                else => unreachable,
+            }
+
             try w.writeAttributes(&.{
                 .{ .username = c.username },
                 .{ .realm = c.auth_info.getRealm() },
@@ -624,8 +610,22 @@ pub fn TurnClient(comptime config: Config) type {
                 .fingerprint,
             });
 
-            tr.payload_len = @intCast(w.final().len);
-            return tr;
+            return w.final();
+        }
+
+        fn buildDeleteAllocationRequest(c: *Self, buffer: []u8) ![]const u8 {
+            const id = c.random.int(u96);
+            var w = stun.Writer.init(buffer, .{ .password = c.auth_info.getKey() });
+            try writeHeader(&w, .request, .refresh, id);
+            try w.writeAttributes(&.{
+                .{ .lifetime = 0 },
+                .{ .username = c.username },
+                .{ .realm = c.auth_info.getRealm() },
+                .{ .nonce = c.auth_info.getNonce() },
+                .{ .message_integrity = &.{} },
+                .fingerprint,
+            });
+            return w.final();
         }
 
         fn parseAllocation(client: *Self, msg: *const stun.Message) !Event {
@@ -685,15 +685,6 @@ pub fn TurnClient(comptime config: Config) type {
                 _ => error.UnknownStunError,
             };
         }
-
-        fn getXorPeerAddress(c: *Self, idx: usize, payload_len: u32) IpAddress {
-            const request = stun.Message.parse(c.transactions.getBuffer(idx, payload_len)) catch unreachable;
-            var it = request.iterateAttributes(&.{});
-            while (it.next() catch unreachable) |attr| {
-                if (attr == .xor_peer_address) return attr.xor_peer_address;
-            }
-            unreachable;
-        }
     };
 }
 
@@ -717,16 +708,18 @@ fn testClient(random: std.Random) TestTurnClient {
     });
 }
 
-test "createAllocation: queues an unauthenticated allocate request" {
+test "TurnClient.createAllocation: queues an unauthenticated allocate request" {
     var r = std.Random.DefaultPrng.init(std.testing.random_seed);
     var c = testClient(r.random());
 
+    var buffer: [1024]u8 = undefined;
+
     try c.createAllocation(0);
 
-    const out = c.pollTransmit() orelse return error.ExpectedOutput;
+    const out = try c.pollTransmit(&buffer) orelse return error.ExpectedOutput;
     try std.testing.expect(out.from.eql(&c.local_addr));
     try std.testing.expect(out.to.eql(&c.remote_addr));
-    try std.testing.expectEqual(null, c.pollTransmit());
+    try std.testing.expectEqual(null, try c.pollTransmit(&buffer));
 
     const msg = try stun.Message.parse(out.data);
     try std.testing.expectEqual(.request, msg.header.message_type.class());
@@ -742,7 +735,7 @@ test "createAllocation: queues an unauthenticated allocate request" {
     try std.testing.expectEqual(null, try it.next());
 }
 
-test "createAllocation: registers a transaction with a retransmit deadline" {
+test "TurnClient.createAllocation: registers a transaction with a retransmit deadline" {
     var r = std.Random.DefaultPrng.init(std.testing.random_seed);
     var c = testClient(r.random());
 
@@ -761,49 +754,60 @@ test "createAllocation: registers a transaction with a retransmit deadline" {
     try std.testing.expectEqual(1000 + TestTurnClient.base_rto, c.pollTimeout());
 }
 
-test "createAllocation: fails when an allocation already exists" {
+test "TurnClient.createAllocation: fails when an allocation already exists" {
     var r = std.Random.DefaultPrng.init(std.testing.random_seed);
     var c = testClient(r.random());
+
+    var buffer: [1024]u8 = undefined;
 
     c.allocation_refresh_deadline = 5000;
     try std.testing.expectError(error.AllocationAlreadyExists, c.createAllocation(0));
-    try std.testing.expectEqual(null, c.pollTransmit());
+    try std.testing.expectEqual(null, try c.pollTransmit(&buffer));
 }
 
-test "createAllocation: fails when no transaction slot is free" {
+test "TurnClient.createAllocation: fails when no transaction slot is free" {
     var r = std.Random.DefaultPrng.init(std.testing.random_seed);
     var c = testClient(r.random());
+
+    var buffer: [1024]u8 = undefined;
 
     c.transactions.current_index = c.transactions.items.len;
 
     try std.testing.expectError(error.OutOfMemory, c.createAllocation(0));
-    try std.testing.expectEqual(null, c.pollTransmit());
+    try std.testing.expectEqual(null, try c.pollTransmit(&buffer));
 }
 
-test "deleteAllocation: does nothing without an active allocation" {
+test "TurnClient.deleteAllocation: does nothing without an active allocation" {
     var r = std.Random.DefaultPrng.init(std.testing.random_seed);
     var c = testClient(r.random());
 
     var buffer: [1024]u8 = undefined;
-    try c.deleteAllocation(&buffer);
+    try c.deleteAllocation();
 
-    try std.testing.expectEqual(null, c.pollTransmit());
+    try std.testing.expectEqual(null, c.pollTransmit(&buffer));
 }
 
-test "deleteAllocation: queues a refresh request with lifetime zero and clears the deadline" {
+test "TurnClient.deleteAllocation: queues a refresh request with lifetime zero and clears allocation state" {
     var r = std.Random.DefaultPrng.init(std.testing.random_seed);
     var c = testClient(r.random());
     c.allocation_refresh_deadline = 5000;
+    c.permission_refresh_deadline = 5000;
+    _ = try c.permissions.add(try IpAddress.parse("192.0.2.1", 3478));
+    try c.newRefreshRequest(0);
 
     var buffer: [1024]u8 = undefined;
-    try c.deleteAllocation(&buffer);
+    while (try c.pollTransmit(&buffer)) |_| {}
+    try c.deleteAllocation();
 
-    try std.testing.expectEqual(0, c.allocation_refresh_deadline);
+    try std.testing.expect(!c.hasAllocation());
+    try std.testing.expectEqual(0, c.permissions.slice().len);
+    try std.testing.expectEqual(0, c.transactions.slice().len);
+    try std.testing.expectEqual(null, c.pollTimeout());
 
-    const out = c.pollTransmit() orelse return error.ExpectedOutput;
+    const out = try c.pollTransmit(&buffer) orelse return error.ExpectedOutput;
     try std.testing.expect(out.from.eql(&c.local_addr));
     try std.testing.expect(out.to.eql(&c.remote_addr));
-    try std.testing.expectEqual(null, c.pollTransmit());
+    try std.testing.expectEqual(null, try c.pollTransmit(&buffer));
 
     const msg = try stun.Message.parse(out.data);
     try std.testing.expectEqual(.request, msg.header.message_type.class());
@@ -814,15 +818,43 @@ test "deleteAllocation: queues a refresh request with lifetime zero and clears t
     try std.testing.expectEqual(0, attribute.lifetime);
 }
 
-test "createPermission: queues a create_permission request for the peer address" {
+test "TurnClient.pollTransmit: keeps the transmit queued when the buffer is too small" {
     var r = std.Random.DefaultPrng.init(std.testing.random_seed);
     var c = testClient(r.random());
+    c.allocation_refresh_deadline = 5000;
+    try c.deleteAllocation();
+
+    var small: [10]u8 = undefined;
+    try std.testing.expectError(error.WriteFailed, c.pollTransmit(&small));
+
+    var buffer: [1024]u8 = undefined;
+    const out = try c.pollTransmit(&buffer) orelse return error.ExpectedOutput;
+    const msg = try stun.Message.parse(out.data);
+    try std.testing.expectEqual(.refresh, msg.header.message_type.method());
+    try std.testing.expectEqual(null, try c.pollTransmit(&buffer));
+}
+
+test "TurnClient.permissions.add: existing address is not an error when full" {
+    var permissions: Permissions(2) = .init;
+    const peer = try IpAddress.parse("192.0.2.1", 3478);
+
+    try std.testing.expect(try permissions.add(peer));
+    try std.testing.expect(try permissions.add(try IpAddress.parse("192.0.2.2", 3478)));
+    try std.testing.expect(!try permissions.add(peer));
+    try std.testing.expectError(error.OutOfMemory, permissions.add(try IpAddress.parse("192.0.2.3", 3478)));
+}
+
+test "TurnClient.createPermission: queues a create_permission request for the peer address" {
+    var r = std.Random.DefaultPrng.init(std.testing.random_seed);
+    var c = testClient(r.random());
+
+    var buffer: [1024]u8 = undefined;
 
     const peer = try IpAddress.parse("192.0.2.1", 3478);
     try c.createPermission(peer, 0);
 
-    const out = c.pollTransmit() orelse return error.ExpectedOutput;
-    try std.testing.expectEqual(null, c.pollTransmit());
+    const out = try c.pollTransmit(&buffer) orelse return error.ExpectedOutput;
+    try std.testing.expectEqual(null, try c.pollTransmit(&buffer));
 
     const msg = try stun.Message.parse(out.data);
     try std.testing.expectEqual(.request, msg.header.message_type.class());
@@ -833,14 +865,16 @@ test "createPermission: queues a create_permission request for the peer address"
     try std.testing.expect(attribute.xor_peer_address.eql(&peer));
 }
 
-test "createPermission: success response emits permission_created" {
+test "TurnClient.createPermission: success response emits permission_created" {
     var r = std.Random.DefaultPrng.init(std.testing.random_seed);
     var c = testClient(r.random());
+
+    var buffer: [1024]u8 = undefined;
 
     const peer = try IpAddress.parse("192.0.2.1", 3478);
     try c.createPermission(peer, 0);
 
-    const out = c.pollTransmit() orelse return error.ExpectedOutput;
+    const out = try c.pollTransmit(&buffer) orelse return error.ExpectedOutput;
     const request = try stun.Message.parse(out.data);
 
     var response_buf: [1024]u8 = undefined;
@@ -856,14 +890,16 @@ test "createPermission: success response emits permission_created" {
     try std.testing.expectEqual(null, c.pollEvent());
 }
 
-test "createPermission: unauthorized then a hard failure emits permission_failed" {
+test "TurnClient.createPermission: unauthorized then a hard failure emits permission_failed" {
     var r = std.Random.DefaultPrng.init(std.testing.random_seed);
     var c = testClient(r.random());
+
+    var buffer: [1024]u8 = undefined;
 
     const peer = try IpAddress.parse("192.0.2.1", 3478);
     try c.createPermission(peer, 0);
 
-    var out = c.pollTransmit() orelse return error.ExpectedOutput;
+    var out = try c.pollTransmit(&buffer) orelse return error.ExpectedOutput;
     var request = try stun.Message.parse(out.data);
 
     var response_buf: [1024]u8 = undefined;
@@ -879,7 +915,7 @@ test "createPermission: unauthorized then a hard failure emits permission_failed
     }
     try std.testing.expectEqual(null, c.pollEvent());
 
-    out = c.pollTransmit() orelse return error.ExpectedOutput;
+    out = try c.pollTransmit(&buffer) orelse return error.ExpectedOutput;
     request = try stun.Message.parse(out.data);
 
     {
@@ -899,14 +935,16 @@ test "createPermission: unauthorized then a hard failure emits permission_failed
     }
 }
 
-test "hasAllocation: reflects the allocation lifecycle" {
+test "TurnClient.hasAllocation: reflects the allocation lifecycle" {
     var r = std.Random.DefaultPrng.init(std.testing.random_seed);
     var c = testClient(r.random());
+
+    var buffer: [1024]u8 = undefined;
 
     try std.testing.expect(!c.hasAllocation());
 
     try c.createAllocation(0);
-    const out = c.pollTransmit() orelse return error.ExpectedOutput;
+    const out = try c.pollTransmit(&buffer) orelse return error.ExpectedOutput;
     const request = try stun.Message.parse(out.data);
 
     var response_buf: [1024]u8 = undefined;
@@ -921,12 +959,13 @@ test "hasAllocation: reflects the allocation lifecycle" {
 
     try std.testing.expect(c.hasAllocation());
 
-    var buffer: [1024]u8 = undefined;
-    try c.deleteAllocation(&buffer);
+    try c.deleteAllocation();
     try std.testing.expect(!c.hasAllocation());
 }
 
-test "handleTimeout: exhausting retries emits the failure event for the transaction's method" {
+test "TurnClient.handleTimeout: exhausting retries emits the failure event for the transaction's method" {
+    var buffer: [1024]u8 = undefined;
+
     // allocate: never answered, exhausts retries as allocation_failed.
     {
         var r = std.Random.DefaultPrng.init(std.testing.random_seed);
@@ -953,7 +992,7 @@ test "handleTimeout: exhausting retries emits the failure event for the transact
 
         var now: i64 = 1;
         try c.handleTimeout(now);
-        _ = c.pollTransmit() orelse return error.ExpectedOutput;
+        _ = try c.pollTransmit(&buffer) orelse return error.ExpectedOutput;
 
         for (0..TestTurnClient.max_attempts) |_| {
             now = (c.pollTimeout() orelse return error.ExpectedTimeout) + 1;
@@ -987,4 +1026,97 @@ test "handleTimeout: exhausting retries emits the failure event for the transact
             else => return error.UnexpectedEvent,
         }
     }
+
+    // refresh_permission: drops all permissions.
+    {
+        var r = std.Random.DefaultPrng.init(std.testing.random_seed);
+        var c = testClient(r.random());
+        _ = try c.permissions.add(try IpAddress.parse("192.0.2.1", 3478));
+        c.permission_refresh_deadline = 1;
+
+        var now: i64 = 1;
+        try c.handleTimeout(now);
+        _ = try c.pollTransmit(&buffer) orelse return error.ExpectedOutput;
+
+        for (0..TestTurnClient.max_attempts) |_| {
+            now = (c.pollTimeout() orelse return error.ExpectedTimeout) + 1;
+            try c.handleTimeout(now);
+        }
+
+        const event = c.pollEvent() orelse return error.ExpectedEvent;
+        try std.testing.expectEqual(StunError.Timeout, event.permission_refresh_failed);
+        try std.testing.expectEqual(0, c.permissions.slice().len);
+        try std.testing.expectEqual(null, c.pollTimeout());
+    }
+
+    // A lower slot expiring while a higher slot is pending reports the expired transaction.
+    {
+        var r = std.Random.DefaultPrng.init(std.testing.random_seed);
+        var c = testClient(r.random());
+
+        const peer = try IpAddress.parse("192.0.2.1", 3478);
+        try c.createPermission(peer, 0);
+        try c.createAllocation(0);
+        while (try c.pollTransmit(&buffer)) |_| {}
+
+        c.transactions.items[0].attempt = TestTurnClient.max_attempts - 1;
+        c.transactions.items[1].deadline = 10_000;
+        try c.handleTimeout(TestTurnClient.base_rto);
+
+        const event = c.pollEvent() orelse return error.ExpectedEvent;
+        try std.testing.expect(event.permission_failed.address.eql(&peer));
+        try std.testing.expectEqual(null, c.pollEvent());
+        try std.testing.expectEqual(.allocate, c.transactions.slice()[0].method);
+    }
+}
+
+test "TurnClient.refreshPermission: retries on stale nonce and drops permissions on a hard failure" {
+    var r = std.Random.DefaultPrng.init(std.testing.random_seed);
+    var c = testClient(r.random());
+
+    var buffer: [1024]u8 = undefined;
+    var response_buf: [1024]u8 = undefined;
+
+    const peers = [_]IpAddress{ try IpAddress.parse("192.0.2.1", 3478), try IpAddress.parse("192.0.2.2", 3478) };
+    for (peers) |peer| _ = try c.permissions.add(peer);
+    c.permission_refresh_deadline = 1;
+
+    try c.handleTimeout(1);
+    var out = try c.pollTransmit(&buffer) orelse return error.ExpectedOutput;
+    var request = try stun.Message.parse(out.data);
+    try std.testing.expectEqual(.create_permission, request.header.message_type.method());
+
+    var it = request.iterateAttributes(&.{});
+    for (peers) |peer| {
+        const attribute = try it.next() orelse return error.ExpectedAttribute;
+        try std.testing.expect(attribute.xor_peer_address.eql(&peer));
+    }
+
+    {
+        var w = stun.Writer.init(&response_buf, .{});
+        try writeHeader(&w, .error_response, .create_permission, request.header.transaction_id);
+        try w.writeAttributes(&.{
+            .{ .error_code = .{ .code = .stale_nonce, .reason = "Stale Nonce" } },
+            .{ .realm = "realm" },
+            .{ .nonce = "nonce2" },
+        });
+        try c.handleRead(w.final(), 1);
+    }
+    try std.testing.expectEqual(null, c.pollEvent());
+    try std.testing.expectEqualStrings("nonce2", c.auth_info.getNonce());
+
+    out = try c.pollTransmit(&buffer) orelse return error.ExpectedOutput;
+    request = try stun.Message.parse(out.data);
+
+    {
+        var w = stun.Writer.init(&response_buf, .{});
+        try writeHeader(&w, .error_response, .create_permission, request.header.transaction_id);
+        try w.writeAttribute(.{ .error_code = .{ .code = .forbidden, .reason = "Forbidden" } });
+        try c.handleRead(w.final(), 1);
+    }
+
+    const event = c.pollEvent() orelse return error.ExpectedEvent;
+    try std.testing.expectEqual(error.Forbidden, event.permission_refresh_failed);
+    try std.testing.expectEqual(0, c.permissions.slice().len);
+    try std.testing.expectEqual(null, c.pollTimeout());
 }

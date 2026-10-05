@@ -24,6 +24,11 @@ pub fn BoundedDeque(comptime T: type, comptime capacity: usize) type {
             return value;
         }
 
+        pub fn peekFront(self: *const Self) ?T {
+            if (self.len == 0) return null;
+            return self.buffer[self.head];
+        }
+
         pub fn clear(self: *Self) void {
             self.head = 0;
             self.len = 0;
@@ -31,12 +36,15 @@ pub fn BoundedDeque(comptime T: type, comptime capacity: usize) type {
     };
 }
 
-test "pushBack/popFront: preserves FIFO order" {
+test "pushBack/popFront/peekFront: preserves FIFO order" {
     var deque: BoundedDeque(u32, 4) = .empty;
+    try std.testing.expectEqual(null, deque.peekFront());
+
     try deque.pushBack(1);
     try deque.pushBack(2);
     try deque.pushBack(3);
 
+    try std.testing.expectEqual(@as(?u32, 1), deque.peekFront());
     try std.testing.expectEqual(@as(?u32, 1), deque.popFront());
     try std.testing.expectEqual(@as(?u32, 2), deque.popFront());
     try std.testing.expectEqual(@as(?u32, 3), deque.popFront());
