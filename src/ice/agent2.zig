@@ -71,10 +71,10 @@ const PendingRequest = struct {
 };
 
 const Response = struct {
-    kind: enum { success, role_conflict } = .success,
     tx_id: [12]u8,
-    local: u8,
-    remote: IpAddress,
+    local: u7,
+    remote: u7,
+    kind: enum(u2) { success, role_conflict } = .success,
 };
 
 /// The maximum number of binding requests sent on a pair before it is
@@ -116,7 +116,8 @@ fn calculatePairPriority(l: u32, r: u32, role: ice.Role) u64 {
 
 pub fn Agent(comptime config: struct {
     auth_info_size: u8 = 64,
-    max_candidates: u8 = 16,
+    max_candidates: u7 = 16,
+    max_responses: u8 = 8,
     stun_config: stun.Client.ClientConfig = .{ .max_transactions = 1 },
     turn_config: stun.turn.Config = .{},
 }) type {
@@ -141,9 +142,9 @@ pub fn Agent(comptime config: struct {
 
         // Candidates and sockets
         candidates: [config.max_candidates]Candidate = undefined,
-        candidates_len: u8 = 0,
+        candidates_len: u7 = 0,
         remote_candidates: [config.max_candidates]RemoteCandidate = undefined,
-        remote_candidates_len: u8 = 0,
+        remote_candidates_len: u7 = 0,
         pairs: std.ArrayList(CandidatePair) = .empty,
         pending_requests: std.ArrayList(PendingRequest) = .empty,
         stun_clients: std.ArrayList(StunClient) = .empty,
@@ -162,8 +163,7 @@ pub fn Agent(comptime config: struct {
         keep_alive_deadline: i64,
 
         events_out: stun.BoundedDeque(Event, max_events),
-        response: Response = undefined,
-        response_pending: bool = false,
+        responses: stun.BoundedDeque(Response, config.max_responses) = .empty,
 
         connectivity_check: ConnectivityChecks = .{ .done = true },
         consent_freshness: bool,
@@ -205,7 +205,7 @@ pub fn Agent(comptime config: struct {
         pub fn deinit(agent: *Self) void {
             agent.close();
             agent.events_out.clear();
-            agent.response_pending = false;
+            agent.responses.clear();
         }
 
         pub fn close(agent: *Self) void {
@@ -432,7 +432,7 @@ pub fn Agent(comptime config: struct {
                     msg = stun.Message.parse(new_message.data) catch return .consumed;
                     if (state == .disconnected) try agent.setConnectionState(.completed, now);
                     if (try agent.handleConsentFreshness(&msg, new_message.to, new_message.from)) |resp| {
-                        agent.setResponse(resp);
+                        agent.queueResponse(resp);
                     }
 
                     return .consumed;
@@ -455,17 +455,16 @@ pub fn Agent(comptime config: struct {
         }
 
         pub fn pollTransmit(agent: *Self, buffer: []u8) error{WriteFailed}!?stun.TransportMessage {
-            if (agent.response_pending) {
-                agent.response_pending = false;
-                const resp = &agent.response;
+            if (agent.responses.popFront()) |resp| {
+                const remote = &agent.remote_candidates[resp.remote].address;
                 const password = agent.credentials.getPassword();
                 const payload = switch (resp.kind) {
-                    .success => try Messages.buildSuccessResponse2(resp.tx_id, password, &resp.remote, buffer),
+                    .success => try Messages.buildSuccessResponse2(resp.tx_id, password, remote, buffer),
                     .role_conflict => try Messages.buildRoleConflictErrorMessage(@bitCast(resp.tx_id), password, buffer),
                 };
                 return try agent.maybeWrapInTurnMessage(
                     &agent.candidates[resp.local].base,
-                    &resp.remote,
+                    remote,
                     buffer,
                     payload.len,
                 );
@@ -622,7 +621,7 @@ pub fn Agent(comptime config: struct {
 
             switch (msg.header.message_type.class()) {
                 .request => {
-                    agent.setResponse(try agent.handleRequest(&msg, message.to, message.from));
+                    if (try agent.handleRequest(&msg, message.to, message.from)) |resp| agent.queueResponse(resp);
                     agent.detectNominatedPair();
                 },
                 .success_response => {
@@ -822,7 +821,7 @@ pub fn Agent(comptime config: struct {
             msg: *const stun.Message,
             base_addr: *const IpAddress,
             from: *const IpAddress,
-        ) !Response {
+        ) !?Response {
             const stun_req = Messages.parseAndValidateStunRequest(
                 msg,
                 agent.credentials.toIceCredentials(),
@@ -833,7 +832,7 @@ pub fn Agent(comptime config: struct {
                     .kind = .role_conflict,
                     .tx_id = @bitCast(msg.header.transaction_id),
                     .local = agent.findLocalBase(base_addr) orelse return error.NoLocalCandidate,
-                    .remote = from.*,
+                    .remote = agent.findRemoteCandidate(from) orelse return null,
                 },
                 error.SwitchRole => blk: {
                     agent.toggleRole();
@@ -847,9 +846,11 @@ pub fn Agent(comptime config: struct {
                 else => |e| return e,
             };
 
-            var local_candidate: u8 = undefined;
+            var local_candidate: u7 = undefined;
+            var remote_candidate: u7 = undefined;
             if (agent.findCandidatePair(base_addr, from)) |candidate_pair| {
                 local_candidate = @intCast(candidate_pair.local);
+                remote_candidate = @intCast(candidate_pair.remote);
                 switch (candidate_pair.status) {
                     .succeeded => candidate_pair.nominated |= stun_req.use_candidate,
                     else => candidate_pair.nominate_on_binding |= stun_req.use_candidate,
@@ -858,7 +859,7 @@ pub fn Agent(comptime config: struct {
                 const local_idx = agent.findLocalCandidate(base_addr, base_addr) orelse return error.NoLocalCandidate;
                 local_candidate = @intCast(local_idx);
 
-                const remote_idx: u32 = agent.findRemoteCandidate(from) orelse blk: {
+                const remote_idx: u7 = agent.findRemoteCandidate(from) orelse blk: {
                     const candidate = Candidate{
                         .base = from.*,
                         .address = from.*,
@@ -875,18 +876,19 @@ pub fn Agent(comptime config: struct {
                     .status = .in_progress,
                     .nominate_on_binding = stun_req.use_candidate,
                 });
+                remote_candidate = remote_idx;
             }
 
             return .{
                 .tx_id = @bitCast(msg.header.transaction_id),
                 .local = local_candidate,
-                .remote = from.*,
+                .remote = remote_candidate,
             };
         }
 
-        fn setResponse(agent: *Self, resp: Response) void {
-            agent.response = resp;
-            agent.response_pending = true;
+        fn queueResponse(agent: *Self, resp: Response) void {
+            // Drop on overflow, the peer will retransmit.
+            agent.responses.pushBack(resp) catch {};
         }
 
         fn maybeWrapInTurnMessage(
@@ -969,7 +971,7 @@ pub fn Agent(comptime config: struct {
                     return .{
                         .tx_id = @bitCast(msg.header.transaction_id),
                         .local = agent.findLocalBase(to) orelse return null,
-                        .remote = from.*,
+                        .remote = agent.findRemoteCandidate(from) orelse return null,
                     };
                 },
                 else => {},
@@ -1035,12 +1037,12 @@ pub fn Agent(comptime config: struct {
             return null;
         }
 
-        fn findLocalBase(core: *Self, base: *const IpAddress) ?u8 {
+        fn findLocalBase(core: *Self, base: *const IpAddress) ?u7 {
             for (core.candidates[0..core.candidates_len], 0..) |candidate, idx| if (candidate.base.eql(base)) return @intCast(idx);
             return null;
         }
 
-        fn findRemoteCandidate(core: *Self, addr: *const IpAddress) ?u32 {
+        fn findRemoteCandidate(core: *Self, addr: *const IpAddress) ?u7 {
             for (core.remote_candidates[0..core.remote_candidates_len], 0..) |candidate, idx| if (candidate.address.eql(addr)) return @intCast(idx);
             return null;
         }
@@ -1190,7 +1192,7 @@ fn expectConnectionStateEvent(core: *TestAgent, state: ice.ConnectionState) !voi
 }
 
 fn testRespond(core: *TestAgent, msg: *const stun.Message, base: *const IpAddress, from: *const IpAddress, buffer: []u8) !stun.TransportMessage {
-    core.setResponse(try core.handleRequest(msg, base, from));
+    core.queueResponse((try core.handleRequest(msg, base, from)) orelse return error.ExpectedResponse);
     return (try core.pollTransmit(buffer)) orelse error.ExpectedTransmit;
 }
 
@@ -1318,6 +1320,10 @@ test "handleRequest: role conflict" {
             .username = core.credentials.getUsername(),
         }, core.credentials.getPassword(), &buffer);
 
+        // Unknown sender: no response.
+        try testing.expectEqual(null, try core.handleRequest(&msg, &base_addr, &from));
+
+        try core.addRemoteCandidate(.initHost(from), 0);
         const resp = try testRespond(&core, &msg, &base_addr, &from, &resp_buffer);
         const resp_msg = try stun.Message.parse(resp.data);
 

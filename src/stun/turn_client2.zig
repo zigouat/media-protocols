@@ -6,7 +6,7 @@ const IpAddress = std.Io.net.IpAddress;
 
 pub const AllocError = std.mem.Allocator.Error;
 
-pub const AllocationError = AllocError || error{AllocationAlreadyExists};
+pub const CreateAllocationError = AllocError || error{AllocationAlreadyExists};
 
 pub const StunError = error{
     BadRequest,
@@ -257,7 +257,7 @@ pub fn TurnClient(comptime config: Config) type {
             };
         }
 
-        pub fn createAllocation(c: *Self, now: i64) AllocationError!void {
+        pub fn createAllocation(c: *Self, now: i64) CreateAllocationError!void {
             if (c.allocation_refresh_deadline != 0) return error.AllocationAlreadyExists;
             try c.newAllocateRequest(now, false);
         }
@@ -320,8 +320,8 @@ pub fn TurnClient(comptime config: Config) type {
             }
         }
 
-        pub fn handleRead(c: *Self, buffer: []const u8, now: i64) !void {
-            const msg = try stun.Message.parse(buffer);
+        pub fn handleRead(c: *Self, buffer: []const u8, now: i64) AllocError!void {
+            const msg = stun.Message.parse(buffer) catch return;
             const idx = c.transactions.find(msg.header.transaction_id) orelse return;
             const tr = c.transactions.items[idx];
             c.transactions.remove(idx);
@@ -411,11 +411,12 @@ pub fn TurnClient(comptime config: Config) type {
                         try c.events_out.pushBack(.{ .allocation_failed = StunError.Unauthorized });
                         return;
                     }
-                    try c.applyChallenge(msg);
+                    c.applyChallenge(msg) catch return;
                     try c.newAllocateRequest(now, true);
                 },
                 .success_response => {
-                    const result = try c.parseAllocation(msg);
+                    // Ignore malformed responses.
+                    const result = c.parseAllocation(msg) catch return;
                     try c.events_out.pushBack(result);
                     if (result == .allocated) {
                         c.allocation_lifetime = result.allocated.lifetime;
