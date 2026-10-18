@@ -80,15 +80,20 @@ const Response = struct {
 /// The maximum number of binding requests sent on a pair before it is
 /// considered failed.
 pub const max_binding_requests: usize = 7;
-pub const connectivity_check_interval: i64 = 200;
 pub const keep_alive_interval: i64 = 4 * std.time.ms_per_s;
 
 pub const Config = struct {
+    /// The role of the agent.
     role: ice.Role,
     credentials: ice.Credentials,
+    /// A random number generator implementation used for generating transaction IDs and tie breakers.
     random: std.Random,
-    failed_timeout: u32 = 25000,
-    disconnected_timeout: u32 = 5000,
+    /// The time in milliseconds after which a connection is considered failed if no data is received or no connection is established.
+    failed_timeout: u32 = 25 * std.time.ms_per_s,
+    /// The time in milliseconds after which a connection is considered disconnected if no data is received.
+    disconnected_timeout: u32 = 5 * std.time.ms_per_s,
+    /// The interval between connectivity checks in milliseconds. This is the time between sending binding requests on all pairs.
+    connectivity_check_interval: u16 = 200,
 };
 
 /// Compare addresses by IP only, ignoring port.
@@ -121,6 +126,12 @@ pub fn Agent(comptime config: struct {
     stun_config: stun.Client.ClientConfig = .{ .max_transactions = 1 },
     turn_config: stun.turn.Config = .{},
 }) type {
+    const Timers = struct {
+        failed_timeout: u32,
+        disconnected_timeout: u32,
+        connectivity_check_interval: u16,
+    };
+
     return struct {
         const Self = @This();
         const StunClient = stun.Client.Client(config.stun_config);
@@ -155,8 +166,7 @@ pub fn Agent(comptime config: struct {
         // This the final pair selected by this agent or the remote one.
         nominated_pair: ?NominatedPair = null,
 
-        failed_timeout: u32,
-        disconnected_timeout: u32,
+        timers: Timers,
 
         connectivity_check_deadline: i64,
         disconnected_connection_deadline: i64, // used for both disconnected and failed states
@@ -165,16 +175,21 @@ pub fn Agent(comptime config: struct {
         events_out: stun.BoundedDeque(Event, max_events),
         responses: stun.BoundedDeque(Response, config.max_responses) = .empty,
 
-        connectivity_check: ConnectivityChecks = .{ .done = true },
+        connectivity_check: ConnectivityChecks = .init_done,
         consent_freshness: bool,
 
         const ConnectivityChecks = struct {
-            index: u16 = 0,
-            nomination_done: bool = false,
-            done: bool = false,
+            index: u16,
+            nomination_done: bool,
+            done: bool,
+
+            const init = ConnectivityChecks{ .index = 0, .nomination_done = false, .done = false };
+            const init_done = ConnectivityChecks{ .index = 0, .nomination_done = false, .done = true };
         };
 
         pub fn init(allocator: std.mem.Allocator, agent_config: Config) error{ OutOfMemory, CredentialsTooLong }!Self {
+            std.debug.assert(agent_config.connectivity_check_interval > 0);
+
             var pairs: std.ArrayList(CandidatePair) = try .initCapacity(allocator, initial_pairs_capacity);
             errdefer pairs.deinit(allocator);
 
@@ -193,12 +208,15 @@ pub fn Agent(comptime config: struct {
                 .connectivity_check_deadline = std.math.maxInt(i64),
                 .keep_alive_deadline = std.math.maxInt(i64),
                 .disconnected_connection_deadline = std.math.maxInt(i64),
-                .failed_timeout = agent_config.failed_timeout,
-                .disconnected_timeout = agent_config.disconnected_timeout,
                 .events_out = .empty,
                 .pairs = pairs,
                 .pending_requests = pending_requests,
                 .consent_freshness = false,
+                .timers = .{
+                    .failed_timeout = agent_config.failed_timeout,
+                    .disconnected_timeout = agent_config.disconnected_timeout,
+                    .connectivity_check_interval = agent_config.connectivity_check_interval,
+                },
             };
         }
 
@@ -327,6 +345,8 @@ pub fn Agent(comptime config: struct {
                     }
                 }
             }
+
+            core.resumeConnectivityChecks();
         }
 
         /// Returns `false` if an identical candidate already exists.
@@ -352,6 +372,7 @@ pub fn Agent(comptime config: struct {
                 });
             }
 
+            core.resumeConnectivityChecks();
             return idx;
         }
 
@@ -373,11 +394,10 @@ pub fn Agent(comptime config: struct {
             }
 
             if (now >= agent.connectivity_check_deadline) {
-                agent.connectivity_check_deadline = now + connectivity_check_interval;
-                if (agent.nominated_pair == null) agent.connectivity_check = .{};
+                agent.connectivity_check_deadline = now + agent.timers.connectivity_check_interval;
+                if (agent.nominated_pair == null) agent.connectivity_check = .init;
                 if (agent.role == .controlling and agent.nominated_pair == null and agent.selected_pair == null) {
                     agent.selected_pair = agent.selectBestPair();
-                    agent.connectivity_check = .{};
                 }
             }
 
@@ -428,7 +448,7 @@ pub fn Agent(comptime config: struct {
 
             switch (agent.connection_state) {
                 .completed, .disconnected, .failed => |state| {
-                    agent.disconnected_connection_deadline = now + agent.disconnected_timeout;
+                    agent.disconnected_connection_deadline = now + agent.timers.disconnected_timeout;
                     msg = stun.Message.parse(new_message.data) catch return .consumed;
                     if (state == .disconnected) try agent.setConnectionState(.completed, now);
                     if (try agent.handleConsentFreshness(&msg, new_message.to, new_message.from)) |resp| {
@@ -581,17 +601,18 @@ pub fn Agent(comptime config: struct {
             agent.connection_state = state;
             switch (agent.connection_state) {
                 .checking => {
-                    agent.connectivity_check_deadline = now + connectivity_check_interval;
-                    agent.disconnected_connection_deadline = now + agent.failed_timeout;
+                    agent.connectivity_check = .init; // start connectivity checks immediately
+                    agent.connectivity_check_deadline = now + agent.timers.connectivity_check_interval;
+                    agent.disconnected_connection_deadline = now + agent.timers.failed_timeout;
                 },
                 .connected => {
                     agent.keep_alive_deadline = now + keep_alive_interval;
-                    agent.disconnected_connection_deadline = now + agent.disconnected_timeout;
+                    agent.disconnected_connection_deadline = now + agent.timers.disconnected_timeout;
                 },
                 .completed => {
                     agent.connectivity_check_deadline = std.math.maxInt(i64);
-                    agent.connectivity_check = .{ .done = true };
-                    agent.disconnected_connection_deadline = now + agent.disconnected_timeout;
+                    agent.connectivity_check = .init_done;
+                    agent.disconnected_connection_deadline = now + agent.timers.disconnected_timeout;
                     agent.pairs.clearAndFree(agent.allocator);
                     agent.pending_requests.clearAndFree(agent.allocator);
                     agent.stun_clients.clearAndFree(agent.allocator);
@@ -603,7 +624,7 @@ pub fn Agent(comptime config: struct {
                         agent.turn_clients.items[0] = client;
                     } else agent.turn_clients.clearAndFree(agent.allocator);
                 },
-                .disconnected => agent.disconnected_connection_deadline = now + agent.failed_timeout,
+                .disconnected => agent.disconnected_connection_deadline = now + agent.timers.failed_timeout,
                 .failed => {
                     agent.connectivity_check_deadline = std.math.maxInt(i64);
                     agent.disconnected_connection_deadline = std.math.maxInt(i64);
@@ -726,6 +747,11 @@ pub fn Agent(comptime config: struct {
                 agent.gathering_state = .complete;
                 try agent.events_out.pushBack(.{ .gathering_state = agent.gathering_state });
             }
+        }
+
+        /// Check pairs added after the current round finished without waiting for the next interval.
+        fn resumeConnectivityChecks(agent: *Self) void {
+            if (agent.connection_state == .checking and agent.nominated_pair == null) agent.connectivity_check.done = false;
         }
 
         fn nextConnectivityCheck(agent: *Self, buffer: []u8) !?stun.TransportMessage {
@@ -1789,14 +1815,15 @@ test "handleInput: success response nominates the pair and transitions to connec
     try testing.expect(core.nominated_pair != null);
 
     try testing.expectEqual(@as(i64, keep_alive_interval), core.keep_alive_deadline);
-    try testing.expectEqual(@as(i64, core.disconnected_timeout), core.disconnected_connection_deadline);
+    try testing.expectEqual(@as(i64, core.timers.disconnected_timeout), core.disconnected_connection_deadline);
 }
 
 test "handleTimeout: new connection starts checking and schedules a connectivity check" {
     var core = try testNewAgent(.controlled);
     defer core.deinit();
 
-    const failed_timeout: i64 = core.failed_timeout;
+    const failed_timeout: i64 = core.timers.failed_timeout;
+    const connectivity_check_interval: i64 = core.timers.connectivity_check_interval;
     try core.setRemoteCredentials(.{ .username = "peer", .password = "peer-password-0123456789" }, 0);
 
     try testing.expectEqual(connectivity_check_interval, core.connectivity_check_deadline);
@@ -1814,6 +1841,7 @@ test "handleTimeout: checking sends a connectivity_check every interval" {
     var core = try testNewAgent(.controlled);
     defer core.deinit();
 
+    const connectivity_check_interval: i64 = core.timers.connectivity_check_interval;
     try core.setRemoteCredentials(.{ .username = "peer", .password = "peer-password-0123456789" }, 0);
     _ = core.pollEvent(); // .checking
 
@@ -1826,25 +1854,51 @@ test "handleTimeout: checking sends a connectivity_check every interval" {
     try testing.expectEqual(null, core.pollEvent());
 }
 
-test "handleTimeout: checking fails after failed_timeout without connecting" {
+test "setRemoteCredentials: connectivity checks start immediately and cover pairs added later" {
+    var tx_buf: [1024]u8 = undefined;
     var core = try testNewAgent(.controlled);
     defer core.deinit();
 
-    const failed_timeout: i64 = core.failed_timeout;
+    const local = try IpAddress.parse("192.168.1.100", 1000);
+    const remote1 = try IpAddress.parse("192.168.1.120", 2000);
+    const remote2 = try IpAddress.parse("192.168.1.121", 2001);
+
+    try core.addLocalAddrs(&.{local}, 0);
+    try core.addRemoteCandidate(.initHost(remote1), 0);
     try core.setRemoteCredentials(.{ .username = "peer", .password = "peer-password-0123456789" }, 0);
-    _ = core.pollEvent(); // .checking
 
-    try core.handleTimeout(failed_timeout);
+    const tm1 = (try core.pollTransmit(&tx_buf)) orelse return error.ExpectedTransmit;
+    try testing.expectEqual(.request, (try stun.Message.parse(tm1.data)).header.message_type.class());
+    try testing.expect(tm1.from.eql(&local));
+    try testing.expect(tm1.to.eql(&remote1));
+    try testing.expectEqual(null, try core.pollTransmit(&tx_buf));
 
-    try testing.expectEqual(.failed, core.connection_state);
-    try testing.expectEqual(std.math.maxInt(i64), core.disconnected_connection_deadline);
+    // Trickled candidate: only the new pair is checked.
+    try core.addRemoteCandidate(.initHost(remote2), 50);
+    const tm2 = (try core.pollTransmit(&tx_buf)) orelse return error.ExpectedTransmit;
+    try testing.expect(tm2.to.eql(&remote2));
+    try testing.expectEqual(null, try core.pollTransmit(&tx_buf));
+}
 
-    try testing.expect(!core.connectivity_check.done);
-    try expectConnectionStateEvent(&core, .failed);
-    try testing.expectEqual(null, core.pollEvent());
+test "handleTimeout: checking fails after failed_timeout without connecting" {
+    var agent = try testNewAgent(.controlled);
+    defer agent.deinit();
 
-    try core.handleTimeout(failed_timeout + 1000);
-    try testing.expectEqual(null, core.pollEvent());
+    const failed_timeout: i64 = agent.timers.failed_timeout;
+    try agent.setRemoteCredentials(.{ .username = "peer", .password = "peer-password-0123456789" }, 0);
+    _ = agent.pollEvent(); // .checking
+
+    try agent.handleTimeout(failed_timeout);
+
+    try testing.expectEqual(.failed, agent.connection_state);
+    try testing.expectEqual(std.math.maxInt(i64), agent.disconnected_connection_deadline);
+
+    try testing.expect(!agent.connectivity_check.done);
+    try expectConnectionStateEvent(&agent, .failed);
+    try testing.expectEqual(null, agent.pollEvent());
+
+    try agent.handleTimeout(failed_timeout + 1000);
+    try testing.expectEqual(null, agent.pollEvent());
 }
 
 test "handleTimeout: connected transitions to completed once keep_alive_deadline elapses and clears the checklist" {
@@ -1930,7 +1984,7 @@ test "handleTimeout: connected becomes disconnected after disconnected_timeout o
     core.keep_alive_deadline = 100_000;
     core.disconnected_connection_deadline = 1000;
 
-    const failed_timeout: i64 = core.failed_timeout;
+    const failed_timeout: i64 = core.timers.failed_timeout;
     try core.handleTimeout(1000);
 
     try testing.expectEqual(.disconnected, core.connection_state);
