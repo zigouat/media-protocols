@@ -8,6 +8,7 @@ const default_replay_detection_window = 64;
 
 pub const EncryptError = std.mem.Allocator.Error || rtp.Packet.ParseError;
 pub const DecryptError = std.mem.Allocator.Error || rtp.Packet.ParseError || ReplayDetector.Error || error{AuthenticationFailed};
+pub const RtcpDecryptError = error{ AuthenticationFailed, InvalidRtcp } || ReplayDetector.Error || std.mem.Allocator.Error;
 
 /// An enum describing the list of supported SRTP profiles.
 pub const Profile = enum {
@@ -194,7 +195,7 @@ pub const Session = struct {
     }
 
     /// Decrypts an RTCP packet using the SRTP session's cipher.
-    pub fn decryptRtcp(session: *Session, allocator: std.mem.Allocator, rtcp_data: []const u8, dst: []u8) ![]const u8 {
+    pub fn decryptRtcp(session: *Session, allocator: std.mem.Allocator, rtcp_data: []const u8, dst: []u8) RtcpDecryptError![]const u8 {
         return try session.processRtcp(allocator, rtcp_data, dst, false);
     }
 
