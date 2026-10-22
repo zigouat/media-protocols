@@ -1,5 +1,7 @@
 const CandidatePair = @This();
 
+pub const CandidateIndex = u7;
+
 /// Enum describing the status of a candidate pair in the ICE process.
 pub const Status = enum(u2) {
     /// The candidate pair is waiting to be checked.
@@ -12,8 +14,8 @@ pub const Status = enum(u2) {
     succeeded,
 };
 
-local: u8,
-remote: u8,
+local: CandidateIndex,
+remote: CandidateIndex,
 /// The priority of the candidate pair, calculated based on the priority of the local and remote candidates.
 priority: u64,
 status: Status = .waiting,

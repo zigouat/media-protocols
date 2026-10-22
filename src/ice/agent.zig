@@ -2,21 +2,16 @@
 //!
 //! The implementation is based on RFC 8445.
 
-//! This module implements an ICE (Interactive Connectivity Establishment) agent that can be used to establish a peer-to-peer connection.
-//!
-//! The implementation is based on RFC 8445.
-
 const std = @import("std");
 const stun = @import("stun");
 const ice = @import("ice.zig");
-const CandidateIndex = CandidatePair.CandidateIndex;
 const CandidatePair = @import("candidate_pair.zig");
 const Messages = @import("messages.zig");
 
 const Candidate = ice.Candidate;
 const CandidateIndex = CandidatePair.CandidateIndex;
-    local: CandidateIndex,
-    remote: CandidateIndex,
+const IpAddress = std.Io.net.IpAddress;
+const Logger = std.log.scoped(.ice);
 const AllocError = std.mem.Allocator.Error;
 
 pub const NominatedPair = struct {
@@ -62,12 +57,12 @@ fn LocalCredentials(comptime size: u8) type {
         }
     };
 }
-    candidate: struct { CandidateIndex, CandidateIndex }, // range inclusive
+
 pub const Event = union(enum) {
     connection_state: ice.ConnectionState,
     gathering_state: ice.GatheringState,
     nominated: NominatedPair,
-    candidate: struct { u8, u8 }, // range inclusive
+    candidate: struct { CandidateIndex, CandidateIndex }, // range inclusive
 };
 
 pub const ReadResult = union(enum) {
@@ -77,14 +72,14 @@ pub const ReadResult = union(enum) {
 
 const PendingRequest = struct {
     transaction_id: [12]u8,
+    pair: u16,
+};
+
+const Response = struct {
+    tx_id: [12]u8,
     local: CandidateIndex,
     remote: CandidateIndex,
     kind:enum(u2) { success, role_conflict } = .success,
-const Response = struct {
-    tx_id: [12]u8,
-    local: u7,
-    remote: u7,
-    kind: enum(u2) { success, role_conflict } = .success,
 };
 
 /// The maximum number of binding requests sent on a pair before it is
@@ -126,12 +121,12 @@ fn calculatePairPriority(l: u32, r: u32, role: ice.Role) u64 {
     if (role == .controlled) g, d = .{ d, g };
 
     const last_part: u8 = if (g > d) 1 else 0;
-    max_candidates: CandidateIndex = 16,
+    return (@as(u64, 1) << 32) * @min(g, d) + 2 * @max(g, d) + last_part;
 }
 
 pub fn Agent(comptime config: struct {
     auth_info_size: u8 = 64,
-    max_candidates: u7 = 16,
+    max_candidates: CandidateIndex = 16,
     max_responses: u8 = 16,
     stun_config: stun.Client.ClientConfig = .{ .max_transactions = 1 },
     turn_config: stun.turn.Config = .{},
@@ -158,14 +153,14 @@ pub fn Agent(comptime config: struct {
         remote_credentials: ?LocalCredentials(config.auth_info_size),
         connection_state: ice.ConnectionState,
         gathering_state: ice.GatheringState,
-        candidates_len: CandidateIndex = 0,
+        role: ice.Role,
         tie_breaker: u64,
-        remote_candidates_len: CandidateIndex = 0,
+
         // Candidates and sockets
         candidates: [config.max_candidates]Candidate = undefined,
-        candidates_len: u7 = 0,
+        candidates_len: CandidateIndex = 0,
         remote_candidates: [config.max_candidates]RemoteCandidate = undefined,
-        remote_candidates_len: u7 = 0,
+        remote_candidates_len: CandidateIndex = 0,
         pairs: std.ArrayList(CandidatePair) = .empty,
         pending_requests: std.ArrayList(PendingRequest) = .empty,
         stun_clients: std.ArrayList(StunClient) = .empty,
@@ -259,18 +254,18 @@ pub fn Agent(comptime config: struct {
             return if (core.nominated_pair) |nominated| core.remote_candidates[nominated.remote].address else null;
         }
 
-            var min_index: ?CandidateIndex = null;
-            var max_index: ?CandidateIndex = null;
+        /// Add local addresses to the agent. This should be called after `addStunServer`.
+        pub fn addLocalAddrs(agent: *Self, addrs: []const IpAddress, now: i64) AllocError!void {
             agent.gathering_state = .gathering;
             try agent.events_out.pushBack(.{ .gathering_state = agent.gathering_state });
 
-                    if (min_index == null) min_index = idx;
-                    max_index = idx;
+            var min_index: ?CandidateIndex = null;
+            var max_index: ?CandidateIndex = null;
             for (addrs) |addr| {
                 const candidate = Candidate.initHost(addr);
                 if (try agent.addLocalCandidate(candidate)) |idx| {
-                    if (min_index == null) min_index = @intCast(idx);
-                    max_index = @intCast(idx);
+                    if (min_index == null) min_index = idx;
+                    max_index = idx;
                 }
             }
 
@@ -316,12 +311,12 @@ pub fn Agent(comptime config: struct {
             });
         }
 
-        pub fn addServerReflexiveCandidate(core: *Self, base: IpAddress, mapped: IpAddress) AllocError!?CandidateIndex {
+        pub fn setRemoteCredentials(agent: *Self, credentials: ice.Credentials, now: i64) (AllocError || error{CredentialsTooLong})!void {
             agent.remote_credentials = try .init(credentials.username, credentials.password);
             try agent.setConnectionState(.checking, now);
         }
 
-        pub fn addServerReflexiveCandidate(core: *Self, base: IpAddress, mapped: IpAddress) AllocError!?usize {
+        pub fn addServerReflexiveCandidate(core: *Self, base: IpAddress, mapped: IpAddress) AllocError!?CandidateIndex {
             for (core.candidates[0..core.candidates_len]) |candidate|
                 if (candidate.candidate_type == .host and ipEql(&candidate.base, &mapped)) return null;
 
@@ -338,12 +333,12 @@ pub fn Agent(comptime config: struct {
                     const local = core.getPairLocal(pair);
                     const remote = core.getPairRemote(pair);
                     if (local.base.eql(&candidate.base) and remote.address.eql(&remote_candidate.address))
-                    .remote = remote_idx,
+                        continue :outer_loop;
                 }
 
                 try core.pairs.append(core.allocator, .{
                     .local = @intCast(local_idx),
-                    .remote = @intCast(remote_idx),
+                    .remote = remote_idx,
                     .priority = calculatePairPriority(candidate.priority, remote_candidate.priority, core.role),
                 });
 
@@ -355,12 +350,12 @@ pub fn Agent(comptime config: struct {
                     }
                 }
             }
-        pub fn addLocalCandidate(core: *Self, candidate: Candidate) AllocError!?CandidateIndex {
+
             core.resumeConnectivityChecks();
         }
 
         /// Returns `false` if an identical candidate already exists.
-        pub fn addLocalCandidate(core: *Self, candidate: Candidate) AllocError!?usize {
+        pub fn addLocalCandidate(core: *Self, candidate: Candidate) AllocError!?CandidateIndex {
             for (core.candidates[0..core.candidates_len]) |*existing| if (existing.eql(&candidate)) return null;
 
             const idx = try core.appendCandidate(candidate);
@@ -371,12 +366,12 @@ pub fn Agent(comptime config: struct {
                 for (core.pairs.items) |*pair| {
                     const local = core.getPairLocal(pair);
                     const remote = core.getPairRemote(pair);
-                    .local = idx,
+                    if (local.base.eql(&candidate.base) and remote.address.eql(&remote_candidate.address))
                         continue :outer_loop;
                 }
 
                 try core.pairs.append(core.allocator, .{
-                    .local = @intCast(idx),
+                    .local = idx,
                     .remote = @intCast(remote_idx),
                     .priority = calculatePairPriority(candidate.priority, remote_candidate.priority, core.role),
                 });
@@ -544,12 +539,12 @@ pub fn Agent(comptime config: struct {
             }) |d| deadline = @min(deadline, d);
 
             return if (deadline == std.math.maxInt(i64)) null else deadline;
-                core.nominated_pair = .{ .local = pair.local, .remote = pair.remote };
+        }
 
         pub fn detectNominatedPair(core: *Self) void {
             if (core.role == .controlling or core.nominated_pair != null) return;
             for (core.pairs.items) |pair| if (pair.nominated) {
-                core.nominated_pair = .{ .local = @intCast(pair.local), .remote = @intCast(pair.remote) };
+                core.nominated_pair = .{ .local = pair.local, .remote = pair.remote };
                 return;
             };
         }
@@ -586,20 +581,20 @@ pub fn Agent(comptime config: struct {
 
             for (agent.pairs.items) |*pair| {
                 const local = agent.getPairLocal(pair);
-        fn appendCandidate(core: *Self, candidate: Candidate) error{OutOfMemory}!CandidateIndex {
+                const remote = agent.getPairRemote(pair);
                 pair.priority = calculatePairPriority(local.priority, remote.priority, agent.role);
             }
         }
 
-        fn appendCandidate(core: *Self, candidate: Candidate) error{OutOfMemory}!usize {
+        fn appendCandidate(core: *Self, candidate: Candidate) error{OutOfMemory}!CandidateIndex {
             if (core.candidates_len >= config.max_candidates) return error.OutOfMemory;
             const idx = core.candidates_len;
-        fn appendRemoteCandidate(core: *Self, candidate: Candidate) AllocError!CandidateIndex {
+            core.candidates[idx] = candidate;
             core.candidates_len += 1;
             return idx;
         }
 
-        fn appendRemoteCandidate(core: *Self, candidate: Candidate) AllocError!usize {
+        fn appendRemoteCandidate(core: *Self, candidate: Candidate) AllocError!CandidateIndex {
             if (core.remote_candidates_len >= config.max_candidates) return error.OutOfMemory;
             const idx = core.remote_candidates_len;
             core.remote_candidates[idx] = .{ .address = candidate.address, .candidate_type = candidate.candidate_type, .priority = candidate.priority };
@@ -675,12 +670,12 @@ pub fn Agent(comptime config: struct {
             // There's only one event
             const event = stun_client.pollEvent() orelse return false;
             switch (event) {
-                    )) |index| try agent.events_out.pushBack(.{ .candidate = .{ index, index } });
+                .mapped_address => {
                     const mapped_address = event.mapped_address;
                     if (try agent.addServerReflexiveCandidate(
                         stun_client.local_addr,
                         mapped_address,
-                    )) |index| try agent.events_out.pushBack(.{ .candidate = .{ @intCast(index), @intCast(index) } });
+                    )) |index| try agent.events_out.pushBack(.{ .candidate = .{ index, index } });
 
                     _ = agent.stun_clients.swapRemove(idx);
                 },
@@ -702,12 +697,12 @@ pub fn Agent(comptime config: struct {
                     const relayed_address = allocation.relayed_address;
                     const index = try agent.addLocalCandidate(.initRelay(
                         turn_client.local_addr,
-                    try agent.events_out.pushBack(.{ .candidate = .{ index, index } });
+                        relayed_address,
                     )) orelse {
                         delete_entry = true;
                         break;
                     };
-                    try agent.events_out.pushBack(.{ .candidate = .{ @intCast(index), @intCast(index) } });
+                    try agent.events_out.pushBack(.{ .candidate = .{ index, index } });
 
                     for (agent.pairs.items) |*pair| {
                         if (pair.local != index) continue;
@@ -877,32 +872,32 @@ pub fn Agent(comptime config: struct {
                         agent.credentials.toIceCredentials(),
                         agent.role,
                         agent.tie_breaker,
+                    );
+                },
+                else => |e| return e,
+            };
+
             var local_candidate: CandidateIndex = undefined;
             var remote_candidate: CandidateIndex = undefined;
-                else => |e| return e,
+            if (agent.findCandidatePair(base_addr, from)) |candidate_pair| {
                 local_candidate = candidate_pair.local;
                 remote_candidate = candidate_pair.remote;
-            var local_candidate: u7 = undefined;
-            var remote_candidate: u7 = undefined;
-            if (agent.findCandidatePair(base_addr, from)) |candidate_pair| {
-                local_candidate = @intCast(candidate_pair.local);
-                remote_candidate = @intCast(candidate_pair.remote);
                 switch (candidate_pair.status) {
-                local_candidate = local_idx;
+                    .succeeded => candidate_pair.nominated |= stun_req.use_candidate,
                     else => candidate_pair.nominate_on_binding |= stun_req.use_candidate,
-                const remote_idx = agent.findRemoteCandidate(from) orelse blk: {
+                }
             } else {
                 const local_idx = agent.findLocalCandidate(base_addr, base_addr) orelse return error.NoLocalCandidate;
-                local_candidate = @intCast(local_idx);
+                local_candidate = local_idx;
 
-                const remote_idx: u7 = agent.findRemoteCandidate(from) orelse blk: {
+                const remote_idx = agent.findRemoteCandidate(from) orelse blk: {
                     const candidate = Candidate{
-                    break :blk try agent.appendRemoteCandidate(candidate);
+                        .base = from.*,
                         .address = from.*,
                         .candidate_type = .prflx,
                         .priority = stun_req.priority,
                     };
-                    break :blk @intCast(try agent.appendRemoteCandidate(candidate));
+                    break :blk try agent.appendRemoteCandidate(candidate);
                 };
 
                 try agent.pairs.append(agent.allocator, .{
@@ -973,14 +968,14 @@ pub fn Agent(comptime config: struct {
 
                 if (mapped_address.eql(base_addr)) {
                     candidate_pair.status = .succeeded;
-                const local_idx = core.findLocalCandidate(base_addr, &mapped_address) orelse blk: {
+                    core.maybeSetNominatedField(candidate_pair);
                     return;
-                    break :blk try core.appendCandidate(prflx_candidate);
+                }
                 candidate_pair.status = .failed;
 
-                const local_idx: u8 = core.findLocalCandidate(base_addr, &mapped_address) orelse blk: {
+                const local_idx = core.findLocalCandidate(base_addr, &mapped_address) orelse blk: {
                     const prflx_candidate: Candidate = .initPeerReflexive(base_addr.*, mapped_address);
-                    break :blk @intCast(try core.appendCandidate(prflx_candidate));
+                    break :blk try core.appendCandidate(prflx_candidate);
                 };
                 const local_candidate = core.candidates[local_idx];
                 const remote_candidate = core.getPairRemote(candidate_pair);
@@ -1054,31 +1049,31 @@ pub fn Agent(comptime config: struct {
         }
 
         fn maybeSetNominatedField(agent: *Self, candidate_pair: *CandidatePair) void {
-                    agent.nominated_pair = .{ .local = candidate_pair.local, .remote = candidate_pair.remote };
+            if (candidate_pair.nominate_on_binding) {
                 candidate_pair.nominate_on_binding = false;
                 candidate_pair.nominated = true;
             } else if (agent.selected_pair) |selected_idx| {
                 if (agent.pairsEql(&agent.pairs.items[selected_idx], candidate_pair)) {
-                    agent.nominated_pair = .{ .local = @intCast(candidate_pair.local), .remote = @intCast(candidate_pair.remote) };
+                    agent.nominated_pair = .{ .local = candidate_pair.local, .remote = candidate_pair.remote };
                     candidate_pair.nominated = true;
-        fn findLocalCandidate(core: *Self, base: *const IpAddress, addr: *const IpAddress) ?CandidateIndex {
+                    agent.selected_pair = null;
                 }
             }
         }
 
-        fn findLocalCandidate(core: *Self, base: *const IpAddress, addr: *const IpAddress) ?u8 {
+        fn findLocalCandidate(core: *Self, base: *const IpAddress, addr: *const IpAddress) ?CandidateIndex {
             for (core.candidates[0..core.candidates_len], 0..) |candidate, idx| {
-        fn findLocalBase(core: *Self, base: *const IpAddress) ?CandidateIndex {
+                if (candidate.base.eql(base) and candidate.address.eql(addr)) return @intCast(idx);
             }
             return null;
         }
 
-        fn findRemoteCandidate(core: *Self, addr: *const IpAddress) ?CandidateIndex {
+        fn findLocalBase(core: *Self, base: *const IpAddress) ?CandidateIndex {
             for (core.candidates[0..core.candidates_len], 0..) |candidate, idx| if (candidate.base.eql(base)) return @intCast(idx);
             return null;
         }
 
-        fn findRemoteCandidate(core: *Self, addr: *const IpAddress) ?u7 {
+        fn findRemoteCandidate(core: *Self, addr: *const IpAddress) ?CandidateIndex {
             for (core.remote_candidates[0..core.remote_candidates_len], 0..) |candidate, idx| if (candidate.address.eql(addr)) return @intCast(idx);
             return null;
         }
