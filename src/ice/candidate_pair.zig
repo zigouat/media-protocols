@@ -12,8 +12,8 @@ pub const Status = enum(u2) {
     succeeded,
 };
 
-local: u32,
-remote: u32,
+local: u8,
+remote: u8,
 /// The priority of the candidate pair, calculated based on the priority of the local and remote candidates.
 priority: u64,
 status: Status = .waiting,
