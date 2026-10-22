@@ -1,5 +1,4 @@
-pub const agent = @import("agent2.zig");
-pub const Agent = @import("agent.zig");
+pub const agent = @import("agent.zig");
 pub const IfIterator = @import("if_iterator.zig");
 pub const ParsedServerUrl = @import("parsed_server_url.zig");
 
@@ -374,8 +373,6 @@ pub const Credentials = struct {
 test {
     std.testing.refAllDecls(@This());
     _ = @import("agent.zig");
-    _ = @import("agent2.zig");
-    _ = @import("core.zig");
     _ = @import("candidate_pair.zig");
     _ = @import("messages.zig");
 }
