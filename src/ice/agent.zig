@@ -70,6 +70,12 @@ pub const ReadResult = union(enum) {
     consumed: void,
 };
 
+/// A resolved STUN or TURN server.
+pub const Server = union(enum) {
+    stun: IpAddress,
+    turn: struct { address: IpAddress, username: []const u8, password: []const u8 },
+};
+
 const PendingRequest = struct {
     transaction_id: [12]u8,
     pair: u16,
@@ -79,7 +85,7 @@ const Response = struct {
     tx_id: [12]u8,
     local: CandidateIndex,
     remote: CandidateIndex,
-    kind:enum(u2) { success, role_conflict } = .success,
+    kind: enum(u2) { success, role_conflict } = .success,
 };
 
 /// The maximum number of binding requests sent on a pair before it is
@@ -153,6 +159,8 @@ pub fn Agent(comptime config: struct {
         remote_credentials: ?LocalCredentials(config.auth_info_size),
         connection_state: ice.ConnectionState,
         gathering_state: ice.GatheringState,
+        /// Set once addLocalAddrs is called with no addresses.
+        gathering_done: bool,
         role: ice.Role,
         tie_breaker: u64,
 
@@ -207,6 +215,7 @@ pub fn Agent(comptime config: struct {
                 .role = agent_config.role,
                 .connection_state = .new,
                 .gathering_state = .new,
+                .gathering_done = false,
                 .credentials = try .init(agent_config.credentials.username, agent_config.credentials.password),
                 .remote_credentials = null,
                 .tie_breaker = agent_config.random.int(u64),
@@ -254,10 +263,16 @@ pub fn Agent(comptime config: struct {
             return if (core.nominated_pair) |nominated| core.remote_candidates[nominated.remote].address else null;
         }
 
-        /// Add local addresses to the agent. This should be called after `addStunServer`.
-        pub fn addLocalAddrs(agent: *Self, addrs: []const IpAddress, now: i64) AllocError!void {
-            agent.gathering_state = .gathering;
-            try agent.events_out.pushBack(.{ .gathering_state = agent.gathering_state });
+        /// Add local addresses to the agent. The first call starts gathering.
+        ///
+        /// Adding an empty list of addresses signals the end of gathering.
+        pub fn addLocalAddrs(agent: *Self, addrs: []const IpAddress, now: i64) (AllocError || error{GatheringDone})!void {
+            if (agent.gathering_done) return error.GatheringDone;
+            const prev_state = agent.gathering_state;
+            if (agent.gathering_state == .new) {
+                agent.gathering_state = .gathering;
+                try agent.events_out.pushBack(.{ .gathering_state = agent.gathering_state });
+            }
 
             var min_index: ?CandidateIndex = null;
             var max_index: ?CandidateIndex = null;
@@ -271,44 +286,58 @@ pub fn Agent(comptime config: struct {
 
             if (min_index) |min| try agent.events_out.pushBack(.{ .candidate = .{ min, max_index.? } });
 
-            for (agent.stun_clients.items) |*stun_client| {
-                try stun_client.bindingRequest(now);
+            // Send binding requests for all stun servers and create allocations for all turn servers
+            // only if this is the first call
+            if (prev_state == .new) {
+                for (agent.stun_clients.items) |*stun_client| {
+                    try stun_client.bindingRequest(now);
+                }
+
+                for (agent.turn_clients.items) |*turn_client| try startAllocation(turn_client, now);
             }
 
-            for (agent.turn_clients.items) |*turn_client| {
-                turn_client.createAllocation(now) catch |err| switch (err) {
-                    error.OutOfMemory => return error.OutOfMemory,
-                    else => {},
-                };
+            if (addrs.len == 0) {
+                agent.gathering_done = true;
+                try agent.setGatheringCompleted();
             }
-
-            try agent.setGatheringCompleted();
         }
 
-        pub fn addStunServer(agent: *Self, local: IpAddress, server: IpAddress) AllocError!void {
-            const stun_client = try agent.stun_clients.addOne(agent.allocator);
-            stun_client.* = StunClient.init(.{
-                .local_addr = local,
-                .remote_addr = server,
-                .random = agent.random,
-            });
+        /// Add a server queried from the `local` socket. Servers added while gathering
+        /// is in progress are queried immediately.
+        pub fn addServer(agent: *Self, local: IpAddress, server: Server, now: i64) (AllocError || error{GatheringDone})!void {
+            if (agent.gathering_done) return error.GatheringDone;
+            const started = agent.gathering_state == .gathering;
+            switch (server) {
+                .stun => |address| {
+                    const stun_client = try agent.stun_clients.addOne(agent.allocator);
+                    errdefer _ = agent.stun_clients.pop();
+                    stun_client.* = StunClient.init(.{
+                        .local_addr = local,
+                        .remote_addr = address,
+                        .random = agent.random,
+                    });
+                    if (started) try stun_client.bindingRequest(now);
+                },
+                .turn => |turn| {
+                    const turn_client = try agent.turn_clients.addOne(agent.allocator);
+                    errdefer _ = agent.turn_clients.pop();
+                    turn_client.* = TurnClient.init(.{
+                        .local_addr = local,
+                        .remote_addr = turn.address,
+                        .random = agent.random,
+                        .username = turn.username,
+                        .password = turn.password,
+                    });
+                    if (started) try startAllocation(turn_client, now);
+                },
+            }
         }
 
-        pub fn addTurnServer(
-            agent: *Self,
-            local: IpAddress,
-            server: IpAddress,
-            username: []const u8,
-            password: []const u8,
-        ) AllocError!void {
-            const stun_client = try agent.turn_clients.addOne(agent.allocator);
-            stun_client.* = TurnClient.init(.{
-                .local_addr = local,
-                .remote_addr = server,
-                .random = agent.random,
-                .username = username,
-                .password = password,
-            });
+        fn startAllocation(turn_client: *TurnClient, now: i64) AllocError!void {
+            turn_client.createAllocation(now) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.AllocationAlreadyExists => {},
+            };
         }
 
         pub fn setRemoteCredentials(agent: *Self, credentials: ice.Credentials, now: i64) (AllocError || error{CredentialsTooLong})!void {
@@ -742,6 +771,7 @@ pub fn Agent(comptime config: struct {
 
         fn setGatheringCompleted(agent: *Self) !void {
             if (agent.gathering_state == .complete) return;
+            if (!agent.gathering_done) return;
             const stun_completed = agent.stun_clients.items.len == 0;
             const turn_completed = blk: {
                 for (agent.turn_clients.items) |*turn_client| if (!turn_client.hasAllocation()) break :blk false;
@@ -1105,6 +1135,10 @@ fn testRemoteCandidate(address: IpAddress) RemoteCandidate {
     return .{ .address = address, .candidate_type = .host, .priority = ice.CandidateType.host.priority() };
 }
 
+fn testTurnServer(address: IpAddress) Server {
+    return .{ .turn = .{ .address = address, .username = "turnuser", .password = "turnpass" } };
+}
+
 fn testNewAgent(role: ice.Role) !TestAgent {
     return TestAgent.init(testing.allocator, .{
         .role = role,
@@ -1218,6 +1252,13 @@ fn expectEvent(core: *TestAgent, tag: std.meta.Tag(Event)) !void {
 fn expectConnectionStateEvent(core: *TestAgent, state: ice.ConnectionState) !void {
     switch (core.pollEvent() orelse return error.ExpectedEvent) {
         .connection_state => |s| try testing.expectEqual(state, s),
+        else => return error.UnexpectedEvent,
+    }
+}
+
+fn expectGatheringStateEvent(core: *TestAgent, state: ice.GatheringState) !void {
+    switch (core.pollEvent() orelse return error.ExpectedEvent) {
+        .gathering_state => |s| try testing.expectEqual(state, s),
         else => return error.UnexpectedEvent,
     }
 }
@@ -1486,7 +1527,31 @@ test "addServerReflexiveCandidate: skips candidate redundant with host" {
     try testing.expectEqual(2, core.candidates_len);
 }
 
-test "addStunServer/addLocalAddrs: queues a binding request per server and reports its deadline" {
+test "addLocalAddrs: gathering completes only on an empty list; later calls fail" {
+    var core = try testNewAgent(.controlling);
+    defer core.deinit();
+
+    try core.addLocalAddrs(&.{try IpAddress.parse("10.0.0.1", 2000)}, 0);
+    try expectGatheringStateEvent(&core, .gathering);
+    try expectEvent(&core, .candidate);
+    try testing.expectEqual(null, core.pollEvent());
+
+    try core.addLocalAddrs(&.{try IpAddress.parse("10.0.0.2", 2001)}, 0);
+    try expectEvent(&core, .candidate);
+    try testing.expectEqual(null, core.pollEvent());
+    try testing.expectEqual(.gathering, core.gathering_state);
+
+    try core.addLocalAddrs(&.{}, 0);
+    try expectGatheringStateEvent(&core, .complete);
+    try testing.expectEqual(null, core.pollEvent());
+
+    try testing.expectError(error.GatheringDone, core.addLocalAddrs(&.{try IpAddress.parse("10.0.0.3", 2002)}, 0));
+    try testing.expectError(error.GatheringDone, core.addLocalAddrs(&.{}, 0));
+    try testing.expectEqual(2, core.candidates_len);
+    try testing.expectEqual(null, core.pollEvent());
+}
+
+test "addServer/addLocalAddrs: queues a stun binding request per server and reports its deadline" {
     var tx_buf: [1024]u8 = undefined;
     var core = try testNewAgent(.controlling);
     defer core.deinit();
@@ -1496,8 +1561,8 @@ test "addStunServer/addLocalAddrs: queues a binding request per server and repor
     const local2 = try IpAddress.parse("10.0.0.11", 4001);
     const server2 = try IpAddress.parse("203.0.113.2", 3478);
 
-    try core.addStunServer(local1, server1);
-    try core.addStunServer(local2, server2);
+    try core.addServer(local1, .{ .stun = server1 }, 0);
+    try core.addServer(local2, .{ .stun = server2 }, 0);
     try core.addLocalAddrs(&.{}, 100);
 
     const tm1 = (try core.pollTransmit(&tx_buf)) orelse return error.ExpectedTransmit;
@@ -1513,9 +1578,47 @@ test "addStunServer/addLocalAddrs: queues a binding request per server and repor
     try testing.expectEqual(100 + stun.Client.Client(.{}).base_rto, core.pollTimeout());
 }
 
-test "handleRead: stun server resolves to reflexive candidate; duplicate mapped address still completes gathering" {
+test "addServer: deferred before gathering, sent during, rejected once done" {
+    var tx_buf: [1024]u8 = undefined;
     var core = try testNewAgent(.controlling);
     defer core.deinit();
+
+    const local = try IpAddress.parse("10.0.0.10", 4000);
+    const stun1 = try IpAddress.parse("203.0.113.1", 3478);
+    const stun2 = try IpAddress.parse("203.0.113.2", 3478);
+    const turn = try IpAddress.parse("203.0.113.3", 3478);
+
+    try core.addServer(local, .{ .stun = stun1 }, 0);
+    try testing.expectEqual(null, (try core.pollTransmit(&tx_buf)));
+
+    try core.addLocalAddrs(&.{try IpAddress.parse("10.0.0.1", 2000)}, 0);
+    const tm1 = (try core.pollTransmit(&tx_buf)) orelse return error.ExpectedTransmit;
+    try testing.expect(tm1.to.eql(&stun1));
+    try testing.expectEqual(null, (try core.pollTransmit(&tx_buf)));
+
+    try core.addServer(local, .{ .stun = stun2 }, 0);
+    const tm2 = (try core.pollTransmit(&tx_buf)) orelse return error.ExpectedTransmit;
+    try testing.expect(tm2.to.eql(&stun2));
+
+    try core.addServer(local, testTurnServer(turn), 0);
+    const tm3 = (try core.pollTransmit(&tx_buf)) orelse return error.ExpectedTransmit;
+    try testing.expect(tm3.to.eql(&turn));
+    try testing.expectEqual(null, (try core.pollTransmit(&tx_buf)));
+
+    // Ending gathering doesn't resend requests to servers already queried.
+    try core.addLocalAddrs(&.{}, 0);
+    try testing.expectEqual(null, (try core.pollTransmit(&tx_buf)));
+    try testing.expectEqual(.gathering, core.gathering_state);
+
+    try testing.expectError(error.GatheringDone, core.addServer(local, .{ .stun = stun1 }, 0));
+    try testing.expectError(error.GatheringDone, core.addServer(local, testTurnServer(turn), 0));
+    try testing.expectEqual(2, core.stun_clients.items.len);
+    try testing.expectEqual(1, core.turn_clients.items.len);
+}
+
+test "handleRead: stun server resolves to reflexive candidate; duplicate mapped address still completes gathering" {
+    var agent = try testNewAgent(.controlling);
+    defer agent.deinit();
 
     const host_addr = try IpAddress.parse("10.0.0.1", 2000);
     const local1 = try IpAddress.parse("10.0.0.10", 4000);
@@ -1523,60 +1626,61 @@ test "handleRead: stun server resolves to reflexive candidate; duplicate mapped 
     const local2 = try IpAddress.parse("10.0.0.11", 4001);
     const server2 = try IpAddress.parse("203.0.113.2", 3478);
 
-    try core.addStunServer(local1, server1);
-    try core.addStunServer(local2, server2);
-    try core.addLocalAddrs(&.{host_addr}, 0);
-    while (core.pollEvent()) |_| {}
+    try agent.addServer(local1, .{ .stun = server1 }, 0);
+    try agent.addServer(local2, .{ .stun = server2 }, 0);
+    try agent.addLocalAddrs(&.{host_addr}, 0);
+    try agent.addLocalAddrs(&.{}, 0);
+    while (agent.pollEvent()) |_| {}
 
     var resp_buffer: [64]u8 = undefined;
 
     // Poll both requests before answering either: handleRead's swapRemove on
     // a resolved server invalidates any transmit still held for another one.
-    const tm1 = (try core.pollTransmit(&resp_buffer)) orelse return error.ExpectedTransmit;
+    const tm1 = (try agent.pollTransmit(&resp_buffer)) orelse return error.ExpectedTransmit;
     const tx1 = (try stun.Message.parse(tm1.data)).header.transaction_id;
-    const tm2 = (try core.pollTransmit(&resp_buffer)) orelse return error.ExpectedTransmit;
+    const tm2 = (try agent.pollTransmit(&resp_buffer)) orelse return error.ExpectedTransmit;
     const tx2 = (try stun.Message.parse(tm2.data)).header.transaction_id;
 
     var buf: [128]u8 = undefined;
     const mapped = try IpAddress.parse("198.51.100.7", 55000);
     const resp1 = try testStunBindingResponse(&buf, tx1, mapped);
-    _ = try core.handleRead(.{ .from = &server1, .to = &local1, .data = resp1 }, 0);
+    _ = try agent.handleRead(.{ .from = &server1, .to = &local1, .data = resp1 }, 0);
 
-    try expectEvent(&core, .candidate);
-    try testing.expectEqual(null, core.pollEvent()); // server2 still pending: gathering not complete yet
-    try testing.expectEqual(1, core.stun_clients.items.len);
+    try expectEvent(&agent, .candidate);
+    try testing.expectEqual(null, agent.pollEvent()); // server2 still pending: gathering not complete yet
+    try testing.expectEqual(1, agent.stun_clients.items.len);
 
     // server2 maps back to the host candidate's own address: a duplicate.
     const resp2 = try testStunBindingResponse(&buf, tx2, host_addr);
-    _ = try core.handleRead(.{ .from = &server2, .to = &local2, .data = resp2 }, 0);
+    _ = try agent.handleRead(.{ .from = &server2, .to = &local2, .data = resp2 }, 0);
 
-    try testing.expectEqual(0, core.stun_clients.items.len);
-    try expectEvent(&core, .gathering_state);
-    try testing.expectEqual(.complete, core.gathering_state);
-    try testing.expectEqual(null, core.pollEvent());
+    try testing.expectEqual(0, agent.stun_clients.items.len);
+    try expectEvent(&agent, .gathering_state);
+    try testing.expectEqual(.complete, agent.gathering_state);
+    try testing.expectEqual(null, agent.pollEvent());
 }
 
 test "handleTimeout: stun server failure removes it and completes gathering" {
     var tx_buf: [1024]u8 = undefined;
-    var core = try testNewAgent(.controlling);
-    defer core.deinit();
+    var agent = try testNewAgent(.controlling);
+    defer agent.deinit();
 
     const local = try IpAddress.parse("10.0.0.10", 4000);
     const server = try IpAddress.parse("203.0.113.1", 3478);
-    try core.addStunServer(local, server);
-    try core.addLocalAddrs(&.{}, 0);
-    while (core.pollEvent()) |_| {}
-    _ = (try core.pollTransmit(&tx_buf)); // drain the initial binding request
+    try agent.addServer(local, .{ .stun = server }, 0);
+    try agent.addLocalAddrs(&.{}, 0);
+    while (agent.pollEvent()) |_| {}
+    _ = (try agent.pollTransmit(&tx_buf)); // drain the initial binding request
 
     var now: i64 = 0;
     for (0..8) |_| {
         now += 2000;
-        try core.handleTimeout(now);
-        _ = (try core.pollTransmit(&tx_buf));
+        try agent.handleTimeout(now);
+        _ = (try agent.pollTransmit(&tx_buf));
     }
 
-    try testing.expectEqual(0, core.stun_clients.items.len);
-    try testing.expectEqual(.complete, core.gathering_state);
+    try testing.expectEqual(0, agent.stun_clients.items.len);
+    try testing.expectEqual(.complete, agent.gathering_state);
 }
 
 test "toggleRole: flips role, tie breaker and pair priorities" {
@@ -1747,7 +1851,6 @@ test "handleInput: role conflict switches role and produces a response" {
     try testing.expectEqual(.success_response, resp_msg.header.message_type.class());
 
     try expectEvent(&core, .candidate);
-    try expectEvent(&core, .gathering_state);
     try testing.expectEqual(null, core.pollEvent());
 }
 
@@ -2048,7 +2151,7 @@ test "setRemoteCredentials: replaces and frees the previous value" {
     try testing.expectEqualStrings("second-password-0123456789", core.remote_credentials.?.getPassword());
 }
 
-test "addTurnServer/addLocalAddrs: queues an allocate request and keeps gathering incomplete until it resolves" {
+test "addServer/addLocalAddrs: turn server queues an allocate request and keeps gathering incomplete until it resolves" {
     var tx_buf: [1024]u8 = undefined;
     var core = try testNewAgent(.controlling);
     defer core.deinit();
@@ -2056,7 +2159,7 @@ test "addTurnServer/addLocalAddrs: queues an allocate request and keeps gatherin
     const local = try IpAddress.parse("10.0.0.10", 4000);
     const server = try IpAddress.parse("203.0.113.1", 3478);
 
-    try core.addTurnServer(local, server, "turnuser", "turnpass");
+    try core.addServer(local, testTurnServer(server), 0);
     try core.addLocalAddrs(&.{}, 0);
 
     const tm = (try core.pollTransmit(&tx_buf)) orelse return error.ExpectedTransmit;
@@ -2075,7 +2178,7 @@ test "handleTurnClientEvents: successful allocation adds a relay candidate, crea
     const server = try IpAddress.parse("203.0.113.1", 3478);
     const remote = try IpAddress.parse("192.168.1.10", 1000);
 
-    try core.addTurnServer(local, server, "turnuser", "turnpass");
+    try core.addServer(local, testTurnServer(server), 0);
     try core.addRemoteCandidate(Candidate.initHost(remote), 0);
     try core.addLocalAddrs(&.{}, 0);
     while (core.pollEvent()) |_| {}
@@ -2125,7 +2228,7 @@ test "addRemoteCandidate: pairs with a relay candidate and creates a permission"
     const server = try IpAddress.parse("203.0.113.1", 3478);
     const relayed = try IpAddress.parse("203.0.113.9", 40000);
 
-    try core.addTurnServer(local, server, "turnuser", "turnpass");
+    try core.addServer(local, testTurnServer(server), 0);
     _ = try core.addLocalCandidate(.initRelay(local, relayed));
 
     const remote = try IpAddress.parse("192.168.1.10", 1000);
@@ -2151,7 +2254,7 @@ test "handleRead: unwraps a TURN data indication before further processing" {
     const relayed = try IpAddress.parse("203.0.113.9", 40000);
     const peer = try IpAddress.parse("192.168.1.120", 2000);
 
-    try core.addTurnServer(local, server, "turnuser", "turnpass");
+    try core.addServer(local, testTurnServer(server), 0);
 
     core.candidates[0] = .initRelay(local, relayed);
     core.candidates_len = 1;
@@ -2207,7 +2310,7 @@ test "maybeWrapInTurnMessage: relay candidate responses are wrapped as a TURN se
     const relayed = try IpAddress.parse("203.0.113.9", 40000);
     const from = try IpAddress.parse("192.168.1.120", 2000);
 
-    try core.addTurnServer(local, server, "turnuser", "turnpass");
+    try core.addServer(local, testTurnServer(server), 0);
 
     core.candidates[0] = .initRelay(local, relayed);
     core.candidates_len = 1;
@@ -2248,7 +2351,7 @@ test "handleTurnClientEvents: allocation_failed removes the turn client and gath
     const local = try IpAddress.parse("10.0.0.10", 4000);
     const server = try IpAddress.parse("203.0.113.1", 3478);
 
-    try core.addTurnServer(local, server, "turnuser", "turnpass");
+    try core.addServer(local, testTurnServer(server), 0);
     try core.addLocalAddrs(&.{}, 0);
     while (core.pollEvent()) |_| {}
 
@@ -2282,7 +2385,7 @@ test "handleTurnClientEvents: permission_failed marks the matching candidate pai
     const server = try IpAddress.parse("203.0.113.1", 3478);
     const remote = try IpAddress.parse("192.168.1.10", 1000);
 
-    try core.addTurnServer(local, server, "turnuser", "turnpass");
+    try core.addServer(local, testTurnServer(server), 0);
     try core.addRemoteCandidate(Candidate.initHost(remote), 0);
     try core.addLocalAddrs(&.{}, 0);
     while (core.pollEvent()) |_| {}
@@ -2325,8 +2428,8 @@ test "handleTimeout: transitioning to completed keeps only the turn client backi
     const local2 = try IpAddress.parse("10.0.0.11", 4001);
     const server2 = try IpAddress.parse("203.0.113.2", 3478);
 
-    try core.addTurnServer(local1, server1, "turnuser", "turnpass");
-    try core.addTurnServer(local2, server2, "turnuser", "turnpass");
+    try core.addServer(local1, testTurnServer(server1), 0);
+    try core.addServer(local2, testTurnServer(server2), 0);
 
     core.candidates[0] = .initRelay(local1, try IpAddress.parse("203.0.113.9", 40000));
     core.candidates_len = 1;
