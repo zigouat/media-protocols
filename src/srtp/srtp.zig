@@ -1,14 +1,16 @@
+pub const ReplayDetector = @import("replay_detector.zig").ReplayDetector;
+
 const std = @import("std");
 const rtp = @import("rtp");
 const rtcp = @import("rtcp");
 const cipher = @import("cipher.zig");
-const ReplayDetector = @import("replay_detector.zig");
 
-const default_replay_detection_window = 64;
+const RtpReplayDetector = ReplayDetector(256);
+const RtcpReplayDetector = ReplayDetector(64);
 
 pub const EncryptError = std.mem.Allocator.Error || rtp.Packet.ParseError;
-pub const DecryptError = std.mem.Allocator.Error || rtp.Packet.ParseError || ReplayDetector.Error || error{AuthenticationFailed};
-pub const RtcpDecryptError = error{ AuthenticationFailed, InvalidRtcp } || ReplayDetector.Error || std.mem.Allocator.Error;
+pub const DecryptError = std.mem.Allocator.Error || rtp.Packet.ParseError || RtpReplayDetector.Error || error{AuthenticationFailed};
+pub const RtcpDecryptError = error{ AuthenticationFailed, InvalidRtcp } || RtcpReplayDetector.Error || std.mem.Allocator.Error;
 
 /// An enum describing the list of supported SRTP profiles.
 pub const Profile = enum {
@@ -49,30 +51,28 @@ const Cipher = union(Profile) {
 
 const RtpSsrcState = struct {
     const SEQ_NUM_MEDIAN: u16 = 0x8000;
+    const SEQ_NUM_MODULO: i32 = 1 << 16;
 
-    index: u64 = 0,
+    /// Highest packet index seen (RFC 3711: ROC << 16 | SEQ).
+    index: u48 = 0,
     rollover_has_processed: bool = false,
-    replay_detector: ReplayDetector,
-
-    pub fn deinit(state: *RtpSsrcState, allocator: std.mem.Allocator) void {
-        state.replay_detector.deinit(allocator);
-    }
+    replay_detector: RtpReplayDetector,
 
     pub fn getRoc(state: *const RtpSsrcState, sequence_number: u16) struct { u32, i32 } {
         const local_roc: u32 = @intCast(state.index >> 16);
-        const local_seq: u16 = @intCast(state.index & 0xFFFF);
+        const local_seq: u16 = @truncate(state.index);
 
         var guess_roc = local_roc;
         const diff: i32 = if (state.rollover_has_processed) blk: {
-            var seq: i32 = @as(i32, sequence_number) -% @as(i32, local_seq);
+            var seq: i32 = @as(i32, sequence_number) - @as(i32, local_seq);
             if (local_seq < SEQ_NUM_MEDIAN) {
                 if (seq > SEQ_NUM_MEDIAN) {
                     guess_roc = local_roc -% 1;
-                    seq -%= @as(i32, std.math.maxInt(u16)) + 1;
+                    seq -= SEQ_NUM_MODULO;
                 }
             } else if (local_seq - SEQ_NUM_MEDIAN > sequence_number) {
                 guess_roc = local_roc +% 1;
-                seq +%= @as(i32, std.math.maxInt(u16)) + 1;
+                seq += SEQ_NUM_MODULO;
             }
 
             break :blk seq;
@@ -85,64 +85,44 @@ const RtpSsrcState = struct {
         if (!state.rollover_has_processed) {
             state.index = sequence_number;
             state.rollover_has_processed = true;
-        } else {
-            state.index +%= @as(u64, @bitCast(@as(i64, diff)));
+        } else if (diff > 0) {
+            // Only advance on newer packets, late ones must not move the reference point.
+            state.index += @intCast(diff);
         }
     }
 
     test "rollover count" {
-        var rtp_ssrc_state: RtpSsrcState = .{ .replay_detector = undefined };
+        const Step = struct { u16, u32, i32 }; // seq, expected roc, expected diff
+        const scenarios = [_][]const Step{
+            // Wrap, late packets across the wrap and RFC 3711 window boundaries.
+            &.{
+                .{ 65530, 0, 0 },       .{ 0, 1, 6 },      .{ 65530, 0, -6 },      .{ 5, 1, 5 },
+                .{ 6, 1, 1 },           .{ 7, 1, 1 },      .{ 0x4000, 1, 0x3FF9 }, .{ 0x8000, 1, 0x4000 },
+                .{ 0xFFFF, 1, 0x7FFF }, .{ 0, 2, 1 },      .{ 0x8001, 1, -32767 }, .{ 0x8000, 2, 32768 },
+                .{ 0, 2, -32768 },      .{ 0x8001, 2, 1 }, .{ 0, 3, 32767 },
+            },
+            // Late packet before ROC 0 doesn't underflow the index.
+            &.{ .{ 5, 0, 0 }, .{ 65530, 0xFFFFFFFF, -11 }, .{ 6, 0, 1 } },
+            // Late packet doesn't shift the reference point.
+            &.{ .{ 1000, 0, 0 }, .{ 30000, 0, 29000 }, .{ 33000, 0, 3000 }, .{ 10000, 0, -23000 }, .{ 45000, 0, 12000 } },
+        };
 
-        var roc, var diff = rtp_ssrc_state.getRoc(65530);
-        try std.testing.expectEqual(0, roc);
-        try std.testing.expectEqual(0, diff);
-
-        rtp_ssrc_state.updateRolloverCount(65530, diff);
-        roc, diff = rtp_ssrc_state.getRoc(0);
-        try std.testing.expectEqual(1, roc);
-        try std.testing.expect(diff != 0);
-
-        rtp_ssrc_state.updateRolloverCount(0, diff);
-        roc, diff = rtp_ssrc_state.getRoc(65530);
-        try std.testing.expectEqual(0, roc);
-        try std.testing.expect(diff != 0);
-
-        rtp_ssrc_state.updateRolloverCount(65530, diff);
-        roc, diff = rtp_ssrc_state.getRoc(5);
-        try std.testing.expectEqual(1, roc);
-        try std.testing.expect(diff != 0);
-
-        roc, diff = rtp_ssrc_state.getRoc(6);
-        rtp_ssrc_state.updateRolloverCount(6, diff);
-        roc, diff = rtp_ssrc_state.getRoc(7);
-        rtp_ssrc_state.updateRolloverCount(7, diff);
-        try std.testing.expectEqual(1, roc);
-
-        roc, diff = rtp_ssrc_state.getRoc(0x4000);
-        try std.testing.expectEqual(1, roc);
-        rtp_ssrc_state.updateRolloverCount(0x4000, diff);
-
-        roc, diff = rtp_ssrc_state.getRoc(0x8000);
-        try std.testing.expectEqual(1, roc);
-        rtp_ssrc_state.updateRolloverCount(0x8000, diff);
-
-        roc, diff = rtp_ssrc_state.getRoc(0xFFFF);
-        try std.testing.expectEqual(1, roc);
-        rtp_ssrc_state.updateRolloverCount(0xFFFF, diff);
-
-        roc, diff = rtp_ssrc_state.getRoc(0);
-        try std.testing.expectEqual(2, roc);
-        rtp_ssrc_state.updateRolloverCount(0, diff);
+        for (scenarios) |steps| {
+            var state: RtpSsrcState = .{ .replay_detector = undefined };
+            for (steps) |step| {
+                const seq, const expected_roc, const expected_diff = step;
+                const roc, const diff = state.getRoc(seq);
+                try std.testing.expectEqual(expected_roc, roc);
+                try std.testing.expectEqual(expected_diff, diff);
+                state.updateRolloverCount(seq, diff);
+            }
+        }
     }
 };
 
 const RtcpSsrcState = struct {
     index: u31 = 1,
-    replay_detector: ReplayDetector,
-
-    pub fn deinit(state: *RtcpSsrcState, allocator: std.mem.Allocator) void {
-        state.replay_detector.deinit(allocator);
-    }
+    replay_detector: RtcpReplayDetector,
 };
 
 /// A struct representing an SRTP session, which holds the master key, salt, cipher, and state for RTP and RTCP SSRCs.
@@ -170,12 +150,7 @@ pub const Session = struct {
     }
 
     pub fn deinit(session: *Session, allocator: std.mem.Allocator) void {
-        var it = session.rtp_ssrc_states.iterator();
-        while (it.next()) |entry| entry.value_ptr.deinit(allocator);
         session.rtp_ssrc_states.deinit(allocator);
-
-        var rtcp_it = session.rtcp_ssrc_states.iterator();
-        while (rtcp_it.next()) |entry| entry.value_ptr.deinit(allocator);
         session.rtcp_ssrc_states.deinit(allocator);
     }
 
@@ -207,12 +182,9 @@ pub const Session = struct {
 
         var new_state: RtpSsrcState = undefined;
         const rtp_ssrc_state = entry orelse blk: {
-            new_state = .{
-                .replay_detector = try .init(allocator, default_replay_detection_window),
-            };
+            new_state = .{ .replay_detector = .init() };
             break :blk &new_state;
         };
-        errdefer if (entry == null) rtp_ssrc_state.deinit(allocator);
 
         const roc, const diff = rtp_ssrc_state.getRoc(rtp_packet.header.sequence_number);
         const packet_index = @as(u64, roc) << 16 | rtp_packet.header.sequence_number;
@@ -244,10 +216,9 @@ pub const Session = struct {
 
         var new_state: RtcpSsrcState = undefined;
         const rtcp_ssrc_state = entry orelse blk: {
-            new_state = .{ .replay_detector = try .init(allocator, 128) };
+            new_state = .{ .replay_detector = .init() };
             break :blk &new_state;
         };
-        errdefer if (entry == null) rtcp_ssrc_state.deinit(allocator);
 
         const index, const encrypted = if (encrypt) .{ rtcp_ssrc_state.index, false } else try session.getRtcpIndex(rtcp_data);
         if (!encrypt) try rtcp_ssrc_state.replay_detector.check(index);
@@ -324,19 +295,19 @@ test {
     _ = @import("cipher.zig");
 }
 
-test "init session" {
+test "Session.init: session" {
     var srtp_session = try Session.init(test_keying_material, .AesCm128HmacSha1_80);
     defer srtp_session.deinit(testing.allocator);
 }
 
-test "init session: wrong keys size" {
+test "Session.init: wrong keys size" {
     try testing.expectError(
         error.InvalidKeyingMaterial,
         Session.init("shortkeyhere", .AesCm128HmacSha1_80),
     );
 }
 
-test "decrypt rtp: Aes128CmHmacSha1_80" {
+test "Session.decryptRtp: Aes128CmHmacSha1_80" {
     var session = try Session.init(test_keying_material, .AesCm128HmacSha1_80);
     defer session.deinit(testing.allocator);
 
@@ -348,7 +319,7 @@ test "decrypt rtp: Aes128CmHmacSha1_80" {
     try testing.expectError(error.Replayed, session.decryptRtp(testing.allocator, &encrypted_rtp_aes_128_cm_hmac1_80, &dest));
 }
 
-test "decrypt rtcp: Aes128CmHmacSha1_80" {
+test "Session.decryptRtcp: Aes128CmHmacSha1_80" {
     var session = try Session.init(test_keying_material, .AesCm128HmacSha1_80);
     defer session.deinit(testing.allocator);
 
@@ -360,7 +331,7 @@ test "decrypt rtcp: Aes128CmHmacSha1_80" {
     try testing.expectError(error.Replayed, session.decryptRtcp(testing.allocator, &encrypted_rtcp_aes_128_cm_hmac1_80, &dest));
 }
 
-test "encrypt rtcp: Aes128CmHmacSha1_80" {
+test "Session.encryptRtp: Aes128CmHmacSha1_80" {
     var session = try Session.init(test_keying_material, .AesCm128HmacSha1_80);
     defer session.deinit(testing.allocator);
 
@@ -369,7 +340,7 @@ test "encrypt rtcp: Aes128CmHmacSha1_80" {
     try testing.expectEqualSlices(u8, &encrypted_rtcp_aes_128_cm_hmac1_80, decrypted);
 }
 
-test "decrypt rtcp: packet too short is rejected" {
+test "Session.encryptRtcp: packet too short is rejected" {
     var session = try Session.init(test_keying_material, .AesCm128HmacSha1_80);
     defer session.deinit(testing.allocator);
 
@@ -378,7 +349,7 @@ test "decrypt rtcp: packet too short is rejected" {
     try testing.expectError(error.InvalidRtcp, session.decryptRtcp(testing.allocator, &[_]u8{}, &dest));
 }
 
-test "encrypt/decrypt rtcp: advancing indices round-trip" {
+test "Session.encrypt/decrypt rtcp: advancing indices round-trip" {
     var sender = try Session.init(test_keying_material, .AesCm128HmacSha1_80);
     defer sender.deinit(testing.allocator);
 
@@ -395,9 +366,15 @@ test "encrypt/decrypt rtcp: advancing indices round-trip" {
     }
 }
 
-test "encrypt/decrypt rtp" {
+test "Session.encrypt/decrypt rtp" {
     const assert_enc_dec = struct {
-        pub fn encrypt_decrypt(session: *Session) !void {
+        pub fn encrypt_decrypt(profile: Profile) !void {
+            // Separate sessions so ROC is tracked independently on each side.
+            var sender = try Session.init(test_keying_material, profile);
+            defer sender.deinit(testing.allocator);
+            var receiver = try Session.init(test_keying_material, profile);
+            defer receiver.deinit(testing.allocator);
+
             var header = rtp.Packet.Header{
                 .extension = false,
                 .marker = false,
@@ -408,45 +385,38 @@ test "encrypt/decrypt rtp" {
                 .timestamp = 1000,
             };
 
-            var dst_enc: [1200]u8 = @splat(0);
             var dst_dec: [1000]u8 = @splat(0);
 
-            // Batch size is 64 because that's the default replay window size
-            // Otherwise we'll get `error.TooOld` when decrypting.
+            // Batch size must not exceed the replay window size,
+            // otherwise we'll get `error.TooOld` when decrypting.
             var batch: [64][1000]u8 = @splat(@splat(0));
+            var dst_enc: [64][1024]u8 = undefined;
+            var encrypted: [64][]const u8 = undefined;
+            var order: [64]usize = undefined;
             var r = std.Random.DefaultPrng.init(testing.random_seed);
             var random = r.random();
 
             var idx: usize = 0;
             while (idx < 1000) : (idx += batch.len) {
-                for (0..batch.len) |i| {
-                    var payload = &batch[i];
-                    testing.io.random(payload[12..payload.len]);
+                // Encrypt in order, decrypt out of order.
+                for (&batch, &dst_enc, &encrypted) |*payload, *dst, *enc| {
+                    testing.io.random(payload[12..]);
                     std.mem.writeInt(u96, payload[0..12], @bitCast(header), .big);
                     header.sequence_number +%= 1;
+                    enc.* = try sender.encryptRtp(testing.allocator, payload, dst);
                 }
 
-                random.shuffle([1000]u8, &batch);
+                for (&order, 0..) |*o, i| o.* = i;
+                random.shuffle(usize, &order);
 
-                for (0..batch.len) |i| {
-                    const encrypted = try session.encryptRtp(testing.allocator, &batch[i], &dst_enc);
-                    const decrypted = try session.decryptRtp(testing.allocator, encrypted, &dst_dec);
-
+                for (order) |i| {
+                    const decrypted = try receiver.decryptRtp(testing.allocator, encrypted[i], &dst_dec);
                     try testing.expectEqualSlices(u8, &batch[i], decrypted);
                 }
             }
         }
     }.encrypt_decrypt;
 
-    {
-        var session = try Session.init(test_keying_material, .AesCm128HmacSha1_80);
-        defer session.deinit(testing.allocator);
-        try assert_enc_dec(&session);
-    }
-
-    {
-        var session = try Session.init(test_keying_material, .AesCm128HmacSha1_32);
-        defer session.deinit(testing.allocator);
-        try assert_enc_dec(&session);
-    }
+    try assert_enc_dec(.AesCm128HmacSha1_80);
+    try assert_enc_dec(.AesCm128HmacSha1_32);
 }
