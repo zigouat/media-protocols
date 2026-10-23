@@ -1,14 +1,16 @@
+pub const ReplayDetector = @import("replay_detector.zig").ReplayDetector;
+
 const std = @import("std");
 const rtp = @import("rtp");
 const rtcp = @import("rtcp");
 const cipher = @import("cipher.zig");
-const ReplayDetector = @import("replay_detector.zig");
 
-const default_replay_detection_window = 64;
+const RtpReplayDetector = ReplayDetector(256);
+const RtcpReplayDetector = ReplayDetector(64);
 
 pub const EncryptError = std.mem.Allocator.Error || rtp.Packet.ParseError;
-pub const DecryptError = std.mem.Allocator.Error || rtp.Packet.ParseError || ReplayDetector.Error || error{AuthenticationFailed};
-pub const RtcpDecryptError = error{ AuthenticationFailed, InvalidRtcp } || ReplayDetector.Error || std.mem.Allocator.Error;
+pub const DecryptError = std.mem.Allocator.Error || rtp.Packet.ParseError || RtpReplayDetector.Error || error{AuthenticationFailed};
+pub const RtcpDecryptError = error{ AuthenticationFailed, InvalidRtcp } || RtcpReplayDetector.Error || std.mem.Allocator.Error;
 
 /// An enum describing the list of supported SRTP profiles.
 pub const Profile = enum {
@@ -54,11 +56,7 @@ const RtpSsrcState = struct {
     /// Highest packet index seen (RFC 3711: ROC << 16 | SEQ).
     index: u48 = 0,
     rollover_has_processed: bool = false,
-    replay_detector: ReplayDetector,
-
-    pub fn deinit(state: *RtpSsrcState, allocator: std.mem.Allocator) void {
-        state.replay_detector.deinit(allocator);
-    }
+    replay_detector: RtpReplayDetector,
 
     pub fn getRoc(state: *const RtpSsrcState, sequence_number: u16) struct { u32, i32 } {
         const local_roc: u32 = @intCast(state.index >> 16);
@@ -124,11 +122,7 @@ const RtpSsrcState = struct {
 
 const RtcpSsrcState = struct {
     index: u31 = 1,
-    replay_detector: ReplayDetector,
-
-    pub fn deinit(state: *RtcpSsrcState, allocator: std.mem.Allocator) void {
-        state.replay_detector.deinit(allocator);
-    }
+    replay_detector: RtcpReplayDetector,
 };
 
 /// A struct representing an SRTP session, which holds the master key, salt, cipher, and state for RTP and RTCP SSRCs.
@@ -156,12 +150,7 @@ pub const Session = struct {
     }
 
     pub fn deinit(session: *Session, allocator: std.mem.Allocator) void {
-        var it = session.rtp_ssrc_states.iterator();
-        while (it.next()) |entry| entry.value_ptr.deinit(allocator);
         session.rtp_ssrc_states.deinit(allocator);
-
-        var rtcp_it = session.rtcp_ssrc_states.iterator();
-        while (rtcp_it.next()) |entry| entry.value_ptr.deinit(allocator);
         session.rtcp_ssrc_states.deinit(allocator);
     }
 
@@ -193,12 +182,9 @@ pub const Session = struct {
 
         var new_state: RtpSsrcState = undefined;
         const rtp_ssrc_state = entry orelse blk: {
-            new_state = .{
-                .replay_detector = try .init(allocator, default_replay_detection_window),
-            };
+            new_state = .{ .replay_detector = .init() };
             break :blk &new_state;
         };
-        errdefer if (entry == null) rtp_ssrc_state.deinit(allocator);
 
         const roc, const diff = rtp_ssrc_state.getRoc(rtp_packet.header.sequence_number);
         const packet_index = @as(u64, roc) << 16 | rtp_packet.header.sequence_number;
@@ -230,10 +216,9 @@ pub const Session = struct {
 
         var new_state: RtcpSsrcState = undefined;
         const rtcp_ssrc_state = entry orelse blk: {
-            new_state = .{ .replay_detector = try .init(allocator, 128) };
+            new_state = .{ .replay_detector = .init() };
             break :blk &new_state;
         };
-        errdefer if (entry == null) rtcp_ssrc_state.deinit(allocator);
 
         const index, const encrypted = if (encrypt) .{ rtcp_ssrc_state.index, false } else try session.getRtcpIndex(rtcp_data);
         if (!encrypt) try rtcp_ssrc_state.replay_detector.check(index);
@@ -402,8 +387,8 @@ test "Session.encrypt/decrypt rtp" {
 
             var dst_dec: [1000]u8 = @splat(0);
 
-            // Batch size is 64 because that's the default replay window size
-            // Otherwise we'll get `error.TooOld` when decrypting.
+            // Batch size must not exceed the replay window size,
+            // otherwise we'll get `error.TooOld` when decrypting.
             var batch: [64][1000]u8 = @splat(@splat(0));
             var dst_enc: [64][1024]u8 = undefined;
             var encrypted: [64][]const u8 = undefined;
