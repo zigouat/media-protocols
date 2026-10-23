@@ -2446,30 +2446,3 @@ test "handleTimeout: transitioning to completed keeps only the turn client backi
     try testing.expectEqual(1, core.turn_clients.items.len);
     try testing.expect(core.turn_clients.items[0].local_addr.eql(&local1));
 }
-
-test "abcd" {
-    std.debug.print("Agent size: {}\n", .{@sizeOf(TestAgent)});
-    std.debug.print("Agent size: {}\n", .{@sizeOf(Agent(.{
-        .max_candidates = 8,
-    }))});
-    std.debug.print("Candidate size: {}\n", .{@sizeOf(Candidate)});
-    std.debug.print("Candidate2 size: {}\n", .{@sizeOf(Candidate2)});
-    std.debug.print("IpAddress:      {}\n", .{@sizeOf(IpAddress)});
-    std.debug.print("Pending request size: {}\n", .{@sizeOf(PendingRequest)});
-    std.debug.print("Event size: {}\n", .{@sizeOf(Event)});
-    std.debug.print("Candidate pair: {}\n", .{@sizeOf(CandidatePair)});
-
-    std.debug.print("Stun message:      {}\n", .{@sizeOf(stun.TransportMessage)});
-    std.debug.print("Response message:  {}\n", .{@sizeOf(Response)});
-    std.debug.print("Turn Client:       {}\n", .{@sizeOf(stun.turn.TurnClient(.{}))}); // 5072
-}
-
-pub const Candidate2 = struct {
-    foundation: u32 = 0,
-    transport: Transport = .udp,
-    base: IpAddress,
-    address: IpAddress,
-    candidate_type: ice.CandidateType,
-
-    pub const Transport = enum { udp, tcp };
-};
