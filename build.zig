@@ -61,7 +61,6 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "stun", .module = stun },
         },
-        .link_libc = os.tag != .windows,
     });
     _ = b.addModule("protocols", .{
         .root_source_file = b.path("src/root.zig"),
