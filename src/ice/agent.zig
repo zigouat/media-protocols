@@ -957,6 +957,36 @@ pub fn Agent(comptime config: struct {
             agent.responses.pushBack(resp) catch {};
         }
 
+        /// Returns the header size to reserve in front of data sent from `local` to `remote` and
+        /// the total frame size. The header size is 0 unless `local` is a TURN relay base.
+        pub fn getDataFrameSize(agent: *Self, local: *const IpAddress, remote: *const IpAddress, payload_len: usize) struct { u32, usize } {
+            const turn_client = agent.findTurnClient(local) orelse return .{ 0, payload_len };
+            return turn_client.getDataFrameSize(remote, payload_len);
+        }
+
+        /// Returns the address data sent from `local` must be sent to when `local` is a TURN relay base.
+        pub fn getRelayServerAddress(agent: *Self, local: *const IpAddress) ?IpAddress {
+            const turn_client = agent.findTurnClient(local) orelse return null;
+            return turn_client.remote_addr;
+        }
+
+        /// Writes the TURN header in front of a payload already placed at the header offset
+        /// returned by `getDataFrameSize` and returns the frame.
+        pub fn writeDataFrame(
+            agent: *Self,
+            local: *const IpAddress,
+            remote: *const IpAddress,
+            buffer: []u8,
+            payload_len: usize,
+        ) error{WriteFailed}![]const u8 {
+            const turn_client = agent.findTurnClient(local) orelse return buffer[0..payload_len];
+
+            _, const size = turn_client.getDataFrameSize(remote, payload_len);
+            if (size > buffer.len) return error.WriteFailed;
+            turn_client.writeDataHeader(remote, buffer, payload_len);
+            return buffer[0..size];
+        }
+
         fn maybeWrapInTurnMessage(
             agent: *Self,
             local: *const IpAddress,
@@ -964,7 +994,7 @@ pub fn Agent(comptime config: struct {
             buffer: []u8,
             data_len: usize,
         ) error{WriteFailed}!stun.TransportMessage {
-            const turn_client = agent.findTurnClient(local) orelse return stun.TransportMessage{
+            const turn_client = agent.findTurnClient(local) orelse return .{
                 .data = buffer[0..data_len],
                 .from = local,
                 .to = remote,
@@ -975,7 +1005,7 @@ pub fn Agent(comptime config: struct {
             @memmove(buffer[offset .. offset + data_len], buffer[0..data_len]);
             turn_client.writeDataHeader(remote, buffer, data_len);
 
-            return stun.TransportMessage{
+            return .{
                 .data = buffer[0..size],
                 .from = local,
                 .to = &turn_client.remote_addr,
@@ -2409,6 +2439,46 @@ test "handleTurnClientEvents: permission_failed marks the matching candidate pai
     _ = try core.handleRead(.{ .from = &server, .to = &local, .data = resp }, 0);
 
     try testing.expectEqual(.failed, core.pairs.items[0].status);
+}
+
+test "writeDataFrame: frames relayed data in place and passes host data through" {
+    var core = try testNewAgent(.controlling);
+    defer core.deinit();
+
+    const local = try IpAddress.parse("10.0.0.10", 4000);
+    const host = try IpAddress.parse("10.0.0.11", 4000);
+    const server = try IpAddress.parse("203.0.113.1", 3478);
+    const remote = try IpAddress.parse("192.168.1.10", 1000);
+    try core.addServer(local, testTurnServer(server), 0);
+
+    const payload = "hello";
+    var buffer: [128]u8 = undefined;
+
+    {
+        const offset, const size = core.getDataFrameSize(&host, &remote, payload.len);
+        try testing.expectEqual(0, offset);
+        try testing.expectEqual(payload.len, size);
+
+        @memcpy(buffer[0..payload.len], payload);
+        const frame = try core.writeDataFrame(&host, &remote, &buffer, payload.len);
+        try testing.expectEqualSlices(u8, payload, frame);
+        try testing.expectEqual(null, core.getRelayServerAddress(&host));
+    }
+
+    const offset, const size = core.getDataFrameSize(&local, &remote, payload.len);
+    try testing.expectEqual(36, offset);
+
+    @memcpy(buffer[offset..][0..payload.len], payload);
+    const frame = try core.writeDataFrame(&local, &remote, &buffer, payload.len);
+    try testing.expectEqual(size, frame.len);
+    try testing.expect(core.getRelayServerAddress(&local).?.eql(&server));
+    try testing.expectEqualSlices(u8, payload, frame[offset..][0..payload.len]);
+
+    const indication = try stun.Message.parse(frame);
+    try testing.expectEqual(.send, indication.header.message_type.method());
+    try testing.expectEqual(.indication, indication.header.message_type.class());
+
+    try testing.expectError(error.WriteFailed, core.writeDataFrame(&local, &remote, buffer[0 .. size - 1], payload.len));
 }
 
 test "handleTimeout: transitioning to completed keeps only the turn client backing the nominated pair" {
