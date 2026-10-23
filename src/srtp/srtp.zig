@@ -8,6 +8,7 @@ const default_replay_detection_window = 64;
 
 pub const EncryptError = std.mem.Allocator.Error || rtp.Packet.ParseError;
 pub const DecryptError = std.mem.Allocator.Error || rtp.Packet.ParseError || ReplayDetector.Error || error{AuthenticationFailed};
+pub const RtcpDecryptError = error{ AuthenticationFailed, InvalidRtcp } || ReplayDetector.Error || std.mem.Allocator.Error;
 
 /// An enum describing the list of supported SRTP profiles.
 pub const Profile = enum {
@@ -145,19 +146,14 @@ const RtcpSsrcState = struct {
 };
 
 /// A struct representing an SRTP session, which holds the master key, salt, cipher, and state for RTP and RTCP SSRCs.
-///
-/// This session only guards againt data races for different ssrc, so calling encrypt/decrypt for the same ssrc and same
-/// packet type (rtp/rtcp) from different threads is not safe.
 pub const Session = struct {
-    io: std.Io,
     master_key: []const u8,
     salt: []const u8,
     cipher: Cipher,
-    rtp_ssrc_states: std.AutoHashMap(u32, RtpSsrcState),
-    rtcp_ssrc_states: std.AutoHashMap(u32, RtcpSsrcState),
-    rw_lock: std.Io.RwLock,
+    rtp_ssrc_states: std.AutoHashMapUnmanaged(u32, RtpSsrcState),
+    rtcp_ssrc_states: std.AutoHashMapUnmanaged(u32, RtcpSsrcState),
 
-    pub fn init(io: std.Io, allocator: std.mem.Allocator, keying_material: []const u8, profile: Profile) !Session {
+    pub fn init(keying_material: []const u8, profile: Profile) error{InvalidKeyingMaterial}!Session {
         const master_size, const salt_size = Profile.keysSize(profile);
         if (master_size + salt_size != keying_material.len) return error.InvalidKeyingMaterial;
 
@@ -165,61 +161,58 @@ pub const Session = struct {
         const master_salt = keying_material[master_size..];
 
         return .{
-            .io = io,
             .master_key = master_key,
             .salt = master_salt,
             .cipher = Cipher.init(profile, master_key, master_salt),
-            .rtp_ssrc_states = .init(allocator),
-            .rtcp_ssrc_states = .init(allocator),
-            .rw_lock = .init,
+            .rtp_ssrc_states = .empty,
+            .rtcp_ssrc_states = .empty,
         };
     }
 
-    pub fn deinit(session: *Session) void {
+    pub fn deinit(session: *Session, allocator: std.mem.Allocator) void {
         var it = session.rtp_ssrc_states.iterator();
-        while (it.next()) |entry| entry.value_ptr.deinit(session.rtp_ssrc_states.allocator);
-        session.rtp_ssrc_states.deinit();
+        while (it.next()) |entry| entry.value_ptr.deinit(allocator);
+        session.rtp_ssrc_states.deinit(allocator);
 
         var rtcp_it = session.rtcp_ssrc_states.iterator();
-        while (rtcp_it.next()) |entry| entry.value_ptr.deinit(session.rtcp_ssrc_states.allocator);
-        session.rtcp_ssrc_states.deinit();
+        while (rtcp_it.next()) |entry| entry.value_ptr.deinit(allocator);
+        session.rtcp_ssrc_states.deinit(allocator);
     }
 
     /// Encrypts an RTP packet using the SRTP session's cipher.
-    pub fn encryptRtp(session: *Session, rtp_data: []const u8, dst: []u8) EncryptError![]const u8 {
-        return try processRtp(session, rtp_data, dst, true);
+    pub fn encryptRtp(session: *Session, allocator: std.mem.Allocator, rtp_data: []const u8, dst: []u8) EncryptError![]const u8 {
+        return try processRtp(session, allocator, rtp_data, dst, true);
     }
 
     /// Encrypts an RTCP packet using the SRTP session's cipher.
-    pub fn encryptRtcp(session: *Session, rtcp_data: []const u8, dst: []u8) std.mem.Allocator.Error![]const u8 {
-        return try processRtcp(session, rtcp_data, dst, true);
+    pub fn encryptRtcp(session: *Session, allocator: std.mem.Allocator, rtcp_data: []const u8, dst: []u8) std.mem.Allocator.Error![]const u8 {
+        return try processRtcp(session, allocator, rtcp_data, dst, true);
     }
 
     /// Decrypts an RTP packet using the SRTP session's cipher.
-    pub fn decryptRtp(session: *Session, rtp_data: []const u8, dst: []u8) DecryptError![]const u8 {
-        return try processRtp(session, rtp_data, dst, false);
+    pub fn decryptRtp(session: *Session, allocator: std.mem.Allocator, rtp_data: []const u8, dst: []u8) DecryptError![]const u8 {
+        return try processRtp(session, allocator, rtp_data, dst, false);
     }
 
     /// Decrypts an RTCP packet using the SRTP session's cipher.
-    pub fn decryptRtcp(session: *Session, rtcp_data: []const u8, dst: []u8) ![]const u8 {
-        return try session.processRtcp(rtcp_data, dst, false);
+    pub fn decryptRtcp(session: *Session, allocator: std.mem.Allocator, rtcp_data: []const u8, dst: []u8) RtcpDecryptError![]const u8 {
+        return try session.processRtcp(allocator, rtcp_data, dst, false);
     }
 
-    fn processRtp(session: *Session, rtp_data: []const u8, dst: []u8, comptime encrypt: bool) ![]const u8 {
+    fn processRtp(session: *Session, allocator: std.mem.Allocator, rtp_data: []const u8, dst: []u8, comptime encrypt: bool) ![]const u8 {
         const rtp_packet = try rtp.Packet.parse(rtp_data);
         const header_size = rtp_data.len - rtp_packet.payload.len - rtp_packet.padding_size;
 
-        session.rw_lock.lockSharedUncancelable(session.io);
-        defer session.rw_lock.unlockShared(session.io);
         const entry = session.rtp_ssrc_states.getPtr(rtp_packet.header.ssrc);
 
-        var rtp_ssrc_state = entry orelse blk: {
-            var state = RtpSsrcState{
-                .replay_detector = try .init(session.rtp_ssrc_states.allocator, default_replay_detection_window),
+        var new_state: RtpSsrcState = undefined;
+        const rtp_ssrc_state = entry orelse blk: {
+            new_state = .{
+                .replay_detector = try .init(allocator, default_replay_detection_window),
             };
-            break :blk &state;
+            break :blk &new_state;
         };
-        errdefer if (entry == null) rtp_ssrc_state.deinit(session.rtp_ssrc_states.allocator);
+        errdefer if (entry == null) rtp_ssrc_state.deinit(allocator);
 
         const roc, const diff = rtp_ssrc_state.getRoc(rtp_packet.header.sequence_number);
         const packet_index = @as(u64, roc) << 16 | rtp_packet.header.sequence_number;
@@ -236,31 +229,25 @@ pub const Session = struct {
 
                 if (entry == null) {
                     @branchHint(.cold);
-                    session.rw_lock.unlockShared(session.io);
-                    session.rw_lock.lockUncancelable(session.io);
-                    defer {
-                        session.rw_lock.unlock(session.io);
-                        session.rw_lock.lockSharedUncancelable(session.io);
-                    }
-                    try session.rtp_ssrc_states.put(rtp_packet.header.ssrc, rtp_ssrc_state.*);
+                    try session.rtp_ssrc_states.put(allocator, rtp_packet.header.ssrc, rtp_ssrc_state.*);
                 }
                 return result;
             },
         }
     }
 
-    fn processRtcp(session: *Session, rtcp_data: []const u8, dst: []u8, comptime encrypt: bool) ![]const u8 {
+    fn processRtcp(session: *Session, allocator: std.mem.Allocator, rtcp_data: []const u8, dst: []u8, comptime encrypt: bool) ![]const u8 {
         if (!encrypt and rtcp_data.len < 8) return error.InvalidRtcp;
         const ssrc = std.mem.readInt(u32, rtcp_data[4..8], .big);
 
-        session.rw_lock.lockSharedUncancelable(session.io);
-        defer session.rw_lock.unlockShared(session.io);
         const entry = session.rtcp_ssrc_states.getPtr(ssrc);
-        var rtcp_ssrc_state = entry orelse blk: {
-            var state: RtcpSsrcState = .{ .replay_detector = try .init(session.rtcp_ssrc_states.allocator, 128) };
-            break :blk &state;
+
+        var new_state: RtcpSsrcState = undefined;
+        const rtcp_ssrc_state = entry orelse blk: {
+            new_state = .{ .replay_detector = try .init(allocator, 128) };
+            break :blk &new_state;
         };
-        errdefer if (entry == null) rtcp_ssrc_state.deinit(session.rtcp_ssrc_states.allocator);
+        errdefer if (entry == null) rtcp_ssrc_state.deinit(allocator);
 
         const index, const encrypted = if (encrypt) .{ rtcp_ssrc_state.index, false } else try session.getRtcpIndex(rtcp_data);
         if (!encrypt) try rtcp_ssrc_state.replay_detector.check(index);
@@ -282,13 +269,7 @@ pub const Session = struct {
 
         if (entry == null) {
             @branchHint(.cold);
-            session.rw_lock.unlockShared(session.io);
-            session.rw_lock.lockUncancelable(session.io);
-            defer {
-                session.rw_lock.unlock(session.io);
-                session.rw_lock.lockSharedUncancelable(session.io);
-            }
-            try session.rtcp_ssrc_states.put(ssrc, rtcp_ssrc_state.*);
+            try session.rtcp_ssrc_states.put(allocator, ssrc, rtcp_ssrc_state.*);
         }
 
         return result;
@@ -344,72 +325,72 @@ test {
 }
 
 test "init session" {
-    var srtp_session = try Session.init(testing.io, testing.allocator, test_keying_material, .AesCm128HmacSha1_80);
-    defer srtp_session.deinit();
+    var srtp_session = try Session.init(test_keying_material, .AesCm128HmacSha1_80);
+    defer srtp_session.deinit(testing.allocator);
 }
 
 test "init session: wrong keys size" {
     try testing.expectError(
         error.InvalidKeyingMaterial,
-        Session.init(testing.io, testing.allocator, "shortkeyhere", .AesCm128HmacSha1_80),
+        Session.init("shortkeyhere", .AesCm128HmacSha1_80),
     );
 }
 
 test "decrypt rtp: Aes128CmHmacSha1_80" {
-    var session = try Session.init(testing.io, testing.allocator, test_keying_material, .AesCm128HmacSha1_80);
-    defer session.deinit();
+    var session = try Session.init(test_keying_material, .AesCm128HmacSha1_80);
+    defer session.deinit(testing.allocator);
 
     var dest: [1024]u8 = @splat(0);
-    const decrypted = try session.decryptRtp(&encrypted_rtp_aes_128_cm_hmac1_80, &dest);
+    const decrypted = try session.decryptRtp(testing.allocator, &encrypted_rtp_aes_128_cm_hmac1_80, &dest);
     try testing.expectEqualSlices(u8, &plain_rtp_aes_128_cm_hmac1_80, decrypted);
     try testing.expectEqual(1, session.rtp_ssrc_states.count());
 
-    try testing.expectError(error.Replayed, session.decryptRtp(&encrypted_rtp_aes_128_cm_hmac1_80, &dest));
+    try testing.expectError(error.Replayed, session.decryptRtp(testing.allocator, &encrypted_rtp_aes_128_cm_hmac1_80, &dest));
 }
 
 test "decrypt rtcp: Aes128CmHmacSha1_80" {
-    var session = try Session.init(testing.io, testing.allocator, test_keying_material, .AesCm128HmacSha1_80);
-    defer session.deinit();
+    var session = try Session.init(test_keying_material, .AesCm128HmacSha1_80);
+    defer session.deinit(testing.allocator);
 
     var dest: [1024]u8 = @splat(0);
-    const decrypted = try session.decryptRtcp(&encrypted_rtcp_aes_128_cm_hmac1_80, &dest);
+    const decrypted = try session.decryptRtcp(testing.allocator, &encrypted_rtcp_aes_128_cm_hmac1_80, &dest);
     try testing.expectEqualSlices(u8, &plain_rtcp_aes_128_cm_hmac1_80, decrypted);
     try testing.expectEqual(1, session.rtcp_ssrc_states.count());
 
-    try testing.expectError(error.Replayed, session.decryptRtcp(&encrypted_rtcp_aes_128_cm_hmac1_80, &dest));
+    try testing.expectError(error.Replayed, session.decryptRtcp(testing.allocator, &encrypted_rtcp_aes_128_cm_hmac1_80, &dest));
 }
 
 test "encrypt rtcp: Aes128CmHmacSha1_80" {
-    var session = try Session.init(testing.io, testing.allocator, test_keying_material, .AesCm128HmacSha1_80);
-    defer session.deinit();
+    var session = try Session.init(test_keying_material, .AesCm128HmacSha1_80);
+    defer session.deinit(testing.allocator);
 
     var dest: [1024]u8 = @splat(0);
-    const decrypted = try session.encryptRtcp(&plain_rtcp_aes_128_cm_hmac1_80, &dest);
+    const decrypted = try session.encryptRtcp(testing.allocator, &plain_rtcp_aes_128_cm_hmac1_80, &dest);
     try testing.expectEqualSlices(u8, &encrypted_rtcp_aes_128_cm_hmac1_80, decrypted);
 }
 
 test "decrypt rtcp: packet too short is rejected" {
-    var session = try Session.init(testing.io, testing.allocator, test_keying_material, .AesCm128HmacSha1_80);
-    defer session.deinit();
+    var session = try Session.init(test_keying_material, .AesCm128HmacSha1_80);
+    defer session.deinit(testing.allocator);
 
     var dest: [64]u8 = @splat(0);
-    try testing.expectError(error.InvalidRtcp, session.decryptRtcp(&[_]u8{ 0x80, 0xC8, 0x00 }, &dest));
-    try testing.expectError(error.InvalidRtcp, session.decryptRtcp(&[_]u8{}, &dest));
+    try testing.expectError(error.InvalidRtcp, session.decryptRtcp(testing.allocator, &[_]u8{ 0x80, 0xC8, 0x00 }, &dest));
+    try testing.expectError(error.InvalidRtcp, session.decryptRtcp(testing.allocator, &[_]u8{}, &dest));
 }
 
 test "encrypt/decrypt rtcp: advancing indices round-trip" {
-    var sender = try Session.init(testing.io, testing.allocator, test_keying_material, .AesCm128HmacSha1_80);
-    defer sender.deinit();
+    var sender = try Session.init(test_keying_material, .AesCm128HmacSha1_80);
+    defer sender.deinit(testing.allocator);
 
-    var receiver = try Session.init(testing.io, testing.allocator, test_keying_material, .AesCm128HmacSha1_80);
-    defer receiver.deinit();
+    var receiver = try Session.init(test_keying_material, .AesCm128HmacSha1_80);
+    defer receiver.deinit(testing.allocator);
 
     var enc_dst: [1024]u8 = @splat(0);
     var dec_dst: [1024]u8 = @splat(0);
 
     for (0..10) |_| {
-        const encrypted = try sender.encryptRtcp(&plain_rtcp_aes_128_cm_hmac1_80, &enc_dst);
-        const decrypted = try receiver.decryptRtcp(encrypted, &dec_dst);
+        const encrypted = try sender.encryptRtcp(testing.allocator, &plain_rtcp_aes_128_cm_hmac1_80, &enc_dst);
+        const decrypted = try receiver.decryptRtcp(testing.allocator, encrypted, &dec_dst);
         try testing.expectEqualSlices(u8, &plain_rtcp_aes_128_cm_hmac1_80, decrypted);
     }
 }
@@ -448,8 +429,8 @@ test "encrypt/decrypt rtp" {
                 random.shuffle([1000]u8, &batch);
 
                 for (0..batch.len) |i| {
-                    const encrypted = try session.encryptRtp(&batch[i], &dst_enc);
-                    const decrypted = try session.decryptRtp(encrypted, &dst_dec);
+                    const encrypted = try session.encryptRtp(testing.allocator, &batch[i], &dst_enc);
+                    const decrypted = try session.decryptRtp(testing.allocator, encrypted, &dst_dec);
 
                     try testing.expectEqualSlices(u8, &batch[i], decrypted);
                 }
@@ -458,14 +439,14 @@ test "encrypt/decrypt rtp" {
     }.encrypt_decrypt;
 
     {
-        var session = try Session.init(testing.io, testing.allocator, test_keying_material, .AesCm128HmacSha1_80);
-        defer session.deinit();
+        var session = try Session.init(test_keying_material, .AesCm128HmacSha1_80);
+        defer session.deinit(testing.allocator);
         try assert_enc_dec(&session);
     }
 
     {
-        var session = try Session.init(testing.io, testing.allocator, test_keying_material, .AesCm128HmacSha1_32);
-        defer session.deinit();
+        var session = try Session.init(test_keying_material, .AesCm128HmacSha1_32);
+        defer session.deinit(testing.allocator);
         try assert_enc_dec(&session);
     }
 }
