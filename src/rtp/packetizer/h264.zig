@@ -83,7 +83,8 @@ pub const Iterator = struct {
 
         // Single nalu
         it.marker = reader.seek == reader.end;
-        return it.packetizer.rtp_config.newRtpPacket(it.marker, it.packet.pts, nalu);
+        @memcpy(out[0..nalu.len], nalu);
+        return it.packetizer.rtp_config.newRtpPacket(it.marker, it.packet.pts, out[0..nalu.len]);
     }
 };
 
@@ -113,6 +114,7 @@ test "h264 packetizer: single nalu" {
     try std.testing.expectEqual(90000, first.header.timestamp);
     try std.testing.expect(!first.header.marker);
     try std.testing.expectEqualSlices(u8, &nalu1, first.payload);
+    try std.testing.expectEqual(&out, first.payload.ptr);
 
     const second = try it.next(&out) orelse return error.TestUnexpectedNull;
     try std.testing.expectEqual(96, second.header.payload_type);
@@ -121,6 +123,7 @@ test "h264 packetizer: single nalu" {
     try std.testing.expectEqual(90000, second.header.timestamp);
     try std.testing.expect(second.header.marker);
     try std.testing.expectEqualSlices(u8, &nalu2, second.payload);
+    try std.testing.expectEqual(&out, second.payload.ptr);
 
     try std.testing.expectEqual(1002, packetizer.rtp_config.seq_number);
 
