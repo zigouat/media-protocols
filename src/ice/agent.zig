@@ -957,14 +957,13 @@ pub fn Agent(comptime config: struct {
             agent.responses.pushBack(resp) catch {};
         }
 
-        /// Returns the header size to reserve in front of data sent from `local` to `remote` and
-        /// the total frame size. The header size is 0 unless `local` is a TURN relay base.
+        /// Returns the header size and the total size of data given a payload length.
+        /// This is useful to only for Turn candidates to know how much space to reserve for the header.
         pub fn getDataFrameSize(agent: *Self, local: *const IpAddress, remote: *const IpAddress, payload_len: usize) struct { u32, usize } {
             const turn_client = agent.findTurnClient(local) orelse return .{ 0, payload_len };
             return turn_client.getDataFrameSize(remote, payload_len);
         }
 
-        /// Returns the address data sent from `local` must be sent to when `local` is a TURN relay base.
         pub fn getRelayServerAddress(agent: *Self, local: *const IpAddress) ?IpAddress {
             const turn_client = agent.findTurnClient(local) orelse return null;
             return turn_client.remote_addr;
