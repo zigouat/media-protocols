@@ -513,7 +513,11 @@ pub fn Agent(comptime config: struct {
                 const header_size, const size = turn_client.getDataFrameSize(remote, payload_len);
                 if (size > buffer.len) return error.WriteFailed;
                 turn_client.writeDataHeader(remote, buffer, payload_len);
-                @memset(buffer[header_size + payload_len .. size], 0);
+                const padding = buffer[header_size + payload_len .. size];
+                switch (padding.len) {
+                    inline 0...3 => |len| padding[0..len].* = @splat(0),
+                    else => unreachable,
+                }
                 return .{ .data = buffer[0..size], .from = local, .to = &turn_client.remote_addr };
             }
 
