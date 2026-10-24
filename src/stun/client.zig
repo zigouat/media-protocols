@@ -39,9 +39,8 @@ fn Transactions(comptime max_transactions: u32) type {
             self.items[idx] = self.items[last];
         }
 
-        fn find(self: *Self, tx_id: u96) ?usize {
-            const tx: [12]u8 = @bitCast(tx_id);
-            for (self.items[0..self.current_index], 0..) |tr, idx| if (std.mem.eql(u8, &tx, &tr.id)) return idx;
+        fn find(self: *Self, tx_id: [12]u8) ?usize {
+            for (self.items[0..self.current_index], 0..) |tr, idx| if (std.mem.eql(u8, &tx_id, &tr.id)) return idx;
             return null;
         }
 
@@ -94,7 +93,7 @@ pub fn Client(comptime config: ClientConfig) type {
         pub fn bindingRequest(c: *Self, now: i64) AllocError!void {
             const id = try c.transactions.add();
             const tr = &c.transactions.items[id];
-            tr.id = @bitCast(c.random.int(u96));
+            c.random.bytes(&tr.id);
             tr.attempt = 0;
             tr.deadline = now + base_rto;
             try c.transmits.pushBack(@intCast(id));
@@ -140,8 +139,7 @@ pub fn Client(comptime config: ClientConfig) type {
             var out = stun.Writer.init(buffer, .{});
             try out.writeHeader(.{
                 .message_type = .fromClassAndMethod(.request, .binding),
-                .transaction_id = @bitCast(tr.id),
-                .message_length = 0,
+                .transaction_id = tr.id,
             });
 
             return .{
@@ -180,22 +178,20 @@ fn testClient(random: std.Random) TestClient {
     return TestClient.init(.{ .local_addr = test_local_addr, .remote_addr = test_remote_addr, .random = random });
 }
 
-fn testBindingRequest(buffer: []u8, tx_id: u96) ![]const u8 {
+fn testBindingRequest(buffer: []u8, tx_id: [12]u8) ![]const u8 {
     var out = stun.Writer.init(buffer, .{});
     try out.writeHeader(.{
         .message_type = .fromClassAndMethod(.request, .binding),
         .transaction_id = tx_id,
-        .message_length = 0,
     });
     return out.final();
 }
 
-fn testBindingSuccessResponse(buffer: []u8, tx_id: u96, addr: IpAddress) ![]const u8 {
+fn testBindingSuccessResponse(buffer: []u8, tx_id: [12]u8, addr: IpAddress) ![]const u8 {
     var out = stun.Writer.init(buffer, .{});
     try out.writeHeader(.{
         .message_type = .fromClassAndMethod(.success_response, .binding),
         .transaction_id = tx_id,
-        .message_length = 0,
     });
     try out.writeAttribute(.{ .xor_mapped_address = addr });
     return out.final();
@@ -220,7 +216,7 @@ test "StunClient.bindingRequest: queues transmit and stores transaction" {
     const msg = try stun.Message.parse(tm.data);
     try testing.expectEqual(.request, msg.header.message_type.class());
     try testing.expectEqual(.binding, msg.header.message_type.method());
-    try testing.expectEqualSlices(u8, &tr.id, &@as([12]u8, @bitCast(msg.header.transaction_id)));
+    try testing.expectEqualSlices(u8, &tr.id, &msg.header.transaction_id);
 
     try testing.expectEqual(null, try client.pollTransmit(&buffer));
 }
@@ -237,7 +233,7 @@ test "StunClient.handleRead: matches pending transaction and emits mapped_addres
 
     const expected_addr: IpAddress = .{ .ip4 = .{ .bytes = .{ 192, 0, 2, 1 }, .port = 32853 } };
     var buf: [64]u8 = undefined;
-    _ = try client.handleRead(try testBindingSuccessResponse(&buf, @bitCast(tx_id), expected_addr));
+    _ = try client.handleRead(try testBindingSuccessResponse(&buf, tx_id, expected_addr));
 
     try testing.expectEqual(0, client.transactions.current_index);
     const event = client.pollEvent() orelse return error.ExpectedEvent;
@@ -250,7 +246,7 @@ test "StunClient.handleRead: unknown transaction produces no event" {
     var client = testClient(prng.random());
 
     var buf: [stun.header_size]u8 = undefined;
-    const processed = try client.handleRead(try testBindingRequest(&buf, 0xABC));
+    const processed = try client.handleRead(try testBindingRequest(&buf, @splat(0xAB)));
     try testing.expect(!processed);
     try testing.expectEqual(null, client.pollEvent());
 }
