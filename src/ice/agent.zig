@@ -957,6 +957,24 @@ pub fn Agent(comptime config: struct {
             agent.responses.pushBack(resp) catch {};
         }
 
+        pub fn handleWrite(agent: *Self, buffer: []u8, payload_len: usize) error{WriteFailed}!stun.TransportMessage {
+            const pair = agent.nominated_pair.?;
+            const local = &agent.candidates[pair.local].base;
+            const remote = &agent.remote_candidates[pair.remote].address;
+
+            if (agent.candidates[pair.local].candidate_type == .relay) {
+                if (agent.findTurnClient(local)) |turn_client| {
+                    _, const size = turn_client.getDataFrameSize(remote, payload_len);
+                    if (size > buffer.len) return error.WriteFailed;
+                    turn_client.writeDataHeader(remote, buffer, payload_len);
+                    return .{ .data = buffer[0..size], .from = local, .to = &turn_client.remote_addr };
+                }
+            }
+
+            if (payload_len > buffer.len) return error.WriteFailed;
+            return .{ .data = buffer[0..payload_len], .from = local, .to = remote };
+        }
+
         /// Returns the header size and the total size of data given a payload length.
         /// This is useful to only for Turn candidates to know how much space to reserve for the header.
         pub fn getDataFrameSize(agent: *Self, local: *const IpAddress, remote: *const IpAddress, payload_len: usize) struct { u32, usize } {
