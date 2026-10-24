@@ -304,6 +304,9 @@ pub fn Agent(comptime config: struct {
 
         /// Add a server queried from the `local` socket. Servers added while gathering
         /// is in progress are queried immediately.
+        ///
+        /// `local` must be a dedicated socket: host, server reflexive and relay candidates
+        /// never share the same base.
         pub fn addServer(agent: *Self, local: IpAddress, server: Server, now: i64) (AllocError || error{GatheringDone})!void {
             if (agent.gathering_done) return error.GatheringDone;
             const started = agent.gathering_state == .gathering;
@@ -331,13 +334,6 @@ pub fn Agent(comptime config: struct {
                     if (started) try startAllocation(turn_client, now);
                 },
             }
-        }
-
-        fn startAllocation(turn_client: *TurnClient, now: i64) AllocError!void {
-            turn_client.createAllocation(now) catch |err| switch (err) {
-                error.OutOfMemory => return error.OutOfMemory,
-                error.AllocationAlreadyExists => {},
-            };
         }
 
         pub fn setRemoteCredentials(agent: *Self, credentials: ice.Credentials, now: i64) (AllocError || error{CredentialsTooLong})!void {
@@ -504,6 +500,27 @@ pub fn Agent(comptime config: struct {
             }
         }
 
+        /// Frames application data for the nominated pair. Must be called after nomination.
+        ///
+        /// The payload must already be at `buffer[header_size..]`, see `getDataFrameSize`.
+        pub fn handleWrite(agent: *Self, buffer: []u8, payload_len: usize) error{WriteFailed}!stun.TransportMessage {
+            std.debug.assert(agent.nominated_pair != null);
+            const pair = agent.nominated_pair.?;
+            const local = &agent.candidates[pair.local].base;
+            const remote = &agent.remote_candidates[pair.remote].address;
+
+            if (agent.nominatedTurnClient()) |turn_client| {
+                const header_size, const size = turn_client.getDataFrameSize(remote, payload_len);
+                if (size > buffer.len) return error.WriteFailed;
+                turn_client.writeDataHeader(remote, buffer, payload_len);
+                @memset(buffer[header_size + payload_len .. size], 0);
+                return .{ .data = buffer[0..size], .from = local, .to = &turn_client.remote_addr };
+            }
+
+            if (payload_len > buffer.len) return error.WriteFailed;
+            return .{ .data = buffer[0..payload_len], .from = local, .to = remote };
+        }
+
         pub fn pollEvent(core: *Self) ?Event {
             return core.events_out.popFront();
         }
@@ -614,10 +631,26 @@ pub fn Agent(comptime config: struct {
             }
         }
 
+        /// Returns the header size and total frame size of a payload sent on the nominated pair.
+        /// The header size is non-zero only for relay candidates. Must be called after nomination.
+        pub fn getDataFrameSize(agent: *Self, payload_len: usize) struct { u32, usize } {
+            std.debug.assert(agent.nominated_pair != null);
+            const turn_client = agent.nominatedTurnClient() orelse return .{ 0, payload_len };
+            const remote = &agent.remote_candidates[agent.nominated_pair.?.remote].address;
+            return turn_client.getDataFrameSize(remote, payload_len);
+        }
+
         fn newTransactionId(agent: *Self) [12]u8 {
             var id: [12]u8 = undefined;
             agent.random.bytes(&id);
             return id;
+        }
+
+        fn startAllocation(turn_client: *TurnClient, now: i64) AllocError!void {
+            turn_client.createAllocation(now) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.AllocationAlreadyExists => {},
+            };
         }
 
         fn appendCandidate(core: *Self, candidate: Candidate) error{OutOfMemory}!CandidateIndex {
@@ -868,6 +901,12 @@ pub fn Agent(comptime config: struct {
             return null;
         }
 
+        fn nominatedTurnClient(agent: *Self) ?*TurnClient {
+            const local = &agent.candidates[agent.nominated_pair.?.local];
+            if (local.candidate_type != .relay) return null;
+            return agent.findTurnClient(&local.base) orelse unreachable;
+        }
+
         fn handleAppData(agent: *Self, sender: *const IpAddress, data: []const u8) ReadResult {
             switch (agent.connection_state) {
                 .connected, .completed, .disconnected => return .{ .app_data = data },
@@ -964,7 +1003,7 @@ pub fn Agent(comptime config: struct {
             buffer: []u8,
             data_len: usize,
         ) error{WriteFailed}!stun.TransportMessage {
-            const turn_client = agent.findTurnClient(local) orelse return stun.TransportMessage{
+            const turn_client = agent.findTurnClient(local) orelse return .{
                 .data = buffer[0..data_len],
                 .from = local,
                 .to = remote,
@@ -974,8 +1013,9 @@ pub fn Agent(comptime config: struct {
             if (size > buffer.len) return error.WriteFailed;
             @memmove(buffer[offset .. offset + data_len], buffer[0..data_len]);
             turn_client.writeDataHeader(remote, buffer, data_len);
+            @memset(buffer[offset + data_len .. size], 0);
 
-            return stun.TransportMessage{
+            return .{
                 .data = buffer[0..size],
                 .from = local,
                 .to = &turn_client.remote_addr,
@@ -2409,6 +2449,59 @@ test "handleTurnClientEvents: permission_failed marks the matching candidate pai
     _ = try core.handleRead(.{ .from = &server, .to = &local, .data = resp }, 0);
 
     try testing.expectEqual(.failed, core.pairs.items[0].status);
+}
+
+test "handleWrite: adds turn header in place and passes host data through" {
+    var agent = try testNewAgent(.controlling);
+    defer agent.deinit();
+
+    const local = try IpAddress.parse("10.0.0.10", 4000);
+    const host = try IpAddress.parse("10.0.0.11", 4000);
+    const server = try IpAddress.parse("203.0.113.1", 3478);
+    const relayed = try IpAddress.parse("203.0.113.1", 10900);
+    const remote = try IpAddress.parse("192.168.1.10", 1000);
+    try agent.addLocalAddrs(&.{host}, 0);
+    try agent.addServer(local, testTurnServer(server), 0);
+    try agent.addRemoteCandidate(.initHost(remote), 0);
+
+    // simulate a successful allocation so that the relay candidate is present
+    const relay_index = try agent.addLocalCandidate(.initRelay(local, relayed)) orelse return error.ExpectedCandidate;
+
+    const payload = "hello";
+    var buffer: [128]u8 = undefined;
+
+    {
+        agent.nominated_pair = .{ .local = 0, .remote = 0 };
+
+        const offset, const size = agent.getDataFrameSize(payload.len);
+        try testing.expectEqual(0, offset);
+        try testing.expectEqual(payload.len, size);
+
+        @memcpy(buffer[0..payload.len], payload);
+        const msg = try agent.handleWrite(&buffer, payload.len);
+        try testing.expectEqualSlices(u8, payload, msg.data);
+    }
+
+    agent.nominated_pair = .{ .local = relay_index, .remote = 0 };
+    const offset, const size = agent.getDataFrameSize(payload.len);
+    try testing.expectEqual(36, offset);
+
+    @memcpy(buffer[offset..][0..payload.len], payload);
+    const msg = try agent.handleWrite(&buffer, payload.len);
+    try testing.expectEqual(size, msg.data.len);
+    try testing.expectEqualSlices(u8, payload, msg.data[offset..][0..payload.len]);
+    try testing.expect(std.mem.allEqual(u8, msg.data[offset + payload.len ..], 0));
+    try testing.expect(msg.from.eql(&local));
+    try testing.expect(msg.to.eql(&server));
+
+    const indication = try stun.Message.parse(msg.data);
+    try testing.expectEqual(.send, indication.header.message_type.method());
+    try testing.expectEqual(.indication, indication.header.message_type.class());
+    var it = indication.iterateAttributes(&.{});
+    const attr = try it.next() orelse return error.ExpectedAttribute;
+    try testing.expect(attr.xor_peer_address.eql(&remote));
+
+    try testing.expectError(error.WriteFailed, agent.handleWrite(buffer[0 .. size - 1], payload.len));
 }
 
 test "handleTimeout: transitioning to completed keeps only the turn client backing the nominated pair" {
