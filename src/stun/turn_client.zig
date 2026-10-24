@@ -353,17 +353,21 @@ pub fn TurnClient(comptime config: Config) type {
             const header_size, const size = c.getDataFrameSize(peer, payload_len);
             std.debug.assert(buffer.len >= header_size);
 
-            var w = stun.Writer.init(buffer, .{});
+            const tx_id: [12]u8 = @splat(0);
+            var w: stun.Writer = .init(buffer[0..header_size], .{});
             w.writeHeader(.{
                 .message_type = .fromClassAndMethod(.indication, .send),
-                .transaction_id = @splat(0),
-            }) catch {};
-            w.writeAttribute(.{ .xor_peer_address = peer.* }) catch {};
+                .transaction_id = tx_id,
+            }) catch unreachable;
             std.mem.writeInt(u16, buffer[2..4], @intCast(size - stun.header_size), .big);
 
-            const len = w.writer.buffered().len;
-            std.mem.writeInt(u16, buffer[len..][0..2], @intFromEnum(stun.AttributeType.data), .big);
-            std.mem.writeInt(u16, buffer[len + 2 ..][0..2], @intCast(payload_len), .big);
+            const addr = buffer[stun.header_size + 4 .. header_size - 4];
+            std.mem.writeInt(u16, buffer[20..22], @intFromEnum(stun.AttributeType.xor_peer_address), .big);
+            std.mem.writeInt(u16, buffer[22..24], @intCast(addr.len), .big);
+            stun.Writer.writeIpAddress(addr, peer.*, &tx_id);
+
+            std.mem.writeInt(u16, buffer[header_size - 4 ..][0..2], @intFromEnum(stun.AttributeType.data), .big);
+            std.mem.writeInt(u16, buffer[header_size - 2 ..][0..2], @intCast(payload_len), .big);
         }
 
         pub fn pollTimeout(c: *Self) ?i64 {
@@ -1124,4 +1128,29 @@ test "TurnClient.refreshPermission: retries on stale nonce and drops permissions
     try std.testing.expectEqual(error.Forbidden, event.permission_refresh_failed);
     try std.testing.expectEqual(0, c.permissions.slice().len);
     try std.testing.expectEqual(null, c.pollTimeout());
+}
+
+test "TurnClient.writeDataHeader: matches a send indication built by stun.Writer" {
+    var r = std.Random.DefaultPrng.init(std.testing.random_seed);
+    var c = testClient(r.random());
+
+    const payload = "hello";
+    const peers = [_]IpAddress{
+        .{ .ip4 = .{ .bytes = .{ 192, 0, 2, 1 }, .port = 32853 } },
+        .{ .ip6 = .{ .bytes = .{ 0x20, 0x01, 0x0D, 0xB8, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12 }, .port = 32853 } },
+    };
+
+    for (&peers) |*peer| {
+        var expected_buf: [128]u8 = undefined;
+        var w = stun.Writer.init(&expected_buf, .{});
+        try writeHeader(&w, .indication, .send, @splat(0));
+        try w.writeAttributes(&.{ .{ .xor_peer_address = peer.* }, .{ .data = payload } });
+        const expected = w.final();
+
+        var buf: [128]u8 = @splat(0);
+        const header_size, const size = c.getDataFrameSize(peer, payload.len);
+        c.writeDataHeader(peer, &buf, payload.len);
+        @memcpy(buf[header_size..][0..payload.len], payload);
+        try std.testing.expectEqualSlices(u8, expected, buf[0..size]);
+    }
 }

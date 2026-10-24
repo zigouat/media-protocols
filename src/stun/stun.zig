@@ -530,9 +530,12 @@ pub const AttributeIterator = struct {
     }
 };
 
-/// A writer for Stun messages.
+/// A Stun writer over a fixed buffer.
+///
+/// Each header/attribute is bounds checked once, then written in place.
 pub const Writer = struct {
-    writer: Io.Writer,
+    buffer: []u8,
+    end: usize,
     options: WriterOptions,
 
     pub const Error = error{WriteFailed};
@@ -543,121 +546,142 @@ pub const Writer = struct {
     };
 
     pub fn init(buffer: []u8, options: WriterOptions) Writer {
-        return .{ .writer = .fixed(buffer), .options = options };
+        return .{ .buffer = buffer, .end = 0, .options = options };
     }
 
     /// Writes the header with a zero length; `final` patches it.
-    pub fn writeHeader(msg_writer: *Writer, header: Header) Error!void {
-        var w = &msg_writer.writer;
-        try w.writeInt(u16, @bitCast(header.message_type), .big);
-        try w.writeInt(u16, 0, .big);
-        try w.writeInt(u32, magic_cookie, .big);
-        try w.writeAll(&header.transaction_id);
+    pub fn writeHeader(w: *Writer, header: Header) Error!void {
+        const out = try w.reserve(header_size);
+        std.mem.writeInt(u16, out[0..2], @bitCast(header.message_type), .big);
+        std.mem.writeInt(u16, out[2..4], 0, .big);
+        std.mem.writeInt(u32, out[4..8], magic_cookie, .big);
+        out[8..20].* = header.transaction_id;
     }
 
-    pub fn writeRaw(msg_writer: *Writer, attr_type: AttributeType, content: [][]const u8) Error!void {
-        var w = &msg_writer.writer;
+    pub fn writeRaw(w: *Writer, attr_type: AttributeType, content: []const []const u8) Error!void {
+        var size: usize = 0;
+        for (content) |part| size += part.len;
 
-        try w.writeInt(u16, @intFromEnum(attr_type), .big);
-        const length = try w.writableArray(2);
-        const pos = w.end;
-        try msg_writer.writer.writeVecAll(content);
-
-        const attr_size: u16 = @intCast(w.end - pos);
-        const padding = switch (@rem(attr_size, 4)) {
-            0 => 0,
-            else => |v| 4 - v,
-        };
-        @memset(try w.writableSlice(padding), msg_writer.options.padding_byte);
-        std.mem.writeInt(u16, length, attr_size, .big);
+        const value = try w.reserveAttribute(attr_type, @intCast(size));
+        var pos: usize = 0;
+        for (content) |part| {
+            @memcpy(value[pos..][0..part.len], part);
+            pos += part.len;
+        }
+        @memset(value[size..], w.options.padding_byte);
     }
 
-    pub fn writeAttributes(msg_writer: *Writer, attributes: []const Attribute) Error!void {
-        for (attributes) |attribute| try msg_writer.writeAttribute(attribute);
+    pub fn writeAttributes(w: *Writer, attributes: []const Attribute) Error!void {
+        for (attributes) |attribute| try w.writeAttribute(attribute);
     }
 
-    pub fn writeAttribute(msg_writer: *Writer, attribute: Attribute) Error!void {
-        var out = &msg_writer.writer;
-
-        try out.writeInt(u16, @intFromEnum(attribute), .big);
-        try out.writeInt(u16, attribute.size(), .big);
+    pub fn writeAttribute(w: *Writer, attribute: Attribute) Error!void {
+        const size = attribute.size();
+        const value = try w.reserveAttribute(attribute, size);
         switch (attribute) {
-            .priority => |p| try out.writeInt(u32, p, .big),
-            .ice_controlled, .ice_controlling => |tie_breaker| try out.writeInt(u64, tie_breaker, .big),
-            .use_candidate => {},
-            .message_integrity => try msg_writer.writeMessageIntegrity(),
-            .fingerprint => try writeFingerprint(&msg_writer.writer),
-            .software, .username, .userhash, .realm, .nonce, .data => |slice| try out.writeAll(slice),
-            .mapped_address => |addr| try msg_writer.writeIpAddress(addr, false),
-            .xor_mapped_address, .xor_peer_address, .xor_relayed_address => |addr| try msg_writer.writeIpAddress(addr, true),
+            .priority, .lifetime => |v| std.mem.writeInt(u32, value[0..4], v, .big),
+            .ice_controlled, .ice_controlling, .reservation_token => |v| std.mem.writeInt(u64, value[0..8], v, .big),
+            .use_candidate, .dont_fragment, .unknown => {},
+            .message_integrity => w.writeMessageIntegrity(value[0..20]),
+            .fingerprint => w.writeFingerprint(value[0..4]),
+            .software, .username, .userhash, .realm, .nonce, .data => |slice| @memcpy(value[0..slice.len], slice),
+            .mapped_address => |addr| writeIpAddress(value, addr, null),
+            .xor_mapped_address, .xor_peer_address, .xor_relayed_address => |addr| {
+                writeIpAddress(value, addr, w.buffer[8..20]);
+            },
             .error_code => |err| {
                 const code = @intFromEnum(err.code);
-                try msg_writer.writer.writeInt(u32, @as(u32, code / 100) << 8 | (code % 100), .big);
-                try msg_writer.writer.writeAll(err.reason);
+                std.mem.writeInt(u32, value[0..4], @as(u32, code / 100) << 8 | (code % 100), .big);
+                @memcpy(value[4..][0..err.reason.len], err.reason);
             },
             .address_error_code => |err| {
                 const code = @intFromEnum(err.code);
-                try out.writeAll(&[_]u8{ familyByte(err.family), 0 });
-                try out.writeInt(u16, @as(u16, code / 100) << 8 | (code % 100), .big);
-                try out.writeAll(err.reason);
+                value[0..2].* = .{ familyByte(err.family), 0 };
+                std.mem.writeInt(u16, value[2..4], @as(u16, code / 100) << 8 | (code % 100), .big);
+                @memcpy(value[4..][0..err.reason.len], err.reason);
             },
-            .requested_transport => |transport| try out.writeAll(&[_]u8{ @intFromEnum(transport), 0, 0, 0 }),
+            .requested_transport => |transport| value[0..4].* = .{ @intFromEnum(transport), 0, 0, 0 },
             .channel_number => |ch| {
-                try out.writeInt(u16, ch, .big);
-                try out.writeAll(&[_]u8{ 0, 0 });
+                std.mem.writeInt(u16, value[0..2], ch, .big);
+                value[2..4].* = .{ 0, 0 };
             },
-            .lifetime => |seconds| try out.writeInt(u32, seconds, .big),
             .requested_address_family, .additional_address_family => |family| {
-                try out.writeAll(&[_]u8{ familyByte(family), 0, 0, 0 });
+                value[0..4].* = .{ familyByte(family), 0, 0, 0 };
             },
-            .even_port => |reserve| try out.writeByte(if (reserve) 0x80 else 0),
-            .dont_fragment => {},
-            .reservation_token => |token| try out.writeInt(u64, token, .big),
+            .even_port => |reserve_next| value[0] = if (reserve_next) 0x80 else 0,
             .icmp => |icmp| {
-                try out.writeAll(&[_]u8{ 0, 0, icmp.type, icmp.code });
-                try out.writeInt(u32, icmp.error_data, .big);
+                value[0..4].* = .{ 0, 0, icmp.type, icmp.code };
+                std.mem.writeInt(u32, value[4..8], icmp.error_data, .big);
             },
-            else => return,
         }
-
-        const padding = switch (@rem(out.end, 4)) {
-            0 => 0,
-            else => |v| 4 - v,
-        };
-        @memset(try out.writableSlice(padding), msg_writer.options.padding_byte);
+        @memset(value[size..], w.options.padding_byte);
     }
 
-    pub fn final(msg_writer: *Writer) []const u8 {
-        const result = msg_writer.writer.buffered();
-        const msg_length: u16 = @intCast(result.len - header_size);
-        std.mem.writeInt(u16, result[2..4], msg_length, .big);
+    pub fn final(w: *Writer) []const u8 {
+        const result = w.buffer[0..w.end];
+        std.mem.writeInt(u16, result[2..4], @intCast(w.end - header_size), .big);
         return result;
     }
 
-    fn writeMessageIntegrity(msg_writer: *Writer) Io.Writer.Error!void {
-        var w = &msg_writer.writer;
+    /// Writes an address attribute value; XORed with the magic cookie and `tx_id` when `tx_id` is set.
+    pub fn writeIpAddress(out: []u8, addr: Io.net.IpAddress, tx_id: ?*const [12]u8) void {
+        const cookie: [4]u8 = @bitCast(std.mem.nativeToBig(u32, magic_cookie));
+        const port_mask: u16 = if (tx_id != null) magic_cookie >> 16 else 0;
+        switch (addr) {
+            .ip4 => |ipv4| {
+                out[0..2].* = .{ 0, 1 };
+                std.mem.writeInt(u16, out[2..4], ipv4.port ^ port_mask, .big);
+                out[4..8].* = ipv4.bytes;
+                if (tx_id != null) for (out[4..8], cookie) |*b, c| {
+                    b.* ^= c;
+                };
+            },
+            .ip6 => |ipv6| {
+                out[0..2].* = .{ 0, 2 };
+                std.mem.writeInt(u16, out[2..4], ipv6.port ^ port_mask, .big);
+                out[4..20].* = ipv6.bytes;
+                if (tx_id) |id| for (out[4..20], cookie ++ id.*) |*b, k| {
+                    b.* ^= k;
+                };
+            },
+        }
+    }
 
-        const buf = w.buffered();
-        const hash = try w.writableArray(20);
-        const msg_length: u16 = @intCast(w.end - header_size); // 4 bytes of already written attribute header
+    fn reserve(w: *Writer, n: usize) Error![]u8 {
+        if (w.buffer.len - w.end < n) return error.WriteFailed;
+        defer w.end += n;
+        return w.buffer[w.end..][0..n];
+    }
 
-        var hasher = std.crypto.auth.hmac.HmacSha1.init(msg_writer.options.password.?);
-        hasher.update(buf[0..2]);
+    /// Writes the attribute type and length, returns the padded value slice.
+    fn reserveAttribute(w: *Writer, attr_type: AttributeType, size: u16) Error![]u8 {
+        const out = try w.reserve(4 + std.mem.alignForward(usize, size, 4));
+        std.mem.writeInt(u16, out[0..2], @intFromEnum(attr_type), .big);
+        std.mem.writeInt(u16, out[2..4], size, .big);
+        return out[4..];
+    }
+
+    // Both checks hash up to the attribute header, with the length covering the attribute.
+    fn writeMessageIntegrity(w: *Writer, hash: *[20]u8) void {
+        const attr_start = w.end - 24;
+        const msg_length: u16 = @intCast(w.end - header_size);
+
+        var hasher = std.crypto.auth.hmac.HmacSha1.init(w.options.password.?);
+        hasher.update(w.buffer[0..2]);
         hasher.update(&std.mem.toBytes(std.mem.nativeToBig(u16, msg_length)));
-        hasher.update(buf[4 .. buf.len - 4]);
+        hasher.update(w.buffer[4..attr_start]);
         hasher.final(hash);
     }
 
-    fn writeFingerprint(w: *Io.Writer) Io.Writer.Error!void {
-        const buf = w.buffered();
-        const msg_size: u16 = @intCast(buf.len - header_size + 4);
+    fn writeFingerprint(w: *Writer, out: *[4]u8) void {
+        const attr_start = w.end - 8;
+        const msg_length: u16 = @intCast(w.end - header_size);
 
         var hasher: std.hash.Crc32 = .init();
-        hasher.update(buf[0..2]);
-        hasher.update(&std.mem.toBytes(std.mem.nativeToBig(u16, msg_size)));
-        hasher.update(buf[4 .. buf.len - 4]);
-
-        try w.writeInt(u32, hasher.final() ^ fingerprint_xor, .big);
+        hasher.update(w.buffer[0..2]);
+        hasher.update(&std.mem.toBytes(std.mem.nativeToBig(u16, msg_length)));
+        hasher.update(w.buffer[4..attr_start]);
+        std.mem.writeInt(u32, out, hasher.final() ^ fingerprint_xor, .big);
     }
 
     fn familyByte(family: Io.net.IpAddress.Family) u8 {
@@ -665,42 +689,6 @@ pub const Writer = struct {
             .ip4 => 1,
             .ip6 => 2,
         };
-    }
-
-    fn writeIpAddress(msg_writer: *Writer, addr: Io.net.IpAddress, xor: bool) Io.Writer.Error!void {
-        var out = &msg_writer.writer;
-        const cookie = std.mem.toBytes(std.mem.nativeToBig(u32, magic_cookie));
-        switch (addr) {
-            .ip4 => |ipv4| {
-                try out.writeInt(u16, 1, .big);
-                if (xor) {
-                    const xor_port: u16 = ipv4.port ^ @as(u16, magic_cookie >> 16);
-                    try out.writeAll(&std.mem.toBytes(std.mem.nativeToBig(u16, xor_port)));
-
-                    const slice = try out.writableSlice(cookie.len);
-                    for (slice, 0..) |*b, idx| b.* = cookie[idx] ^ ipv4.bytes[idx];
-                } else {
-                    try out.writeInt(u16, ipv4.port, .big);
-                    try out.writeAll(&ipv4.bytes);
-                }
-            },
-            .ip6 => |ipv6| {
-                try out.writeInt(u16, 2, .big);
-                if (xor) {
-                    const xor_port: u16 = ipv6.port ^ @as(u16, magic_cookie >> 16);
-                    try out.writeAll(&std.mem.toBytes(std.mem.nativeToBig(u16, xor_port)));
-
-                    const slice = try out.writableSlice(ipv6.bytes.len);
-                    const txid = out.buffer[8..20];
-
-                    for (slice[0..4], 0..) |*b, idx| b.* = cookie[idx] ^ ipv6.bytes[idx];
-                    for (slice[4..], 0..) |*b, idx| b.* = txid[idx] ^ ipv6.bytes[idx];
-                } else {
-                    try out.writeInt(u16, ipv6.port, .big);
-                    try out.writeAll(&ipv6.bytes);
-                }
-            },
-        }
     }
 };
 
@@ -965,6 +953,31 @@ test "Writer: write mapped and xor mapped addresses" {
     try writer.writeAttribute(.{ .mapped_address = ipv6 });
     try writer.writeAttribute(.{ .xor_mapped_address = ipv4 });
     try testing.expectEqualSlices(u8, &expected, writer.final());
+}
+
+test "Writer: xor ipv6 round-trip and buffer overflow" {
+    const ipv6 = Io.net.IpAddress{ .ip6 = .{
+        .bytes = .{ 0x20, 0x01, 0x0D, 0xB8, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12 },
+        .port = 32853,
+    } };
+    const header: Header = .{
+        .message_type = .fromClassAndMethod(.request, .binding),
+        .transaction_id = rfc_5769_test_vector[8..20].*,
+    };
+
+    var buf: [128]u8 = undefined;
+    var out: Writer = .init(&buf, .{});
+    try out.writeHeader(header);
+    try out.writeAttributes(&.{ .{ .xor_mapped_address = ipv6 }, .{ .xor_peer_address = ipv6 } });
+    const msg = try Message.parse(out.final());
+    var it = msg.iterateAttributes(&.{});
+    try testing.expect((try it.next()).?.xor_mapped_address.eql(&ipv6));
+    try testing.expect((try it.next()).?.xor_peer_address.eql(&ipv6));
+
+    var small: [header_size + 4]u8 = undefined;
+    out = .init(&small, .{});
+    try out.writeHeader(header);
+    try testing.expectError(error.WriteFailed, out.writeAttribute(.{ .priority = 1 }));
 }
 
 test "Attribute: size" {
@@ -1431,7 +1444,7 @@ test "Message.iterateAttributes: invalid turn attributes" {
             .message_type = .fromClassAndMethod(.request, .allocate),
             .transaction_id = @splat(0),
         });
-        try out.writer.writeAll(attribute);
+        @memcpy(try out.reserve(attribute.len), attribute);
 
         const message = try Message.parse(out.final());
         var it = message.iterateAttributes(&.{});
