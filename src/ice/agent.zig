@@ -333,13 +333,6 @@ pub fn Agent(comptime config: struct {
             }
         }
 
-        fn startAllocation(turn_client: *TurnClient, now: i64) AllocError!void {
-            turn_client.createAllocation(now) catch |err| switch (err) {
-                error.OutOfMemory => return error.OutOfMemory,
-                error.AllocationAlreadyExists => {},
-            };
-        }
-
         pub fn setRemoteCredentials(agent: *Self, credentials: ice.Credentials, now: i64) (AllocError || error{CredentialsTooLong})!void {
             agent.remote_credentials = try .init(credentials.username, credentials.password);
             try agent.setConnectionState(.checking, now);
@@ -504,6 +497,22 @@ pub fn Agent(comptime config: struct {
             }
         }
 
+        pub fn handleWrite(agent: *Self, buffer: []u8, payload_len: usize) error{WriteFailed}!stun.TransportMessage {
+            const pair = agent.nominated_pair.?;
+            const local = &agent.candidates[pair.local].base;
+            const remote = &agent.remote_candidates[pair.remote].address;
+
+            if (agent.candidates[pair.local].candidate_type == .relay) if (agent.findTurnClient(local)) |turn_client| {
+                _, const size = turn_client.getDataFrameSize(remote, payload_len);
+                if (size > buffer.len) return error.WriteFailed;
+                turn_client.writeDataHeader(remote, buffer, payload_len);
+                return .{ .data = buffer[0..size], .from = local, .to = &turn_client.remote_addr };
+            };
+
+            if (payload_len > buffer.len) return error.WriteFailed;
+            return .{ .data = buffer[0..payload_len], .from = local, .to = remote };
+        }
+
         pub fn pollEvent(core: *Self) ?Event {
             return core.events_out.popFront();
         }
@@ -614,10 +623,24 @@ pub fn Agent(comptime config: struct {
             }
         }
 
+        /// Returns the header size and the total size of data given a payload length.
+        /// This is useful to only for Turn candidates to know how much space to reserve for the header.
+        pub fn getDataFrameSize(agent: *Self, local: *const IpAddress, remote: *const IpAddress, payload_len: usize) struct { u32, usize } {
+            const turn_client = agent.findTurnClient(local) orelse return .{ 0, payload_len };
+            return turn_client.getDataFrameSize(remote, payload_len);
+        }
+
         fn newTransactionId(agent: *Self) [12]u8 {
             var id: [12]u8 = undefined;
             agent.random.bytes(&id);
             return id;
+        }
+
+        fn startAllocation(turn_client: *TurnClient, now: i64) AllocError!void {
+            turn_client.createAllocation(now) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.AllocationAlreadyExists => {},
+            };
         }
 
         fn appendCandidate(core: *Self, candidate: Candidate) error{OutOfMemory}!CandidateIndex {
@@ -955,53 +978,6 @@ pub fn Agent(comptime config: struct {
         fn queueResponse(agent: *Self, resp: Response) void {
             // Drop on overflow, the peer will retransmit.
             agent.responses.pushBack(resp) catch {};
-        }
-
-        pub fn handleWrite(agent: *Self, buffer: []u8, payload_len: usize) error{WriteFailed}!stun.TransportMessage {
-            const pair = agent.nominated_pair.?;
-            const local = &agent.candidates[pair.local].base;
-            const remote = &agent.remote_candidates[pair.remote].address;
-
-            if (agent.candidates[pair.local].candidate_type == .relay) {
-                if (agent.findTurnClient(local)) |turn_client| {
-                    _, const size = turn_client.getDataFrameSize(remote, payload_len);
-                    if (size > buffer.len) return error.WriteFailed;
-                    turn_client.writeDataHeader(remote, buffer, payload_len);
-                    return .{ .data = buffer[0..size], .from = local, .to = &turn_client.remote_addr };
-                }
-            }
-
-            if (payload_len > buffer.len) return error.WriteFailed;
-            return .{ .data = buffer[0..payload_len], .from = local, .to = remote };
-        }
-
-        /// Returns the header size and the total size of data given a payload length.
-        /// This is useful to only for Turn candidates to know how much space to reserve for the header.
-        pub fn getDataFrameSize(agent: *Self, local: *const IpAddress, remote: *const IpAddress, payload_len: usize) struct { u32, usize } {
-            const turn_client = agent.findTurnClient(local) orelse return .{ 0, payload_len };
-            return turn_client.getDataFrameSize(remote, payload_len);
-        }
-
-        pub fn getRelayServerAddress(agent: *Self, local: *const IpAddress) ?IpAddress {
-            const turn_client = agent.findTurnClient(local) orelse return null;
-            return turn_client.remote_addr;
-        }
-
-        /// Writes the TURN header in front of a payload already placed at the header offset
-        /// returned by `getDataFrameSize` and returns the frame.
-        pub fn writeDataFrame(
-            agent: *Self,
-            local: *const IpAddress,
-            remote: *const IpAddress,
-            buffer: []u8,
-            payload_len: usize,
-        ) error{WriteFailed}![]const u8 {
-            const turn_client = agent.findTurnClient(local) orelse return buffer[0..payload_len];
-
-            _, const size = turn_client.getDataFrameSize(remote, payload_len);
-            if (size > buffer.len) return error.WriteFailed;
-            turn_client.writeDataHeader(remote, buffer, payload_len);
-            return buffer[0..size];
         }
 
         fn maybeWrapInTurnMessage(
@@ -2458,44 +2434,56 @@ test "handleTurnClientEvents: permission_failed marks the matching candidate pai
     try testing.expectEqual(.failed, core.pairs.items[0].status);
 }
 
-test "writeDataFrame: frames relayed data in place and passes host data through" {
-    var core = try testNewAgent(.controlling);
-    defer core.deinit();
+test "handleWrite: add turn header in place and passes host data through" {
+    var agent = try testNewAgent(.controlling);
+    defer agent.deinit();
 
     const local = try IpAddress.parse("10.0.0.10", 4000);
     const host = try IpAddress.parse("10.0.0.11", 4000);
     const server = try IpAddress.parse("203.0.113.1", 3478);
+    const relayed = try IpAddress.parse("203.0.113.1", 10900);
     const remote = try IpAddress.parse("192.168.1.10", 1000);
-    try core.addServer(local, testTurnServer(server), 0);
+    try agent.addLocalAddrs(&.{host}, 0);
+    try agent.addServer(local, testTurnServer(server), 0);
+    try agent.addRemoteCandidate(.initHost(remote), 0);
+
+    // simulate a successful allocation so that the relay candidate is present
+    const relay_index = try agent.addLocalCandidate(.initRelay(local, relayed)) orelse return error.ExpectedCandidate;
 
     const payload = "hello";
     var buffer: [128]u8 = undefined;
 
     {
-        const offset, const size = core.getDataFrameSize(&host, &remote, payload.len);
+        agent.nominated_pair = .{ .local = 0, .remote = 0 };
+
+        const offset, const size = agent.getDataFrameSize(&host, &remote, payload.len);
         try testing.expectEqual(0, offset);
         try testing.expectEqual(payload.len, size);
 
         @memcpy(buffer[0..payload.len], payload);
-        const frame = try core.writeDataFrame(&host, &remote, &buffer, payload.len);
-        try testing.expectEqualSlices(u8, payload, frame);
-        try testing.expectEqual(null, core.getRelayServerAddress(&host));
+        const msg = try agent.handleWrite(&buffer, payload.len);
+        try testing.expectEqualSlices(u8, payload, msg.data);
     }
 
-    const offset, const size = core.getDataFrameSize(&local, &remote, payload.len);
+    agent.nominated_pair = .{ .local = relay_index, .remote = 0 };
+    const offset, const size = agent.getDataFrameSize(&local, &remote, payload.len);
     try testing.expectEqual(36, offset);
 
     @memcpy(buffer[offset..][0..payload.len], payload);
-    const frame = try core.writeDataFrame(&local, &remote, &buffer, payload.len);
-    try testing.expectEqual(size, frame.len);
-    try testing.expect(core.getRelayServerAddress(&local).?.eql(&server));
-    try testing.expectEqualSlices(u8, payload, frame[offset..][0..payload.len]);
+    const msg = try agent.handleWrite(&buffer, payload.len);
+    try testing.expectEqual(size, msg.data.len);
+    try testing.expectEqualSlices(u8, payload, msg.data[offset..][0..payload.len]);
+    try testing.expect(msg.from.eql(&local));
+    try testing.expect(msg.to.eql(&server));
 
-    const indication = try stun.Message.parse(frame);
+    const indication = try stun.Message.parse(msg.data);
     try testing.expectEqual(.send, indication.header.message_type.method());
     try testing.expectEqual(.indication, indication.header.message_type.class());
+    var it = indication.iterateAttributes(&.{});
+    const attr = try it.next() orelse return error.ExpectedAttribute;
+    try testing.expect(attr.xor_peer_address.eql(&remote));
 
-    try testing.expectError(error.WriteFailed, core.writeDataFrame(&local, &remote, buffer[0 .. size - 1], payload.len));
+    try testing.expectError(error.WriteFailed, agent.handleWrite(buffer[0 .. size - 1], payload.len));
 }
 
 test "handleTimeout: transitioning to completed keeps only the turn client backing the nominated pair" {
