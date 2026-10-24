@@ -5,7 +5,7 @@ const ice = @import("ice.zig");
 const IpAddress = std.Io.net.IpAddress;
 
 pub const StunRequest = struct {
-    tx_id: u96 = 0,
+    tx_id: [12]u8 = @splat(0),
     username: []const u8 = &.{},
     ice_controlled: ?u64 = null,
     ice_controlling: ?u64 = null,
@@ -13,12 +13,11 @@ pub const StunRequest = struct {
     priority: u32 = 0,
 };
 
-pub fn builUnauthenticatedBindingRequest(buffer: []u8, tx_id: u96) ![]const u8 {
+pub fn builUnauthenticatedBindingRequest(buffer: []u8, tx_id: [12]u8) ![]const u8 {
     var w = stun.Writer.init(buffer, .{ .password = &.{} });
     try w.writeHeader(.{
         .message_type = .fromClassAndMethod(.request, .binding),
         .transaction_id = tx_id,
-        .message_length = 0,
     });
     return w.final();
 }
@@ -104,17 +103,11 @@ pub fn parseAndValidateStunResponse(msg: *const stun.Message, pass: []const u8) 
     return if (maybe_addr) |addr| addr else error.MissingMappedAddress;
 }
 
-pub fn buildSuccessResponse(
-    msg: *const stun.Message,
-    password: []const u8,
-    from: *const IpAddress,
-    buffer: []u8,
-) ![]const u8 {
+pub fn buildSuccessResponse(tx_id: [12]u8, password: []const u8, from: *const IpAddress, buffer: []u8) stun.Writer.Error![]const u8 {
     var w = stun.Writer.init(buffer, .{ .password = password });
     try w.writeHeader(.{
         .message_type = .fromClassAndMethod(.success_response, .binding),
-        .transaction_id = msg.header.transaction_id,
-        .message_length = 0,
+        .transaction_id = tx_id,
     });
     try w.writeAttribute(.{ .xor_mapped_address = from.* });
     try w.writeAttribute(.{ .message_integrity = &.{} });
@@ -122,25 +115,11 @@ pub fn buildSuccessResponse(
     return w.final();
 }
 
-pub fn buildSuccessResponse2(tx_id: [12]u8, password: []const u8, from: *const IpAddress, buffer: []u8) stun.Writer.Error![]const u8 {
-    var w = stun.Writer.init(buffer, .{ .password = password });
-    try w.writeHeader(.{
-        .message_type = .fromClassAndMethod(.success_response, .binding),
-        .transaction_id = @bitCast(tx_id),
-        .message_length = 0,
-    });
-    try w.writeAttribute(.{ .xor_mapped_address = from.* });
-    try w.writeAttribute(.{ .message_integrity = &.{} });
-    try w.writeAttribute(.fingerprint);
-    return w.final();
-}
-
-pub fn buildRoleConflictErrorMessage(transaction_id: u96, pwd: []const u8, buffer: []u8) stun.Writer.Error![]const u8 {
+pub fn buildRoleConflictErrorMessage(transaction_id: [12]u8, pwd: []const u8, buffer: []u8) stun.Writer.Error![]const u8 {
     var w = stun.Writer.init(buffer, .{ .password = pwd });
     try w.writeHeader(.{
         .message_type = .fromClassAndMethod(.error_response, .binding),
         .transaction_id = transaction_id,
-        .message_length = 0,
     });
     try w.writeAttribute(.{ .error_code = .{ .code = .role_conflict, .reason = "Role conflict" } });
     try w.writeAttribute(.{ .message_integrity = &.{} });
@@ -148,9 +127,9 @@ pub fn buildRoleConflictErrorMessage(transaction_id: u96, pwd: []const u8, buffe
     return w.final();
 }
 
-pub fn getMappedAddress(resp: []const u8, tx_id: u96) !IpAddress {
+pub fn getMappedAddress(resp: []const u8, tx_id: [12]u8) !IpAddress {
     const msg = try stun.Message.parse(resp);
-    if (msg.header.transaction_id != tx_id) return error.TransactionIdMismatch;
+    if (!std.mem.eql(u8, &msg.header.transaction_id, &tx_id)) return error.TransactionIdMismatch;
 
     switch (msg.header.message_type.class()) {
         .success_response => {
@@ -184,8 +163,7 @@ fn buildRequest(buffer: []u8, opts: RequestOptions) !stun.Message {
     var out = stun.Writer.init(buffer, .{ .password = test_password });
     try out.writeHeader(.{
         .message_type = .fromClassAndMethod(.request, .binding),
-        .transaction_id = 0x000102030405060708090A0B,
-        .message_length = 0,
+        .transaction_id = .{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11 },
     });
 
     if (opts.username) |u| try out.writeAttribute(.{ .username = u });
@@ -203,8 +181,7 @@ fn buildResponse(buffer: []u8, addr: ?IpAddress, message_integrity: bool, finger
     var out = stun.Writer.init(buffer, .{ .password = test_password });
     try out.writeHeader(.{
         .message_type = .fromClassAndMethod(.success_response, .binding),
-        .transaction_id = 0x000102030405060708090A0B,
-        .message_length = 0,
+        .transaction_id = .{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11 },
     });
 
     if (addr) |a| try out.writeAttribute(.{ .xor_mapped_address = a });

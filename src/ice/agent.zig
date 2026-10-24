@@ -513,8 +513,8 @@ pub fn Agent(comptime config: struct {
                 const remote = &agent.remote_candidates[resp.remote].address;
                 const password = agent.credentials.getPassword();
                 const payload = switch (resp.kind) {
-                    .success => try Messages.buildSuccessResponse2(resp.tx_id, password, remote, buffer),
-                    .role_conflict => try Messages.buildRoleConflictErrorMessage(@bitCast(resp.tx_id), password, buffer),
+                    .success => try Messages.buildSuccessResponse(resp.tx_id, password, remote, buffer),
+                    .role_conflict => try Messages.buildRoleConflictErrorMessage(resp.tx_id, password, buffer),
                 };
                 return try agent.maybeWrapInTurnMessage(
                     &agent.candidates[resp.local].base,
@@ -534,7 +534,7 @@ pub fn Agent(comptime config: struct {
 
             if (agent.consent_freshness) {
                 agent.consent_freshness = false;
-                const payload = try agent.buildBindingRequest(agent.random.int(u96), false, buffer);
+                const payload = try agent.buildBindingRequest(agent.newTransactionId(), false, buffer);
                 const local_candidate = &agent.candidates[agent.nominated_pair.?.local];
                 const remote_addr = &agent.remote_candidates[agent.nominated_pair.?.remote].address;
 
@@ -578,12 +578,11 @@ pub fn Agent(comptime config: struct {
             };
         }
 
-        pub fn buildBindingRequest(core: *Self, tx_id: u96, use_candidate: bool, buffer: []u8) error{WriteFailed}![]const u8 {
+        pub fn buildBindingRequest(core: *Self, tx_id: [12]u8, use_candidate: bool, buffer: []u8) error{WriteFailed}![]const u8 {
             var w = stun.Writer.init(buffer, .{ .password = core.remote_credentials.?.getPassword() });
             try w.writeHeader(.{
                 .message_type = .fromClassAndMethod(.request, .binding),
                 .transaction_id = tx_id,
-                .message_length = 0,
             });
 
             var username = [_][]const u8{ core.remote_credentials.?.getUsername(), ":", core.credentials.getUsername() };
@@ -613,6 +612,12 @@ pub fn Agent(comptime config: struct {
                 const remote = agent.getPairRemote(pair);
                 pair.priority = calculatePairPriority(local.priority, remote.priority, agent.role);
             }
+        }
+
+        fn newTransactionId(agent: *Self) [12]u8 {
+            var id: [12]u8 = undefined;
+            agent.random.bytes(&id);
+            return id;
         }
 
         fn appendCandidate(core: *Self, candidate: Candidate) error{OutOfMemory}!CandidateIndex {
@@ -833,7 +838,7 @@ pub fn Agent(comptime config: struct {
         }
 
         fn buildConnectivityCheckBindingRequest(agent: *Self, pair: *const CandidatePair, idx: u16, buffer: []u8) !?stun.TransportMessage {
-            const tx_id = agent.random.int(u96);
+            const tx_id = agent.newTransactionId();
             const local = agent.getPairLocal(pair);
             const remote = &agent.getPairRemote(pair).address;
 
@@ -851,7 +856,7 @@ pub fn Agent(comptime config: struct {
             );
 
             agent.pending_requests.append(agent.allocator, .{
-                .transaction_id = @bitCast(tx_id),
+                .transaction_id = tx_id,
                 .pair = idx,
             }) catch return null;
 
@@ -891,7 +896,7 @@ pub fn Agent(comptime config: struct {
             ) catch |err| switch (err) {
                 error.RoleConflict => return .{
                     .kind = .role_conflict,
-                    .tx_id = @bitCast(msg.header.transaction_id),
+                    .tx_id = msg.header.transaction_id,
                     .local = agent.findLocalBase(base_addr) orelse return error.NoLocalCandidate,
                     .remote = agent.findRemoteCandidate(from) orelse return null,
                 },
@@ -941,7 +946,7 @@ pub fn Agent(comptime config: struct {
             }
 
             return .{
-                .tx_id = @bitCast(msg.header.transaction_id),
+                .tx_id = msg.header.transaction_id,
                 .local = local_candidate,
                 .remote = remote_candidate,
             };
@@ -981,7 +986,7 @@ pub fn Agent(comptime config: struct {
             const pending_request = blk: {
                 const tx_id = msg.header.transaction_id;
                 for (core.pending_requests.items, 0..) |pr, i| {
-                    if (@as(u96, @bitCast(pr.transaction_id)) == tx_id) {
+                    if (std.mem.eql(u8, &pr.transaction_id, &tx_id)) {
                         const pending_request = core.pending_requests.swapRemove(i);
                         break :blk pending_request;
                     }
@@ -1030,7 +1035,7 @@ pub fn Agent(comptime config: struct {
                 .request => {
                     Messages.validateConsentFreshnessRequest(msg, agent.credentials.getPassword()) catch return null;
                     return .{
-                        .tx_id = @bitCast(msg.header.transaction_id),
+                        .tx_id = msg.header.transaction_id,
                         .local = agent.findLocalBase(to) orelse return null,
                         .remote = agent.findRemoteCandidate(from) orelse return null,
                     };
@@ -1151,8 +1156,7 @@ fn testBuildRequest(req: Messages.StunRequest, peer_password: []const u8, buffer
     var w = stun.Writer.init(buffer, .{ .password = peer_password });
     try w.writeHeader(.{
         .message_type = .fromClassAndMethod(.request, .binding),
-        .transaction_id = 0x000102030405060708090A0B,
-        .message_length = 0,
+        .transaction_id = .{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11 },
     });
     try w.writeAttribute(.{ .username = req.username });
     try w.writeAttribute(.{ .priority = req.priority });
@@ -1165,12 +1169,11 @@ fn testBuildRequest(req: Messages.StunRequest, peer_password: []const u8, buffer
     return try stun.Message.parse(w.final());
 }
 
-fn testBuildResponse(tx_id: u96, addr: IpAddress, password: []const u8, buffer: []u8) !stun.Message {
+fn testBuildResponse(tx_id: [12]u8, addr: IpAddress, password: []const u8, buffer: []u8) !stun.Message {
     var w = stun.Writer.init(buffer, .{ .password = password });
     try w.writeHeader(.{
         .message_type = .fromClassAndMethod(.success_response, .binding),
         .transaction_id = tx_id,
-        .message_length = 0,
     });
     try w.writeAttribute(.{ .xor_mapped_address = addr });
     try w.writeAttribute(.{ .message_integrity = &.{} });
@@ -1180,23 +1183,21 @@ fn testBuildResponse(tx_id: u96, addr: IpAddress, password: []const u8, buffer: 
 }
 
 /// Unauthenticated STUN binding success response, as stun.Client expects.
-fn testStunBindingResponse(buffer: []u8, tx_id: u96, addr: IpAddress) ![]const u8 {
+fn testStunBindingResponse(buffer: []u8, tx_id: [12]u8, addr: IpAddress) ![]const u8 {
     var w = stun.Writer.init(buffer, .{});
     try w.writeHeader(.{
         .message_type = .fromClassAndMethod(.success_response, .binding),
         .transaction_id = tx_id,
-        .message_length = 0,
     });
     try w.writeAttribute(.{ .xor_mapped_address = addr });
     return w.final();
 }
 
-fn testTurnAllocateSuccessResponse(buffer: []u8, tx_id: u96, relayed: IpAddress, mapped: IpAddress, lifetime: u32) ![]const u8 {
+fn testTurnAllocateSuccessResponse(buffer: []u8, tx_id: [12]u8, relayed: IpAddress, mapped: IpAddress, lifetime: u32) ![]const u8 {
     var w = stun.Writer.init(buffer, .{});
     try w.writeHeader(.{
         .message_type = .fromClassAndMethod(.success_response, .allocate),
         .transaction_id = tx_id,
-        .message_length = 0,
     });
     try w.writeAttributes(&.{
         .{ .xor_relayed_address = relayed },
@@ -1206,12 +1207,11 @@ fn testTurnAllocateSuccessResponse(buffer: []u8, tx_id: u96, relayed: IpAddress,
     return w.final();
 }
 
-fn testTurnChallengeResponse(buffer: []u8, tx_id: u96, method: stun.Method) ![]const u8 {
+fn testTurnChallengeResponse(buffer: []u8, tx_id: [12]u8, method: stun.Method) ![]const u8 {
     var w = stun.Writer.init(buffer, .{});
     try w.writeHeader(.{
         .message_type = .fromClassAndMethod(.error_response, method),
         .transaction_id = tx_id,
-        .message_length = 0,
     });
     try w.writeAttributes(&.{
         .{ .error_code = .{ .code = .unauthorized, .reason = "Unauthorized" } },
@@ -1221,12 +1221,11 @@ fn testTurnChallengeResponse(buffer: []u8, tx_id: u96, method: stun.Method) ![]c
     return w.final();
 }
 
-fn testTurnErrorResponse(buffer: []u8, tx_id: u96, method: stun.Method, code: stun.StunErrorCode, reason: []const u8) ![]const u8 {
+fn testTurnErrorResponse(buffer: []u8, tx_id: [12]u8, method: stun.Method, code: stun.StunErrorCode, reason: []const u8) ![]const u8 {
     var w = stun.Writer.init(buffer, .{});
     try w.writeHeader(.{
         .message_type = .fromClassAndMethod(.error_response, method),
         .transaction_id = tx_id,
-        .message_length = 0,
     });
     try w.writeAttribute(.{ .error_code = .{ .code = code, .reason = reason } });
     return w.final();
@@ -1236,8 +1235,7 @@ fn testTurnDataIndication(buffer: []u8, peer: IpAddress, data: []const u8) ![]co
     var w = stun.Writer.init(buffer, .{});
     try w.writeHeader(.{
         .message_type = .fromClassAndMethod(.indication, .data),
-        .transaction_id = 0,
-        .message_length = 0,
+        .transaction_id = @splat(0),
     });
     try w.writeAttribute(.{ .xor_peer_address = peer });
     try w.writeAttribute(.{ .data = data });
@@ -1869,12 +1867,12 @@ test "handleInput: success response completes the pending request and marks the 
     core.remote_candidates_len = 1;
     try core.pairs.append(testing.allocator, .{ .local = 0, .remote = 0, .status = .in_progress, .priority = 0 });
     try core.pending_requests.append(testing.allocator, .{
-        .transaction_id = @bitCast(@as(u96, 0x2)),
+        .transaction_id = @splat(2),
         .pair = 0,
     });
 
     var buffer: [1024]u8 = undefined;
-    const msg = try testBuildResponse(0x2, base_addr, core.remote_credentials.?.getPassword(), &buffer);
+    const msg = try testBuildResponse(@splat(2), base_addr, core.remote_credentials.?.getPassword(), &buffer);
 
     _ = try core.handleRead(.{ .from = &from, .to = &base_addr, .data = msg.bytes }, 0);
 
@@ -1905,12 +1903,12 @@ test "handleInput: success response nominates the pair and transitions to connec
         .nominate_on_binding = true,
     });
     try core.pending_requests.append(testing.allocator, .{
-        .transaction_id = @bitCast(@as(u96, 0x2)),
+        .transaction_id = @splat(2),
         .pair = 0,
     });
 
     var buffer: [1024]u8 = undefined;
-    const msg = try testBuildResponse(0x2, base_addr, core.remote_credentials.?.getPassword(), &buffer);
+    const msg = try testBuildResponse(@splat(2), base_addr, core.remote_credentials.?.getPassword(), &buffer);
 
     _ = try core.handleRead(.{ .from = &from, .to = &base_addr, .data = msg.bytes }, 0);
 
@@ -2027,7 +2025,7 @@ test "handleTimeout: connected transitions to completed once keep_alive_deadline
     core.remote_candidates_len = 1;
     core.nominated_pair = .{ .local = 0, .remote = 0 };
     try core.pairs.append(testing.allocator, .{ .local = 0, .remote = 0, .status = .succeeded, .priority = 0 });
-    try core.pending_requests.append(testing.allocator, .{ .transaction_id = @bitCast(@as(u96, 0x1)), .pair = 0 });
+    try core.pending_requests.append(testing.allocator, .{ .transaction_id = @splat(1), .pair = 0 });
 
     try core.handleTimeout(1000);
 
@@ -2438,7 +2436,7 @@ test "handleTimeout: transitioning to completed keeps only the turn client backi
     core.remote_candidates_len = 1;
     core.nominated_pair = .{ .local = 0, .remote = 0 };
     try core.pairs.append(testing.allocator, .{ .local = 0, .remote = 0, .status = .succeeded, .priority = 0 });
-    try core.pending_requests.append(testing.allocator, .{ .transaction_id = @bitCast(@as(u96, 0x1)), .pair = 0 });
+    try core.pending_requests.append(testing.allocator, .{ .transaction_id = @splat(1), .pair = 0 });
 
     try core.handleTimeout(1000);
 
