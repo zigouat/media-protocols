@@ -530,19 +530,22 @@ pub fn Agent(comptime config: struct {
         }
 
         pub fn pollTransmit(agent: *Self, buffer: []u8) error{WriteFailed}!?stun.TransportMessage {
-            if (agent.responses.popFront()) |resp| {
+            if (agent.responses.peekFront()) |resp| {
                 const remote = &agent.remote_candidates[resp.remote].address;
                 const password = agent.credentials.getPassword();
                 const payload = switch (resp.kind) {
                     .success => try Messages.buildSuccessResponse(resp.tx_id, password, remote, buffer),
                     .role_conflict => try Messages.buildRoleConflictErrorMessage(resp.tx_id, password, buffer),
                 };
-                return try agent.maybeWrapInTurnMessage(
+                const result = try agent.maybeWrapInTurnMessage(
                     &agent.candidates[resp.local].base,
                     remote,
                     buffer,
                     payload.len,
                 );
+
+                _ = agent.responses.popFront();
+                return result;
             }
 
             for (agent.stun_clients.items) |*stun_client| if (try stun_client.pollTransmit(buffer)) |msg| {
@@ -554,17 +557,19 @@ pub fn Agent(comptime config: struct {
             };
 
             if (agent.consent_freshness) {
-                agent.consent_freshness = false;
                 const payload = try agent.buildBindingRequest(agent.newTransactionId(), false, buffer);
                 const local_candidate = &agent.candidates[agent.nominated_pair.?.local];
                 const remote_addr = &agent.remote_candidates[agent.nominated_pair.?.remote].address;
 
-                return try agent.maybeWrapInTurnMessage(
+                const result = try agent.maybeWrapInTurnMessage(
                     &local_candidate.base,
                     remote_addr,
                     buffer,
                     payload.len,
                 );
+
+                agent.consent_freshness = false;
+                return result;
             }
 
             return try agent.nextConnectivityCheck(buffer);
@@ -836,42 +841,34 @@ pub fn Agent(comptime config: struct {
             if (check.done) return null;
 
             if (!check.nomination_done) {
-                check.nomination_done = true;
-                if (agent.selected_pair) |selected_idx| {
-                    const pair = &agent.pairs.items[selected_idx];
-                    if (try agent.buildConnectivityCheckBindingRequest(
-                        pair,
-                        selected_idx,
-                        buffer,
-                    )) |msg| return msg;
+                if (agent.selected_pair) |idx| {
+                    if (try agent.buildConnectivityCheckBindingRequest(&agent.pairs.items[idx], idx, buffer)) |msg| return msg;
                 }
+                check.nomination_done = true;
             }
 
             while (check.index < agent.pairs.items.len) {
-                const idx = check.index;
-                const pair = &agent.pairs.items[idx];
+                const msg = try agent.checkPair(check.index, buffer);
                 check.index += 1;
-                switch (pair.status) {
-                    .waiting, .in_progress => {
-                        pair.conn_check_count += 1;
-                        if (pair.conn_check_count > max_binding_requests) {
-                            pair.status = .failed;
-                            continue;
-                        }
-
-                        const msg = (try agent.buildConnectivityCheckBindingRequest(
-                            pair,
-                            idx,
-                            buffer,
-                        )) orelse continue;
-                        return msg;
-                    },
-                    else => {},
-                }
+                if (msg) |m| return m;
             }
 
             check.done = true;
             return null;
+        }
+
+        /// Builds the next binding request for the pair, or null if it's not checkable.
+        fn checkPair(agent: *Self, idx: u16, buffer: []u8) !?stun.TransportMessage {
+            const pair = &agent.pairs.items[idx];
+            if (pair.status != .waiting and pair.status != .in_progress) return null;
+            if (pair.conn_check_count >= max_binding_requests) {
+                pair.status = .failed;
+                return null;
+            }
+
+            const msg = (try agent.buildConnectivityCheckBindingRequest(pair, idx, buffer)) orelse return null;
+            pair.conn_check_count += 1;
+            return msg;
         }
 
         fn buildConnectivityCheckBindingRequest(agent: *Self, pair: *const CandidatePair, idx: u16, buffer: []u8) !?stun.TransportMessage {
@@ -1489,6 +1486,30 @@ test "addLocalCandidate: forms pairs with existing remote candidates" {
     try testing.expectEqual(2, core.pairs.items.len);
 }
 
+test "addLocalCandidate: skips pairing across differing address families" {
+    var core = try testNewAgent(.controlling);
+    defer core.deinit();
+
+    try core.addRemoteCandidate(Candidate.initHost(try IpAddress.parse("192.168.1.10", 1000)), 0);
+
+    try core.addLocalAddrs(&.{try IpAddress.parse("2001:db8::1", 2000)}, 0);
+    while (core.pollEvent()) |_| {}
+    try testing.expectEqual(0, core.pairs.items.len);
+
+    try core.addLocalAddrs(&.{try IpAddress.parse("10.0.0.1", 2001)}, 0);
+    try testing.expectEqual(1, core.pairs.items.len);
+}
+
+test "addLocalCandidate: reports whether the candidate was added" {
+    var core = try testNewAgent(.controlling);
+    defer core.deinit();
+
+    const candidate = Candidate.initHost(try IpAddress.parse("10.0.0.1", 2000));
+    try testing.expect(try core.addLocalCandidate(candidate) != null);
+    try testing.expectEqual(null, try core.addLocalCandidate(candidate));
+    try testing.expectEqual(1, core.candidates_len);
+}
+
 test "addRemoteCandidate: forms pairs with existing local candidates" {
     var core = try testNewAgent(.controlling);
     defer core.deinit();
@@ -1525,28 +1546,30 @@ test "addRemoteCandidate: skips pairing across differing address families" {
     try testing.expectEqual(1, core.pairs.items.len);
 }
 
-test "addLocalCandidate: skips pairing across differing address families" {
+test "addRemoteCandidate: pairs with a relay candidate and creates a permission" {
+    var tx_buf: [1024]u8 = undefined;
     var core = try testNewAgent(.controlling);
     defer core.deinit();
 
-    try core.addRemoteCandidate(Candidate.initHost(try IpAddress.parse("192.168.1.10", 1000)), 0);
+    const local = try IpAddress.parse("10.0.0.10", 4000);
+    const server = try IpAddress.parse("203.0.113.1", 3478);
+    const relayed = try IpAddress.parse("203.0.113.9", 40000);
 
-    try core.addLocalAddrs(&.{try IpAddress.parse("2001:db8::1", 2000)}, 0);
-    while (core.pollEvent()) |_| {}
-    try testing.expectEqual(0, core.pairs.items.len);
+    try core.addServer(local, testTurnServer(server), 0);
+    _ = try core.addLocalCandidate(.initRelay(local, relayed));
 
-    try core.addLocalAddrs(&.{try IpAddress.parse("10.0.0.1", 2001)}, 0);
+    const remote = try IpAddress.parse("192.168.1.10", 1000);
+    try core.addRemoteCandidate(Candidate.initHost(remote), 0);
+
     try testing.expectEqual(1, core.pairs.items.len);
-}
 
-test "addLocalCandidate: reports whether the candidate was added" {
-    var core = try testNewAgent(.controlling);
-    defer core.deinit();
+    const out = (try core.pollTransmit(&tx_buf)) orelse return error.ExpectedTransmit;
+    const msg = try stun.Message.parse(out.data);
+    try testing.expectEqual(.create_permission, msg.header.message_type.method());
 
-    const candidate = Candidate.initHost(try IpAddress.parse("10.0.0.1", 2000));
-    try testing.expect(try core.addLocalCandidate(candidate) != null);
-    try testing.expectEqual(null, try core.addLocalCandidate(candidate));
-    try testing.expectEqual(1, core.candidates_len);
+    var it = msg.iterateAttributes(&.{});
+    const attr = try it.next() orelse return error.ExpectedAttribute;
+    try testing.expect(attr.xor_peer_address.eql(&remote));
 }
 
 test "addServerReflexiveCandidate: skips candidate redundant with host" {
@@ -1618,6 +1641,25 @@ test "addServer/addLocalAddrs: queues a stun binding request per server and repo
     try testing.expectEqual(null, (try core.pollTransmit(&tx_buf)));
     try testing.expectEqual(.gathering, core.gathering_state);
     try testing.expectEqual(100 + stun.Client.Client(.{}).base_rto, core.pollTimeout());
+}
+
+test "addServer/addLocalAddrs: turn server queues an allocate request and keeps gathering incomplete until it resolves" {
+    var tx_buf: [1024]u8 = undefined;
+    var core = try testNewAgent(.controlling);
+    defer core.deinit();
+
+    const local = try IpAddress.parse("10.0.0.10", 4000);
+    const server = try IpAddress.parse("203.0.113.1", 3478);
+
+    try core.addServer(local, testTurnServer(server), 0);
+    try core.addLocalAddrs(&.{}, 0);
+
+    const tm = (try core.pollTransmit(&tx_buf)) orelse return error.ExpectedTransmit;
+    try testing.expect(tm.from.eql(&local));
+    try testing.expect(tm.to.eql(&server));
+    try testing.expectEqual(null, (try core.pollTransmit(&tx_buf)));
+
+    try testing.expectEqual(.gathering, core.gathering_state);
 }
 
 test "addServer: deferred before gathering, sent during, rejected once done" {
@@ -1702,6 +1744,59 @@ test "handleRead: stun server resolves to reflexive candidate; duplicate mapped 
     try testing.expectEqual(null, agent.pollEvent());
 }
 
+test "handleRead: unwraps a TURN data indication before further processing" {
+    var core = try testNewAgent(.controlled);
+    defer core.deinit();
+
+    const local = try IpAddress.parse("10.0.0.10", 4000);
+    const server = try IpAddress.parse("203.0.113.1", 3478);
+    const relayed = try IpAddress.parse("203.0.113.9", 40000);
+    const peer = try IpAddress.parse("192.168.1.120", 2000);
+
+    try core.addServer(local, testTurnServer(server), 0);
+
+    core.candidates[0] = .initRelay(local, relayed);
+    core.candidates_len = 1;
+    core.remote_candidates[0] = testRemoteCandidate(peer);
+    core.remote_candidates_len = 1;
+    try core.pairs.append(testing.allocator, .{
+        .local = 0,
+        .remote = 0,
+        .status = .in_progress,
+        .priority = 0,
+    });
+
+    var buffer: [1024]u8 = undefined;
+    var indication_buf: [1024]u8 = undefined;
+    var resp_buffer: [1024]u8 = undefined;
+
+    {
+        const inner = try testBuildRequest(.{
+            .ice_controlling = 0x10000,
+            .priority = 0x9090,
+            .username = core.credentials.getUsername(),
+        }, core.credentials.getPassword(), &buffer);
+
+        const indication = try testTurnDataIndication(&indication_buf, peer, inner.bytes);
+
+        const result = try core.handleRead(.{ .from = &server, .to = &local, .data = indication }, 0);
+        try testing.expectEqual(.consumed, std.meta.activeTag(result));
+
+        const tm = (try core.pollTransmit(&resp_buffer)) orelse return error.ExpectedTransmit;
+        try testing.expect(tm.from.eql(&local));
+        try testing.expect(tm.to.eql(&server));
+    }
+
+    {
+        const indication = try testTurnDataIndication(&indication_buf, peer, "hello");
+        const result = try core.handleRead(.{ .from = &server, .to = &local, .data = indication }, 0);
+        switch (result) {
+            .app_data => |data| try testing.expectEqualStrings("hello", data),
+            .consumed => return error.UnexpectedResult,
+        }
+    }
+}
+
 test "handleTimeout: stun server failure removes it and completes gathering" {
     var tx_buf: [1024]u8 = undefined;
     var agent = try testNewAgent(.controlling);
@@ -1723,6 +1818,227 @@ test "handleTimeout: stun server failure removes it and completes gathering" {
 
     try testing.expectEqual(0, agent.stun_clients.items.len);
     try testing.expectEqual(.complete, agent.gathering_state);
+}
+
+test "handleTimeout: new connection starts checking and schedules a connectivity check" {
+    var core = try testNewAgent(.controlled);
+    defer core.deinit();
+
+    const failed_timeout: i64 = core.timers.failed_timeout;
+    const connectivity_check_interval: i64 = core.timers.connectivity_check_interval;
+    try core.setRemoteCredentials(.{ .username = "peer", .password = "peer-password-0123456789" }, 0);
+
+    try testing.expectEqual(connectivity_check_interval, core.connectivity_check_deadline);
+    try testing.expectEqual(failed_timeout, core.disconnected_connection_deadline);
+
+    try expectConnectionStateEvent(&core, .checking);
+    try testing.expectEqual(null, core.pollEvent());
+
+    try core.handleTimeout(connectivity_check_interval);
+    try testing.expect(!core.connectivity_check.done);
+    try testing.expectEqual(null, core.pollEvent());
+}
+
+test "handleTimeout: checking sends a connectivity_check every interval" {
+    var core = try testNewAgent(.controlled);
+    defer core.deinit();
+
+    const connectivity_check_interval: i64 = core.timers.connectivity_check_interval;
+    try core.setRemoteCredentials(.{ .username = "peer", .password = "peer-password-0123456789" }, 0);
+    _ = core.pollEvent(); // .checking
+
+    try core.handleTimeout(100);
+    try testing.expectEqual(null, core.pollEvent());
+
+    try core.handleTimeout(connectivity_check_interval);
+    try testing.expectEqual(connectivity_check_interval * 2, core.connectivity_check_deadline);
+    try testing.expect(!core.connectivity_check.done);
+    try testing.expectEqual(null, core.pollEvent());
+}
+
+test "handleTimeout: checking fails after failed_timeout without connecting" {
+    var agent = try testNewAgent(.controlled);
+    defer agent.deinit();
+
+    const failed_timeout: i64 = agent.timers.failed_timeout;
+    try agent.setRemoteCredentials(.{ .username = "peer", .password = "peer-password-0123456789" }, 0);
+    _ = agent.pollEvent(); // .checking
+
+    try agent.handleTimeout(failed_timeout);
+
+    try testing.expectEqual(.failed, agent.connection_state);
+    try testing.expectEqual(std.math.maxInt(i64), agent.disconnected_connection_deadline);
+
+    try testing.expect(!agent.connectivity_check.done);
+    try expectConnectionStateEvent(&agent, .failed);
+    try testing.expectEqual(null, agent.pollEvent());
+
+    try agent.handleTimeout(failed_timeout + 1000);
+    try testing.expectEqual(null, agent.pollEvent());
+}
+
+test "handleTimeout: connected transitions to completed once keep_alive_deadline elapses and clears the checklist" {
+    var tx_buf: [1024]u8 = undefined;
+    var core = try testNewAgent(.controlling);
+    defer core.deinit();
+
+    core.connection_state = .connected;
+    core.connectivity_check_deadline = 100_000;
+    core.disconnected_connection_deadline = 100_000;
+    core.keep_alive_deadline = 1000;
+    core.remote_credentials = try .init("ruser", "peer-password-0123456789");
+
+    core.candidates[0] = .initHost(try IpAddress.parse("192.168.1.100", 1000));
+    core.candidates_len = 1;
+    const from = try IpAddress.parse("192.168.1.120", 2000);
+    core.remote_candidates[0] = testRemoteCandidate(from);
+    core.remote_candidates_len = 1;
+    core.nominated_pair = .{ .local = 0, .remote = 0 };
+    try core.pairs.append(testing.allocator, .{ .local = 0, .remote = 0, .status = .succeeded, .priority = 0 });
+    try core.pending_requests.append(testing.allocator, .{ .transaction_id = @splat(1), .pair = 0 });
+
+    try core.handleTimeout(1000);
+
+    try testing.expectEqual(.completed, core.connection_state);
+    try testing.expectEqual(1, core.remote_candidates_len);
+    try testing.expectEqual(0, core.pairs.items.len);
+    try testing.expectEqual(0, core.pending_requests.items.len);
+    try testing.expectEqual(1000 + keep_alive_interval, core.keep_alive_deadline);
+
+    try expectConnectionStateEvent(&core, .completed);
+    try testing.expectEqual(null, core.pollEvent());
+
+    const tm = (try core.pollTransmit(&tx_buf)) orelse return error.ExpectedTransmit;
+    const msg = try stun.Message.parse(tm.data);
+    try testing.expectEqual(.request, msg.header.message_type.class());
+    try testing.expectEqual(.binding, msg.header.message_type.method());
+    try testing.expect(tm.from.eql(&core.candidates[0].base));
+    try testing.expect(tm.to.eql(&from));
+    try testing.expectEqual(null, (try core.pollTransmit(&tx_buf)));
+}
+
+test "handleTimeout: completed/disconnected request consent freshness without changing state" {
+    var tx_buf: [1024]u8 = undefined;
+    for ([_]ice.ConnectionState{ .completed, .disconnected }) |state| {
+        var core = try testNewAgent(.controlling);
+        defer core.deinit();
+
+        core.connection_state = state;
+        core.disconnected_connection_deadline = 100_000;
+        core.keep_alive_deadline = 1000;
+        core.remote_credentials = try .init("ruser", "peer-password-0123456789");
+
+        core.candidates[0] = .initHost(try IpAddress.parse("192.168.1.100", 1000));
+        core.candidates_len = 1;
+        const from = try IpAddress.parse("192.168.1.120", 2000);
+        core.remote_candidates[0] = testRemoteCandidate(from);
+        core.remote_candidates_len = 1;
+        core.nominated_pair = .{ .local = 0, .remote = 0 };
+
+        try core.handleTimeout(1000);
+
+        try testing.expectEqual(state, core.connection_state);
+        try testing.expectEqual(1000 + keep_alive_interval, core.keep_alive_deadline);
+        try testing.expectEqual(null, core.pollEvent());
+
+        const tm = (try core.pollTransmit(&tx_buf)) orelse return error.ExpectedTransmit;
+        const msg = try stun.Message.parse(tm.data);
+        try testing.expectEqual(.request, msg.header.message_type.class());
+        try testing.expectEqual(.binding, msg.header.message_type.method());
+        try testing.expect(tm.from.eql(&core.candidates[0].base));
+        try testing.expect(tm.to.eql(&from));
+        try testing.expectEqual(null, (try core.pollTransmit(&tx_buf)));
+    }
+}
+
+test "handleTimeout: connected becomes disconnected after disconnected_timeout of silence and refreshes the failed deadline" {
+    var core = try testNewAgent(.controlling);
+    defer core.deinit();
+
+    core.connection_state = .connected;
+    core.connectivity_check_deadline = 100_000;
+    core.keep_alive_deadline = 100_000;
+    core.disconnected_connection_deadline = 1000;
+
+    const failed_timeout: i64 = core.timers.failed_timeout;
+    try core.handleTimeout(1000);
+
+    try testing.expectEqual(.disconnected, core.connection_state);
+    try testing.expectEqual(1000 + failed_timeout, core.disconnected_connection_deadline);
+
+    try expectConnectionStateEvent(&core, .disconnected);
+    try testing.expectEqual(null, core.pollEvent());
+}
+
+test "handleTimeout: disconnected becomes failed after failed_timeout elapses" {
+    var core = try testNewAgent(.controlling);
+    defer core.deinit();
+
+    core.connection_state = .disconnected;
+    core.keep_alive_deadline = 999_999;
+    core.disconnected_connection_deadline = 1000;
+
+    try core.handleTimeout(1000);
+
+    try testing.expectEqual(.failed, core.connection_state);
+    try testing.expectEqual(null, core.pollTimeout());
+
+    try expectConnectionStateEvent(&core, .failed);
+    try testing.expectEqual(null, core.pollEvent());
+}
+
+test "handleTimeout: returns the earliest of the three schedules without firing anything" {
+    var core = try testNewAgent(.controlling);
+    defer core.deinit();
+
+    core.connection_state = .connected;
+    core.connectivity_check_deadline = 5000;
+    core.keep_alive_deadline = 3000;
+    core.disconnected_connection_deadline = 8000;
+
+    try core.handleTimeout(1000);
+
+    try testing.expectEqual(.connected, core.connection_state);
+    try testing.expectEqual(3000, core.pollTimeout());
+    try testing.expectEqual(null, core.pollEvent());
+
+    try testing.expectEqual(5000, core.connectivity_check_deadline);
+    try testing.expectEqual(3000, core.keep_alive_deadline);
+    try testing.expectEqual(8000, core.disconnected_connection_deadline);
+}
+
+test "handleTimeout: transitioning to completed keeps only the turn client backing the nominated pair" {
+    var core = try testNewAgent(.controlling);
+    defer core.deinit();
+
+    core.connection_state = .connected;
+    core.connectivity_check_deadline = 100_000;
+    core.disconnected_connection_deadline = 100_000;
+    core.keep_alive_deadline = 1000;
+    core.remote_credentials = try .init("ruser", "peer-password-0123456789");
+
+    const local1 = try IpAddress.parse("10.0.0.10", 4000);
+    const server1 = try IpAddress.parse("203.0.113.1", 3478);
+    const local2 = try IpAddress.parse("10.0.0.11", 4001);
+    const server2 = try IpAddress.parse("203.0.113.2", 3478);
+
+    try core.addServer(local1, testTurnServer(server1), 0);
+    try core.addServer(local2, testTurnServer(server2), 0);
+
+    core.candidates[0] = .initRelay(local1, try IpAddress.parse("203.0.113.9", 40000));
+    core.candidates_len = 1;
+    const from = try IpAddress.parse("192.168.1.120", 2000);
+    core.remote_candidates[0] = testRemoteCandidate(from);
+    core.remote_candidates_len = 1;
+    core.nominated_pair = .{ .local = 0, .remote = 0 };
+    try core.pairs.append(testing.allocator, .{ .local = 0, .remote = 0, .status = .succeeded, .priority = 0 });
+    try core.pending_requests.append(testing.allocator, .{ .transaction_id = @splat(1), .pair = 0 });
+
+    try core.handleTimeout(1000);
+
+    try testing.expectEqual(.completed, core.connection_state);
+    try testing.expectEqual(1, core.turn_clients.items.len);
+    try testing.expect(core.turn_clients.items[0].local_addr.eql(&local1));
 }
 
 test "toggleRole: flips role, tie breaker and pair priorities" {
@@ -1968,42 +2284,6 @@ test "handleInput: success response nominates the pair and transitions to connec
     try testing.expectEqual(@as(i64, core.timers.disconnected_timeout), core.disconnected_connection_deadline);
 }
 
-test "handleTimeout: new connection starts checking and schedules a connectivity check" {
-    var core = try testNewAgent(.controlled);
-    defer core.deinit();
-
-    const failed_timeout: i64 = core.timers.failed_timeout;
-    const connectivity_check_interval: i64 = core.timers.connectivity_check_interval;
-    try core.setRemoteCredentials(.{ .username = "peer", .password = "peer-password-0123456789" }, 0);
-
-    try testing.expectEqual(connectivity_check_interval, core.connectivity_check_deadline);
-    try testing.expectEqual(failed_timeout, core.disconnected_connection_deadline);
-
-    try expectConnectionStateEvent(&core, .checking);
-    try testing.expectEqual(null, core.pollEvent());
-
-    try core.handleTimeout(connectivity_check_interval);
-    try testing.expect(!core.connectivity_check.done);
-    try testing.expectEqual(null, core.pollEvent());
-}
-
-test "handleTimeout: checking sends a connectivity_check every interval" {
-    var core = try testNewAgent(.controlled);
-    defer core.deinit();
-
-    const connectivity_check_interval: i64 = core.timers.connectivity_check_interval;
-    try core.setRemoteCredentials(.{ .username = "peer", .password = "peer-password-0123456789" }, 0);
-    _ = core.pollEvent(); // .checking
-
-    try core.handleTimeout(100);
-    try testing.expectEqual(null, core.pollEvent());
-
-    try core.handleTimeout(connectivity_check_interval);
-    try testing.expectEqual(connectivity_check_interval * 2, core.connectivity_check_deadline);
-    try testing.expect(!core.connectivity_check.done);
-    try testing.expectEqual(null, core.pollEvent());
-}
-
 test "setRemoteCredentials: connectivity checks start immediately and cover pairs added later" {
     var tx_buf: [1024]u8 = undefined;
     var core = try testNewAgent(.controlled);
@@ -2030,157 +2310,6 @@ test "setRemoteCredentials: connectivity checks start immediately and cover pair
     try testing.expectEqual(null, try core.pollTransmit(&tx_buf));
 }
 
-test "handleTimeout: checking fails after failed_timeout without connecting" {
-    var agent = try testNewAgent(.controlled);
-    defer agent.deinit();
-
-    const failed_timeout: i64 = agent.timers.failed_timeout;
-    try agent.setRemoteCredentials(.{ .username = "peer", .password = "peer-password-0123456789" }, 0);
-    _ = agent.pollEvent(); // .checking
-
-    try agent.handleTimeout(failed_timeout);
-
-    try testing.expectEqual(.failed, agent.connection_state);
-    try testing.expectEqual(std.math.maxInt(i64), agent.disconnected_connection_deadline);
-
-    try testing.expect(!agent.connectivity_check.done);
-    try expectConnectionStateEvent(&agent, .failed);
-    try testing.expectEqual(null, agent.pollEvent());
-
-    try agent.handleTimeout(failed_timeout + 1000);
-    try testing.expectEqual(null, agent.pollEvent());
-}
-
-test "handleTimeout: connected transitions to completed once keep_alive_deadline elapses and clears the checklist" {
-    var tx_buf: [1024]u8 = undefined;
-    var core = try testNewAgent(.controlling);
-    defer core.deinit();
-
-    core.connection_state = .connected;
-    core.connectivity_check_deadline = 100_000;
-    core.disconnected_connection_deadline = 100_000;
-    core.keep_alive_deadline = 1000;
-    core.remote_credentials = try .init("ruser", "peer-password-0123456789");
-
-    core.candidates[0] = .initHost(try IpAddress.parse("192.168.1.100", 1000));
-    core.candidates_len = 1;
-    const from = try IpAddress.parse("192.168.1.120", 2000);
-    core.remote_candidates[0] = testRemoteCandidate(from);
-    core.remote_candidates_len = 1;
-    core.nominated_pair = .{ .local = 0, .remote = 0 };
-    try core.pairs.append(testing.allocator, .{ .local = 0, .remote = 0, .status = .succeeded, .priority = 0 });
-    try core.pending_requests.append(testing.allocator, .{ .transaction_id = @splat(1), .pair = 0 });
-
-    try core.handleTimeout(1000);
-
-    try testing.expectEqual(.completed, core.connection_state);
-    try testing.expectEqual(1, core.remote_candidates_len);
-    try testing.expectEqual(0, core.pairs.items.len);
-    try testing.expectEqual(0, core.pending_requests.items.len);
-    try testing.expectEqual(1000 + keep_alive_interval, core.keep_alive_deadline);
-
-    try expectConnectionStateEvent(&core, .completed);
-    try testing.expectEqual(null, core.pollEvent());
-
-    const tm = (try core.pollTransmit(&tx_buf)) orelse return error.ExpectedTransmit;
-    const msg = try stun.Message.parse(tm.data);
-    try testing.expectEqual(.request, msg.header.message_type.class());
-    try testing.expectEqual(.binding, msg.header.message_type.method());
-    try testing.expect(tm.from.eql(&core.candidates[0].base));
-    try testing.expect(tm.to.eql(&from));
-    try testing.expectEqual(null, (try core.pollTransmit(&tx_buf)));
-}
-
-test "handleTimeout: completed/disconnected request consent freshness without changing state" {
-    var tx_buf: [1024]u8 = undefined;
-    for ([_]ice.ConnectionState{ .completed, .disconnected }) |state| {
-        var core = try testNewAgent(.controlling);
-        defer core.deinit();
-
-        core.connection_state = state;
-        core.disconnected_connection_deadline = 100_000;
-        core.keep_alive_deadline = 1000;
-        core.remote_credentials = try .init("ruser", "peer-password-0123456789");
-
-        core.candidates[0] = .initHost(try IpAddress.parse("192.168.1.100", 1000));
-        core.candidates_len = 1;
-        const from = try IpAddress.parse("192.168.1.120", 2000);
-        core.remote_candidates[0] = testRemoteCandidate(from);
-        core.remote_candidates_len = 1;
-        core.nominated_pair = .{ .local = 0, .remote = 0 };
-
-        try core.handleTimeout(1000);
-
-        try testing.expectEqual(state, core.connection_state);
-        try testing.expectEqual(1000 + keep_alive_interval, core.keep_alive_deadline);
-        try testing.expectEqual(null, core.pollEvent());
-
-        const tm = (try core.pollTransmit(&tx_buf)) orelse return error.ExpectedTransmit;
-        const msg = try stun.Message.parse(tm.data);
-        try testing.expectEqual(.request, msg.header.message_type.class());
-        try testing.expectEqual(.binding, msg.header.message_type.method());
-        try testing.expect(tm.from.eql(&core.candidates[0].base));
-        try testing.expect(tm.to.eql(&from));
-        try testing.expectEqual(null, (try core.pollTransmit(&tx_buf)));
-    }
-}
-
-test "handleTimeout: connected becomes disconnected after disconnected_timeout of silence and refreshes the failed deadline" {
-    var core = try testNewAgent(.controlling);
-    defer core.deinit();
-
-    core.connection_state = .connected;
-    core.connectivity_check_deadline = 100_000;
-    core.keep_alive_deadline = 100_000;
-    core.disconnected_connection_deadline = 1000;
-
-    const failed_timeout: i64 = core.timers.failed_timeout;
-    try core.handleTimeout(1000);
-
-    try testing.expectEqual(.disconnected, core.connection_state);
-    try testing.expectEqual(1000 + failed_timeout, core.disconnected_connection_deadline);
-
-    try expectConnectionStateEvent(&core, .disconnected);
-    try testing.expectEqual(null, core.pollEvent());
-}
-
-test "handleTimeout: disconnected becomes failed after failed_timeout elapses" {
-    var core = try testNewAgent(.controlling);
-    defer core.deinit();
-
-    core.connection_state = .disconnected;
-    core.keep_alive_deadline = 999_999;
-    core.disconnected_connection_deadline = 1000;
-
-    try core.handleTimeout(1000);
-
-    try testing.expectEqual(.failed, core.connection_state);
-    try testing.expectEqual(null, core.pollTimeout());
-
-    try expectConnectionStateEvent(&core, .failed);
-    try testing.expectEqual(null, core.pollEvent());
-}
-
-test "handleTimeout: returns the earliest of the three schedules without firing anything" {
-    var core = try testNewAgent(.controlling);
-    defer core.deinit();
-
-    core.connection_state = .connected;
-    core.connectivity_check_deadline = 5000;
-    core.keep_alive_deadline = 3000;
-    core.disconnected_connection_deadline = 8000;
-
-    try core.handleTimeout(1000);
-
-    try testing.expectEqual(.connected, core.connection_state);
-    try testing.expectEqual(3000, core.pollTimeout());
-    try testing.expectEqual(null, core.pollEvent());
-
-    try testing.expectEqual(5000, core.connectivity_check_deadline);
-    try testing.expectEqual(3000, core.keep_alive_deadline);
-    try testing.expectEqual(8000, core.disconnected_connection_deadline);
-}
-
 test "setRemoteCredentials: replaces and frees the previous value" {
     var core = try testNewAgent(.controlled);
     defer core.deinit();
@@ -2193,23 +2322,75 @@ test "setRemoteCredentials: replaces and frees the previous value" {
     try testing.expectEqualStrings("second-password-0123456789", core.remote_credentials.?.getPassword());
 }
 
-test "addServer/addLocalAddrs: turn server queues an allocate request and keeps gathering incomplete until it resolves" {
+test "pollTransmit: keeps the message queued on WriteFailed" {
+    var small: [stun.header_size - 1]u8 = undefined;
     var tx_buf: [1024]u8 = undefined;
-    var core = try testNewAgent(.controlling);
+    var req_buf: [1024]u8 = undefined;
+    var agent = try testNewAgent(.controlled);
+    defer agent.deinit();
+
+    const local = try IpAddress.parse("192.168.1.100", 1000);
+    const remote = try IpAddress.parse("192.168.1.120", 2000);
+
+    try agent.addLocalAddrs(&.{local}, 0);
+    try agent.addRemoteCandidate(.initHost(remote), 0);
+    try agent.setRemoteCredentials(.{ .username = "peer", .password = "peer-password-0123456789" }, 0);
+
+    const req = try testBuildRequest(.{
+        .ice_controlling = 0x10000,
+        .priority = 0x9090,
+        .username = agent.credentials.getUsername(),
+    }, agent.credentials.getPassword(), &req_buf);
+    agent.queueResponse((try agent.handleRequest(&req, &local, &remote)) orelse return error.ExpectedResponse);
+
+    // Response
+    try testing.expectError(error.WriteFailed, agent.pollTransmit(&small));
+    const resp = (try agent.pollTransmit(&tx_buf)) orelse return error.ExpectedTransmit;
+    const resp_msg = try stun.Message.parse(resp.data);
+    try testing.expectEqual(.success_response, resp_msg.header.message_type.class());
+    try testing.expectEqual(req.header.transaction_id, resp_msg.header.transaction_id);
+
+    // Connectivity check
+    try testing.expectError(error.WriteFailed, agent.pollTransmit(&small));
+    try testing.expectEqual(0, agent.pairs.items[0].conn_check_count);
+    try testing.expectEqual(0, agent.pending_requests.items.len);
+    const check = (try agent.pollTransmit(&tx_buf)) orelse return error.ExpectedTransmit;
+    try testing.expectEqual(.request, (try stun.Message.parse(check.data)).header.message_type.class());
+    try testing.expect(check.to.eql(&remote));
+    try testing.expectEqual(1, agent.pairs.items[0].conn_check_count);
+    try testing.expectEqual(null, try agent.pollTransmit(&tx_buf));
+
+    // Consent freshness
+    agent.nominated_pair = .{ .local = 0, .remote = 0 };
+    agent.consent_freshness = true;
+    try testing.expectError(error.WriteFailed, agent.pollTransmit(&small));
+    try testing.expect(agent.consent_freshness);
+
+    const consent = (try agent.pollTransmit(&tx_buf)) orelse return error.ExpectedTransmit;
+    try testing.expectEqual(.request, (try stun.Message.parse(consent.data)).header.message_type.class());
+    try testing.expect(consent.to.eql(&remote));
+    try testing.expectEqual(null, try agent.pollTransmit(&tx_buf));
+}
+
+test "pollTransmit: pair fails after max_binding_requests connectivity checks" {
+    var tx_buf: [1024]u8 = undefined;
+    var core = try testNewAgent(.controlled);
     defer core.deinit();
 
-    const local = try IpAddress.parse("10.0.0.10", 4000);
-    const server = try IpAddress.parse("203.0.113.1", 3478);
+    try core.addLocalAddrs(&.{try IpAddress.parse("192.168.1.100", 1000)}, 0);
+    try core.addRemoteCandidate(.initHost(try IpAddress.parse("192.168.1.120", 2000)), 0);
+    try core.setRemoteCredentials(.{ .username = "peer", .password = "peer-password-0123456789" }, 0);
 
-    try core.addServer(local, testTurnServer(server), 0);
-    try core.addLocalAddrs(&.{}, 0);
+    for (0..max_binding_requests) |_| {
+        core.connectivity_check = .init;
+        _ = (try core.pollTransmit(&tx_buf)) orelse return error.ExpectedTransmit;
+        try testing.expectEqual(null, try core.pollTransmit(&tx_buf));
+    }
 
-    const tm = (try core.pollTransmit(&tx_buf)) orelse return error.ExpectedTransmit;
-    try testing.expect(tm.from.eql(&local));
-    try testing.expect(tm.to.eql(&server));
-    try testing.expectEqual(null, (try core.pollTransmit(&tx_buf)));
-
-    try testing.expectEqual(.gathering, core.gathering_state);
+    core.connectivity_check = .init;
+    try testing.expectEqual(null, try core.pollTransmit(&tx_buf));
+    try testing.expectEqual(.failed, core.pairs.items[0].status);
+    try testing.expect(core.connectivity_check.done);
 }
 
 test "handleTurnClientEvents: successful allocation adds a relay candidate, creates a permission for the paired remote, and completes gathering" {
@@ -2259,131 +2440,6 @@ test "handleTurnClientEvents: successful allocation adds a relay candidate, crea
     var it = permission_msg.iterateAttributes(&.{});
     const attr = try it.next() orelse return error.ExpectedAttribute;
     try testing.expect(attr.xor_peer_address.eql(&remote));
-}
-
-test "addRemoteCandidate: pairs with a relay candidate and creates a permission" {
-    var tx_buf: [1024]u8 = undefined;
-    var core = try testNewAgent(.controlling);
-    defer core.deinit();
-
-    const local = try IpAddress.parse("10.0.0.10", 4000);
-    const server = try IpAddress.parse("203.0.113.1", 3478);
-    const relayed = try IpAddress.parse("203.0.113.9", 40000);
-
-    try core.addServer(local, testTurnServer(server), 0);
-    _ = try core.addLocalCandidate(.initRelay(local, relayed));
-
-    const remote = try IpAddress.parse("192.168.1.10", 1000);
-    try core.addRemoteCandidate(Candidate.initHost(remote), 0);
-
-    try testing.expectEqual(1, core.pairs.items.len);
-
-    const out = (try core.pollTransmit(&tx_buf)) orelse return error.ExpectedTransmit;
-    const msg = try stun.Message.parse(out.data);
-    try testing.expectEqual(.create_permission, msg.header.message_type.method());
-
-    var it = msg.iterateAttributes(&.{});
-    const attr = try it.next() orelse return error.ExpectedAttribute;
-    try testing.expect(attr.xor_peer_address.eql(&remote));
-}
-
-test "handleRead: unwraps a TURN data indication before further processing" {
-    var core = try testNewAgent(.controlled);
-    defer core.deinit();
-
-    const local = try IpAddress.parse("10.0.0.10", 4000);
-    const server = try IpAddress.parse("203.0.113.1", 3478);
-    const relayed = try IpAddress.parse("203.0.113.9", 40000);
-    const peer = try IpAddress.parse("192.168.1.120", 2000);
-
-    try core.addServer(local, testTurnServer(server), 0);
-
-    core.candidates[0] = .initRelay(local, relayed);
-    core.candidates_len = 1;
-    core.remote_candidates[0] = testRemoteCandidate(peer);
-    core.remote_candidates_len = 1;
-    try core.pairs.append(testing.allocator, .{
-        .local = 0,
-        .remote = 0,
-        .status = .in_progress,
-        .priority = 0,
-    });
-
-    var buffer: [1024]u8 = undefined;
-    var indication_buf: [1024]u8 = undefined;
-    var resp_buffer: [1024]u8 = undefined;
-
-    {
-        const inner = try testBuildRequest(.{
-            .ice_controlling = 0x10000,
-            .priority = 0x9090,
-            .username = core.credentials.getUsername(),
-        }, core.credentials.getPassword(), &buffer);
-
-        const indication = try testTurnDataIndication(&indication_buf, peer, inner.bytes);
-
-        const result = try core.handleRead(.{ .from = &server, .to = &local, .data = indication }, 0);
-        try testing.expectEqual(.consumed, std.meta.activeTag(result));
-
-        const tm = (try core.pollTransmit(&resp_buffer)) orelse return error.ExpectedTransmit;
-        try testing.expect(tm.from.eql(&local));
-        try testing.expect(tm.to.eql(&server));
-    }
-
-    {
-        const indication = try testTurnDataIndication(&indication_buf, peer, "hello");
-        const result = try core.handleRead(.{ .from = &server, .to = &local, .data = indication }, 0);
-        switch (result) {
-            .app_data => |data| try testing.expectEqualStrings("hello", data),
-            .consumed => return error.UnexpectedResult,
-        }
-    }
-}
-
-test "maybeWrapInTurnMessage: relay candidate responses are wrapped as a TURN send indication addressed to the server" {
-    var core = try testNewAgent(.controlled);
-    defer core.deinit();
-
-    var buffer: [1024]u8 = undefined;
-    var resp_buffer: [1024]u8 = undefined;
-
-    const local = try IpAddress.parse("10.0.0.10", 4000);
-    const server = try IpAddress.parse("203.0.113.1", 3478);
-    const relayed = try IpAddress.parse("203.0.113.9", 40000);
-    const from = try IpAddress.parse("192.168.1.120", 2000);
-
-    try core.addServer(local, testTurnServer(server), 0);
-
-    core.candidates[0] = .initRelay(local, relayed);
-    core.candidates_len = 1;
-    core.remote_candidates[0] = testRemoteCandidate(from);
-    core.remote_candidates_len = 1;
-    try core.pairs.append(testing.allocator, .{
-        .local = 0,
-        .remote = 0,
-        .status = .in_progress,
-        .priority = 0,
-    });
-
-    const msg = try testBuildRequest(.{
-        .ice_controlling = 0x10000,
-        .priority = 0x9090,
-        .username = core.credentials.getUsername(),
-    }, core.credentials.getPassword(), &buffer);
-
-    _ = try core.pollTransmit(&resp_buffer); // drain the allocate request
-    const resp = try testRespond(&core, &msg, &local, &from, &resp_buffer);
-
-    try testing.expect(resp.from.eql(&local));
-    try testing.expect(resp.to.eql(&server));
-
-    const resp_msg = try stun.Message.parse(resp.data);
-    try testing.expectEqual(.indication, resp_msg.header.message_type.class());
-    try testing.expectEqual(.send, resp_msg.header.message_type.method());
-
-    var it = resp_msg.iterateAttributes(&.{});
-    const attr = try it.next() orelse return error.ExpectedAttribute;
-    try testing.expect(attr.xor_peer_address.eql(&from));
 }
 
 test "handleTurnClientEvents: allocation_failed removes the turn client and gathering still completes" {
@@ -2455,6 +2511,52 @@ test "handleTurnClientEvents: permission_failed marks the matching candidate pai
     try testing.expectEqual(.failed, core.pairs.items[0].status);
 }
 
+test "maybeWrapInTurnMessage: relay candidate responses are wrapped as a TURN send indication addressed to the server" {
+    var core = try testNewAgent(.controlled);
+    defer core.deinit();
+
+    var buffer: [1024]u8 = undefined;
+    var resp_buffer: [1024]u8 = undefined;
+
+    const local = try IpAddress.parse("10.0.0.10", 4000);
+    const server = try IpAddress.parse("203.0.113.1", 3478);
+    const relayed = try IpAddress.parse("203.0.113.9", 40000);
+    const from = try IpAddress.parse("192.168.1.120", 2000);
+
+    try core.addServer(local, testTurnServer(server), 0);
+
+    core.candidates[0] = .initRelay(local, relayed);
+    core.candidates_len = 1;
+    core.remote_candidates[0] = testRemoteCandidate(from);
+    core.remote_candidates_len = 1;
+    try core.pairs.append(testing.allocator, .{
+        .local = 0,
+        .remote = 0,
+        .status = .in_progress,
+        .priority = 0,
+    });
+
+    const msg = try testBuildRequest(.{
+        .ice_controlling = 0x10000,
+        .priority = 0x9090,
+        .username = core.credentials.getUsername(),
+    }, core.credentials.getPassword(), &buffer);
+
+    _ = try core.pollTransmit(&resp_buffer); // drain the allocate request
+    const resp = try testRespond(&core, &msg, &local, &from, &resp_buffer);
+
+    try testing.expect(resp.from.eql(&local));
+    try testing.expect(resp.to.eql(&server));
+
+    const resp_msg = try stun.Message.parse(resp.data);
+    try testing.expectEqual(.indication, resp_msg.header.message_type.class());
+    try testing.expectEqual(.send, resp_msg.header.message_type.method());
+
+    var it = resp_msg.iterateAttributes(&.{});
+    const attr = try it.next() orelse return error.ExpectedAttribute;
+    try testing.expect(attr.xor_peer_address.eql(&from));
+}
+
 test "handleWrite: adds turn header in place and passes host data through" {
     var agent = try testNewAgent(.controlling);
     defer agent.deinit();
@@ -2506,38 +2608,4 @@ test "handleWrite: adds turn header in place and passes host data through" {
     try testing.expect(attr.xor_peer_address.eql(&remote));
 
     try testing.expectError(error.WriteFailed, agent.handleWrite(buffer[0 .. size - 1], payload.len));
-}
-
-test "handleTimeout: transitioning to completed keeps only the turn client backing the nominated pair" {
-    var core = try testNewAgent(.controlling);
-    defer core.deinit();
-
-    core.connection_state = .connected;
-    core.connectivity_check_deadline = 100_000;
-    core.disconnected_connection_deadline = 100_000;
-    core.keep_alive_deadline = 1000;
-    core.remote_credentials = try .init("ruser", "peer-password-0123456789");
-
-    const local1 = try IpAddress.parse("10.0.0.10", 4000);
-    const server1 = try IpAddress.parse("203.0.113.1", 3478);
-    const local2 = try IpAddress.parse("10.0.0.11", 4001);
-    const server2 = try IpAddress.parse("203.0.113.2", 3478);
-
-    try core.addServer(local1, testTurnServer(server1), 0);
-    try core.addServer(local2, testTurnServer(server2), 0);
-
-    core.candidates[0] = .initRelay(local1, try IpAddress.parse("203.0.113.9", 40000));
-    core.candidates_len = 1;
-    const from = try IpAddress.parse("192.168.1.120", 2000);
-    core.remote_candidates[0] = testRemoteCandidate(from);
-    core.remote_candidates_len = 1;
-    core.nominated_pair = .{ .local = 0, .remote = 0 };
-    try core.pairs.append(testing.allocator, .{ .local = 0, .remote = 0, .status = .succeeded, .priority = 0 });
-    try core.pending_requests.append(testing.allocator, .{ .transaction_id = @splat(1), .pair = 0 });
-
-    try core.handleTimeout(1000);
-
-    try testing.expectEqual(.completed, core.connection_state);
-    try testing.expectEqual(1, core.turn_clients.items.len);
-    try testing.expect(core.turn_clients.items[0].local_addr.eql(&local1));
 }
