@@ -134,7 +134,7 @@ pub fn Client(comptime config: ClientConfig) type {
         }
 
         pub fn pollTransmit(c: *Self, buffer: []u8) error{WriteFailed}!?stun.TransportMessage {
-            const transaction_id = c.transmits.popFront() orelse return null;
+            const transaction_id = c.transmits.peekFront() orelse return null;
             const tr = &c.transactions.items[transaction_id];
             var out = stun.Writer.init(buffer, .{});
             try out.writeHeader(.{
@@ -142,6 +142,7 @@ pub fn Client(comptime config: ClientConfig) type {
                 .transaction_id = tr.id,
             });
 
+            _ = c.transmits.popFront();
             return .{
                 .from = &c.local_addr,
                 .to = &c.remote_addr,
@@ -324,6 +325,22 @@ test "StunClient.handleTimeout: emits err event and drops transaction after max 
     const event = client.pollEvent() orelse return error.ExpectedEvent;
     try testing.expectEqual(error.TransactionTimeout, event.err);
     try testing.expectEqual(null, client.pollEvent());
+}
+
+test "StunClient.pollTransmit: keeps the transmit queued on WriteFailed" {
+    var prng = std.Random.DefaultPrng.init(std.testing.random_seed);
+    var client = testClient(prng.random());
+
+    try client.bindingRequest(0);
+
+    var small: [stun.header_size - 1]u8 = undefined;
+    try testing.expectError(error.WriteFailed, client.pollTransmit(&small));
+
+    var buffer: [64]u8 = undefined;
+    const tm = try client.pollTransmit(&buffer) orelse return error.ExpectedTransmit;
+    const msg = try stun.Message.parse(tm.data);
+    try testing.expectEqualSlices(u8, &client.transactions.items[0].id, &msg.header.transaction_id);
+    try testing.expectEqual(null, try client.pollTransmit(&buffer));
 }
 
 test "StunClient.poll*: return null when empty" {
