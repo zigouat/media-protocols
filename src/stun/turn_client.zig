@@ -6,6 +6,9 @@ const IpAddress = std.Io.net.IpAddress;
 
 pub const AllocError = std.mem.Allocator.Error;
 
+/// RFC 8489 caps USERNAME to fewer than 509 bytes, this also bounds the size of every request.
+pub const max_username_len = 508;
+
 pub const CreateAllocationError = AllocError || error{AllocationAlreadyExists};
 
 pub const StunError = error{
@@ -201,6 +204,7 @@ pub const TurnClientConfig = struct {
     local_addr: IpAddress,
     remote_addr: IpAddress,
     random: std.Random,
+    /// At most `max_username_len` bytes.
     username: []const u8,
     password: []const u8,
 };
@@ -240,6 +244,7 @@ pub fn TurnClient(comptime config: Config) type {
         permission_refresh_deadline: i64,
 
         pub fn init(turn_config: TurnClientConfig) Self {
+            std.debug.assert(turn_config.username.len <= max_username_len);
             return .{
                 .random = turn_config.random,
                 .local_addr = turn_config.local_addr,
@@ -841,6 +846,36 @@ test "TurnClient.pollTransmit: keeps the transmit queued when the buffer is too 
     const msg = try stun.Message.parse(out.data);
     try std.testing.expectEqual(.refresh, msg.header.message_type.method());
     try std.testing.expectEqual(null, try c.pollTransmit(&buffer));
+}
+
+test "TurnClient.pollTransmit: largest request fits in 1500 bytes" {
+    var r = std.Random.DefaultPrng.init(std.testing.random_seed);
+    const username: [max_username_len]u8 = @splat('u');
+    var c = TestTurnClient.init(.{
+        .local_addr = .{ .ip6 = .{ .bytes = @splat(1), .port = 12345 } },
+        .remote_addr = .{ .ip6 = .{ .bytes = @splat(2), .port = 3478 } },
+        .random = r.random(),
+        .username = &username,
+        .password = "pass",
+    });
+
+    // Realm and nonce fill the auth info, lengths chosen to maximize padding.
+    const realm: [1]u8 = @splat('r');
+    const nonce: [111]u8 = @splat('n');
+    try c.auth_info.init(&nonce, &realm, c.username, c.password);
+
+    for (0..c.permissions.addresses.len) |idx| {
+        var peer: IpAddress = .{ .ip6 = .{ .bytes = @splat(3), .port = 3478 } };
+        peer.ip6.bytes[15] = @intCast(idx);
+        try std.testing.expect(try c.permissions.add(peer));
+    }
+    c.permission_refresh_deadline = 1;
+    try c.handleTimeout(1);
+
+    var buffer: [1500]u8 = undefined;
+    const out = try c.pollTransmit(&buffer) orelse return error.ExpectedOutput;
+    const msg = try stun.Message.parse(out.data);
+    try std.testing.expectEqual(.create_permission, msg.header.message_type.method());
 }
 
 test "TurnClient.permissions.add: existing address is not an error when full" {
