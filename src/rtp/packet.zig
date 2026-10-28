@@ -426,12 +426,14 @@ pub fn parse(data: []const u8) ParseError!Self {
     if (packet.header.extension) packet.extension = Extension.parse(&reader) catch return error.MalformedPacket;
 
     if (packet.header.padding) {
-        if (reader.seek >= data.len or data[data.len - 1] != data.len - reader.seek) {
+        const remaining = data.len - reader.seek;
+        const padding_size = if (remaining > 0) data[data.len - 1] else 0;
+        if (padding_size == 0 or padding_size > remaining) {
             @branchHint(.unlikely);
             return error.MalformedPacket;
         }
 
-        packet.padding_size = data[data.len - 1];
+        packet.padding_size = padding_size;
     }
     packet.payload = data[reader.seek .. reader.end - packet.padding_size];
 
@@ -480,6 +482,18 @@ pub fn size(packet: *const Self) usize {
     const ext_size = if (packet.extension) |ext| ext.size() else 0;
     const padding_size = if (packet.header.padding) 4 - @rem(packet.payload.len + ext_size, 4) else 0;
     return header_size + packet.csrc_list.len * 4 + ext_size + packet.payload.len + padding_size;
+}
+
+/// Returns the RTP header size (fixed part, CSRCs and extension) without fully parsing the packet.
+pub fn getHeaderSize(packet: []const u8) ParseError!usize {
+    if (packet.len < header_size) return error.MalformedPacket;
+    var len: usize = header_size + @as(usize, packet[0] & 0x0F) * 4;
+    if (packet[0] & 0x10 != 0) {
+        if (packet.len < len + 4) return error.MalformedPacket;
+        len += 4 + @as(usize, std.mem.readInt(u16, packet[len + 2 ..][0..2], .big)) * 4;
+    }
+    if (packet.len < len) return error.MalformedPacket;
+    return len;
 }
 
 test {
@@ -570,6 +584,57 @@ test "packet with padding" {
     try std.testing.expect(parsed_packet.padding_size == 4);
 
     try std.testing.expectEqual(44, parsed_packet.size());
+}
+
+test "parse: padding length is validated against the bytes after the header" {
+    const header = [_]u8{ 0xA0, 0x60, 0x00, 0x01, 0, 0, 0, 1, 0, 0, 0, 2 };
+
+    const with_payload = header ++ [_]u8{ 'A', 'B', 'C', 'D', 0, 0, 0, 4 };
+    var packet = try Self.parse(&with_payload);
+    try std.testing.expectEqualSlices(u8, "ABCD", packet.payload);
+    try std.testing.expectEqual(4, packet.padding_size);
+
+    const single_byte = header ++ [_]u8{ 'A', 'B', 'C', 1 };
+    packet = try Self.parse(&single_byte);
+    try std.testing.expectEqualSlices(u8, "ABC", packet.payload);
+    try std.testing.expectEqual(1, packet.padding_size);
+
+    const padding_only = header ++ [_]u8{ 0, 0, 0, 4 };
+    packet = try Self.parse(&padding_only);
+    try std.testing.expectEqual(0, packet.payload.len);
+    try std.testing.expectEqual(4, packet.padding_size);
+
+    try std.testing.expectError(error.MalformedPacket, Self.parse(&header));
+    try std.testing.expectError(error.MalformedPacket, Self.parse(&(header ++ [_]u8{ 'A', 'B', 'C', 0 })));
+    try std.testing.expectError(error.MalformedPacket, Self.parse(&(header ++ [_]u8{ 'A', 'B', 'C', 5 })));
+}
+
+test "getHeaderSize: fixed header, csrcs and extension" {
+    const plain = [_]u8{ 0x80, 0xE0, 0x51, 0xA4, 0x00, 0x0D, 0xDF, 0x22, 0x54, 0xA7, 0xD4, 0xF3, 0x01, 0x02, 0x03, 0x04 };
+    try std.testing.expectEqual(12, try getHeaderSize(&plain));
+    try std.testing.expectEqual(12, try getHeaderSize(plain[0..12]));
+
+    // Payload bytes must not be read as header fields.
+    const large_payload = plain[0..12] ++ [_]u8{ 0xFF, 0xFF, 0xFF, 0xFF };
+    try std.testing.expectEqual(12, try getHeaderSize(large_payload));
+
+    // 3 csrcs
+    const csrc = [_]u8{ 0x83, 0x6F, 0x41, 0xFF, 0xD2, 0x14, 0x8B, 0xBA, 0x37, 0xB8, 0x30, 0x7F } ++ [_]u8{0} ** 12 ++ [_]u8{ 0x05, 0x00, 0x09 };
+    try std.testing.expectEqual(24, try getHeaderSize(&csrc));
+
+    // 3-word extension
+    const ext = [_]u8{ 0x90, 0x6F, 0x41, 0xFF, 0xD2, 0x14, 0x8B, 0xBA, 0x37, 0xB8, 0x30, 0x7F, 0xBE, 0xDE, 0x00, 0x03 } ++ [_]u8{0} ** 12 ++ [_]u8{ 0x05, 0x00, 0x09 };
+    try std.testing.expectEqual(28, try getHeaderSize(&ext));
+
+    // 3 csrcs, 3-word extension and padding
+    const all = [_]u8{ 0xB3, 0x6F, 0x41, 0xFF, 0xD2, 0x14, 0x8B, 0xBA, 0x37, 0xB8, 0x30, 0x7F } ++ [_]u8{0} ** 12 ++
+        [_]u8{ 0xBE, 0xDE, 0x00, 0x03 } ++ [_]u8{0} ** 12 ++ [_]u8{ 0x05, 0x00, 0x09, 0x00, 0x00, 0x00, 0x00, 0x04 };
+    try std.testing.expectEqual(40, try getHeaderSize(&all));
+
+    try std.testing.expectError(error.MalformedPacket, getHeaderSize(plain[0..11]));
+    try std.testing.expectError(error.MalformedPacket, getHeaderSize(csrc[0..23]));
+    try std.testing.expectError(error.MalformedPacket, getHeaderSize(ext[0..15]));
+    try std.testing.expectError(error.MalformedPacket, getHeaderSize(ext[0..27]));
 }
 
 test "write packet" {
@@ -698,4 +763,8 @@ test "write packet with padding" {
     var writer = std.Io.Writer.fixed(&buffer);
     try packet.write(&writer);
     try std.testing.expectEqualSlices(u8, &expected, writer.buffered());
+
+    const parsed = try Self.parse(writer.buffered());
+    try std.testing.expectEqualSlices(u8, packet.payload, parsed.payload);
+    try std.testing.expectEqual(4, parsed.padding_size);
 }

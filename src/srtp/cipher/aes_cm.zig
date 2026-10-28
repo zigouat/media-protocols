@@ -80,7 +80,6 @@ pub fn encryptRtp(cm: *AesCm, roc: u32, header_size: usize, src: []const u8, dst
 
 pub fn encryptRtcp(cm: *AesCm, src: []const u8, dst: []u8, index: u32) []const u8 {
     const tag_size = cm.profile.rtcpTagLength();
-    std.debug.assert(dst.len >= src.len + tag_size + rtcp_index_size);
 
     var iv: [enc_key_size]u8 = @splat(0);
     cm.generateRtcpIV(&iv, src[4..8], index);
