@@ -14,6 +14,12 @@ const IpAddress = std.Io.net.IpAddress;
 const Logger = std.log.scoped(.ice);
 const AllocError = std.mem.Allocator.Error;
 
+pub const AddServerError = AllocError || error{
+    GatheringDone,
+    /// The TURN username exceeds `stun.turn.max_username_len`.
+    UsernameTooLong,
+};
+
 pub const NominatedPair = struct {
     local: CandidateIndex,
     remote: CandidateIndex,
@@ -307,7 +313,7 @@ pub fn Agent(comptime config: struct {
         ///
         /// `local` must be a dedicated socket: host, server reflexive and relay candidates
         /// never share the same base.
-        pub fn addServer(agent: *Self, local: IpAddress, server: Server, now: i64) (AllocError || error{GatheringDone})!void {
+        pub fn addServer(agent: *Self, local: IpAddress, server: Server, now: i64) AddServerError!void {
             if (agent.gathering_done) return error.GatheringDone;
             const started = agent.gathering_state == .gathering;
             switch (server) {
@@ -322,6 +328,7 @@ pub fn Agent(comptime config: struct {
                     if (started) try stun_client.bindingRequest(now);
                 },
                 .turn => |turn| {
+                    if (turn.username.len > stun.turn.max_username_len) return error.UsernameTooLong;
                     const turn_client = try agent.turn_clients.addOne(agent.allocator);
                     errdefer _ = agent.turn_clients.pop();
                     turn_client.* = TurnClient.init(.{
@@ -1697,6 +1704,22 @@ test "addServer: deferred before gathering, sent during, rejected once done" {
     try testing.expectError(error.GatheringDone, core.addServer(local, .{ .stun = stun1 }, 0));
     try testing.expectError(error.GatheringDone, core.addServer(local, testTurnServer(turn), 0));
     try testing.expectEqual(2, core.stun_clients.items.len);
+    try testing.expectEqual(1, core.turn_clients.items.len);
+}
+
+test "addServer: rejects a turn username longer than the RFC limit" {
+    var core = try testNewAgent(.controlling);
+    defer core.deinit();
+
+    const local = try IpAddress.parse("10.0.0.10", 4000);
+    const address = try IpAddress.parse("203.0.113.1", 3478);
+    const username: [stun.turn.max_username_len + 1]u8 = @splat('u');
+
+    const server: Server = .{ .turn = .{ .address = address, .username = &username, .password = "turnpass" } };
+    try testing.expectError(error.UsernameTooLong, core.addServer(local, server, 0));
+    try testing.expectEqual(0, core.turn_clients.items.len);
+
+    try core.addServer(local, .{ .turn = .{ .address = address, .username = username[1..], .password = "turnpass" } }, 0);
     try testing.expectEqual(1, core.turn_clients.items.len);
 }
 
