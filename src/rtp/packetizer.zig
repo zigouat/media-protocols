@@ -6,6 +6,8 @@ const std = @import("std");
 const Packet = @import("packet.zig");
 const media = @import("media");
 
+const Packetizer = @This();
+
 const max_timestamp: u64 = std.math.maxInt(u32) + 1;
 
 pub const RtpConfig = struct {
@@ -40,64 +42,62 @@ pub const Fragment = struct {
     last: bool,
 };
 
-pub const Packetizer = struct {
-    rtp_config: RtpConfig,
-    codec: Codec,
+rtp_config: RtpConfig,
+codec: Codec,
 
-    const State = union(Codec) {
-        h264: H264,
-        vp8: VP8,
-        opus: Opus,
+const State = union(Codec) {
+    h264: H264,
+    vp8: VP8,
+    opus: Opus,
+};
+
+pub fn init(codec: Codec, rtp_config: RtpConfig) Packetizer {
+    return .{ .rtp_config = rtp_config, .codec = codec };
+}
+
+pub fn packetize(self: *Packetizer, media_packet: *const media.Packet) Iterator {
+    return .{
+        .packetizer = self,
+        .timestamp = media_packet.pts,
+        .done = media_packet.data.len == 0,
+        .state = switch (self.codec) {
+            inline else => |tag| @unionInit(State, @tagName(tag), .init(media_packet.data)),
+        },
     };
+}
 
-    pub fn init(codec: Codec, rtp_config: RtpConfig) Packetizer {
-        return .{ .rtp_config = rtp_config, .codec = codec };
+pub const Iterator = struct {
+    packetizer: *Packetizer,
+    timestamp: i64,
+    done: bool,
+    state: State,
+
+    pub fn next(it: *Iterator, out: []u8) Error!?Packet {
+        if (it.done) return null;
+
+        const fragment = try switch (it.state) {
+            inline else => |*s| s.next(out, it.packetizer.rtp_config.fragment_size),
+        };
+        it.done = fragment.last;
+        it.packetizer.rtp_config.incrementSeqNumber();
+        return it.newRtpPacket(fragment);
     }
 
-    pub fn packetize(self: *Packetizer, media_packet: *const media.Packet) Iterator {
-        return .{
-            .packetizer = self,
-            .timestamp = media_packet.pts,
-            .done = media_packet.data.len == 0,
-            .state = switch (self.codec) {
-                inline else => |tag| @unionInit(State, @tagName(tag), .init(media_packet.data)),
+    fn newRtpPacket(it: *Iterator, framgent: Fragment) Packet {
+        const config = &it.packetizer.rtp_config;
+        return Packet{
+            .header = .{
+                .extension = false,
+                .marker = framgent.last,
+                .padding = false,
+                .payload_type = config.payload_type,
+                .sequence_number = config.seq_number,
+                .ssrc = config.ssrc,
+                .timestamp = @truncate(@as(u64, @bitCast(it.timestamp))),
             },
+            .payload = framgent.payload,
         };
     }
-
-    pub const Iterator = struct {
-        packetizer: *Packetizer,
-        timestamp: i64,
-        done: bool,
-        state: State,
-
-        pub fn next(it: *Iterator, out: []u8) Error!?Packet {
-            if (it.done) return null;
-
-            const fragment = try switch (it.state) {
-                inline else => |*s| s.next(out, it.packetizer.rtp_config.fragment_size),
-            };
-            it.done = fragment.last;
-            it.packetizer.rtp_config.incrementSeqNumber();
-            return it.newRtpPacket(fragment);
-        }
-
-        fn newRtpPacket(it: *Iterator, framgent: Fragment) Packet {
-            const config = &it.packetizer.rtp_config;
-            return Packet{
-                .header = .{
-                    .extension = false,
-                    .marker = framgent.last,
-                    .padding = false,
-                    .payload_type = config.payload_type,
-                    .sequence_number = config.seq_number,
-                    .ssrc = config.ssrc,
-                    .timestamp = @truncate(@as(u64, @bitCast(it.timestamp))),
-                },
-                .payload = framgent.payload,
-            };
-        }
-    };
 };
 
 test {
