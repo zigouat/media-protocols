@@ -848,10 +848,12 @@ pub fn Agent(comptime config: struct {
             if (check.done) return null;
 
             if (!check.nomination_done) {
-                if (agent.selected_pair) |idx| {
-                    if (try agent.buildConnectivityCheckBindingRequest(&agent.pairs.items[idx], idx, buffer)) |msg| return msg;
-                }
+                const msg = if (agent.selected_pair) |idx|
+                    try agent.buildConnectivityCheckBindingRequest(&agent.pairs.items[idx], idx, buffer)
+                else
+                    null;
                 check.nomination_done = true;
+                if (msg) |m| return m;
             }
 
             while (check.index < agent.pairs.items.len) {
@@ -2393,6 +2395,29 @@ test "pollTransmit: keeps the message queued on WriteFailed" {
     try testing.expectEqual(.request, (try stun.Message.parse(consent.data)).header.message_type.class());
     try testing.expect(consent.to.eql(&remote));
     try testing.expectEqual(null, try agent.pollTransmit(&tx_buf));
+}
+
+test "pollTransmit: sends the nomination request once per connectivity check" {
+    var tx_buf: [1024]u8 = undefined;
+    var core = try testNewAgent(.controlling);
+    defer core.deinit();
+
+    try core.addLocalAddrs(&.{try IpAddress.parse("192.168.1.100", 1000)}, 0);
+    try core.addRemoteCandidate(.initHost(try IpAddress.parse("192.168.1.120", 2000)), 0);
+    try core.setRemoteCredentials(.{ .username = "peer", .password = "peer-password-0123456789" }, 0);
+
+    core.selected_pair = 0;
+    core.connectivity_check = .init;
+
+    const nomination = (try core.pollTransmit(&tx_buf)) orelse return error.ExpectedTransmit;
+    try testing.expectEqual(.request, (try stun.Message.parse(nomination.data)).header.message_type.class());
+    try testing.expect(core.connectivity_check.nomination_done);
+
+    var count: usize = 0;
+    while (try core.pollTransmit(&tx_buf)) |_| : (count += 1) {
+        if (count > core.pairs.items.len) return error.TestUnexpectedResult;
+    }
+    try testing.expect(core.connectivity_check.done);
 }
 
 test "pollTransmit: pair fails after max_binding_requests connectivity checks" {
