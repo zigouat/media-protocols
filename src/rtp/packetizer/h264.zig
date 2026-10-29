@@ -52,11 +52,12 @@ pub fn next(self: *H264, out: []u8, fragment_size: usize) error{ InvalidPacket, 
         return .{ .payload = payload, .last = self.fu_state == null and self.data.len == 0 };
     }
 
-    var reader: std.Io.Reader = .fixed(self.data);
-    const nalu_size = reader.takeInt(u32, .big) catch return error.InvalidPacket;
-    const nalu = reader.take(nalu_size) catch return error.InvalidPacket;
+    if (self.data.len < 4) return error.InvalidPacket;
+    const nalu_size = std.mem.readInt(u32, self.data[0..4], .big);
+    if (self.data.len - 4 < nalu_size) return error.InvalidPacket;
+    const nalu = self.data[4..][0..nalu_size];
     if (out.len < @min(nalu.len, fragment_size)) return error.WriteFailed;
-    self.data = self.data[reader.seek..];
+    self.data = self.data[4 + nalu_size ..];
 
     if (nalu.len > fragment_size) {
         // FU unit
