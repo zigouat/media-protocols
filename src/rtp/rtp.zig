@@ -1,6 +1,6 @@
 pub const Packet = @import("packet.zig");
 pub const Depacketizer = @import("depacketizer.zig");
-pub const packetizer = @import("packetizer.zig");
+pub const Packetizer = @import("packetizer.zig");
 
 test {
     _ = @import("packet.zig");
