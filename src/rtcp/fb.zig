@@ -6,6 +6,23 @@ const Io = std.Io;
 pub const pli_size = 8;
 
 /// Describes a payload specific feedback (PSFB) packet for Negative Acknowledgment (NACK) as defined in RFC 4585.
+///
+/// NACK RTCP Format:
+///   0                   1                   2                   3
+///   0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
+///  +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+///  |V=2|P| FMT=1 |   PT=205      |            Length               |
+///  +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+///  |                     SSRC of packet sender                     |
+///  +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+///  |                     SSRC of media source                      |
+///  +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+///  |            PID                |             BLP               |
+///  +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+///  |            PID                |             BLP               |
+///  +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+///  |                             ...                               |
+///  +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 pub const Nack = struct {
     sender_ssrc: u32,
     media_ssrc: u32,
@@ -49,43 +66,54 @@ pub const Nack = struct {
     };
 
     pub const Writer = struct {
-        w: Io.Writer,
-        pid: u16,
-        blp: u16,
+        buffer: []u8,
+        idx: usize,
+        pid: ?u16 = null,
+        blp: u16 = 0,
 
-        pub fn init(buffer: []u8, sender_ssrc: u32, media_ssrc: u32) !Writer {
-            var writer = Io.Writer.fixed(buffer);
-            try writer.writeInt(u32, sender_ssrc, .big);
-            try writer.writeInt(u32, media_ssrc, .big);
-            return Writer{ .w = writer, .pid = 0, .blp = 0 };
+        pub const Error = error{WriteFailed};
+
+        pub fn init(buffer: []u8, sender_ssrc: u32, media_ssrc: u32) Error!Writer {
+            // Header and at least one FCI pair.
+            if (buffer.len < 12) return error.WriteFailed;
+            std.mem.writeInt(u32, buffer[0..4], sender_ssrc, .big);
+            std.mem.writeInt(u32, buffer[4..8], media_ssrc, .big);
+            return Writer{ .buffer = buffer, .idx = 8 };
         }
 
-        pub fn writeSequenceNumber(self: *Writer, seq_num: u16) !void {
-            if (self.w.end == 8) {
-                try self.w.writeInt(u16, seq_num, .big);
+        /// On `WriteFailed` the state is untouched, `finalize` still returns a valid packet.
+        pub fn writeSequenceNumber(self: *Writer, seq_num: u16) Error!void {
+            const pid = self.pid orelse {
                 self.pid = seq_num;
                 return;
-            }
+            };
 
-            const diff = seq_num -% self.pid;
+            const diff = seq_num -% pid;
             std.debug.assert(diff != 0);
 
             if (diff <= 16) {
                 self.blp |= @as(u16, 1) << @intCast(diff - 1);
             } else {
-                try self.w.writeInt(u16, self.blp, .big);
-                try self.w.writeInt(u16, seq_num, .big);
+                if (self.idx + 8 > self.buffer.len) return error.WriteFailed;
+                self.writePair();
                 self.pid = seq_num;
                 self.blp = 0;
             }
         }
 
-        pub fn finalize(self: *Writer) ![]const u8 {
-            if (self.w.end > 8) {
-                try self.w.writeInt(u16, self.blp, .big);
+        pub fn finalize(self: *Writer) []const u8 {
+            if (self.pid != null) {
+                self.writePair();
+                self.pid = null;
+                self.blp = 0;
             }
+            return self.buffer[0..self.idx];
+        }
 
-            return self.w.buffered();
+        fn writePair(self: *Writer) void {
+            std.mem.writeInt(u16, self.buffer[self.idx..][0..2], self.pid.?, .big);
+            std.mem.writeInt(u16, self.buffer[self.idx + 2 ..][0..2], self.blp, .big);
+            self.idx += 4;
         }
     };
 };
@@ -181,7 +209,26 @@ test "NACK: write sequence numbers" {
     var w = try Nack.Writer.init(&buffer, 123321, 112231);
 
     for (&sequence_numbers) |seq| try w.writeSequenceNumber(seq);
-    try std.testing.expectEqualSlices(u8, &data, try w.finalize());
+    try std.testing.expectEqualSlices(u8, &data, w.finalize());
+    // Idempotent.
+    try std.testing.expectEqualSlices(u8, &data, w.finalize());
+}
+
+test "NACK: write sequence numbers with short buffer" {
+    var buffer: [12]u8 = undefined;
+    try std.testing.expectError(error.WriteFailed, Nack.Writer.init(buffer[0..11], 123321, 112231));
+
+    var w = try Nack.Writer.init(&buffer, 123321, 112231);
+    try w.writeSequenceNumber(100);
+    try w.writeSequenceNumber(103);
+    try std.testing.expectError(error.WriteFailed, w.writeSequenceNumber(200));
+
+    // Written data is still a valid NACK.
+    const fb = try Nack.decode(w.finalize());
+    var it = fb.iterateSequenceNumbers();
+    try std.testing.expectEqual(100, it.next().?);
+    try std.testing.expectEqual(103, it.next().?);
+    try std.testing.expect(it.next() == null);
 }
 
 test "NACK: write sequence numbers across u16 wraparound" {
@@ -191,7 +238,7 @@ test "NACK: write sequence numbers across u16 wraparound" {
     var w = try Nack.Writer.init(&buffer, 123321, 112231);
 
     for (&sequence_numbers) |seq| try w.writeSequenceNumber(seq);
-    const data = try w.finalize();
+    const data = w.finalize();
 
     const fb = try Nack.decode(data);
     var it = fb.iterateSequenceNumbers();

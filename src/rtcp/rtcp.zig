@@ -46,6 +46,12 @@ pub const PayloadType = enum(u8) {
 };
 
 /// The RTCP packet header structure as defined in RFC 3550.
+///
+///   0                   1                   2                   3
+///   0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
+///  +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+///  |V=2|P| FMT=1 |   PT=205      |            Length               |
+///  +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 pub const Header = packed struct {
     /// The length of the RTCP packet in 32-bit words minus one, including the header and any padding.
     length: u16,
