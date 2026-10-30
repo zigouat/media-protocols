@@ -182,6 +182,18 @@ pub const Session = struct {
         return @as(Profile, session.cipher).rtcpOverhead();
     }
 
+    /// Registers `ssrc` so encrypting and decrypting its packets never allocates.
+    pub fn addSsrc(session: *Session, allocator: std.mem.Allocator, ssrc: u32) std.mem.Allocator.Error!void {
+        try session.rtp_ssrc_states.ensureUnusedCapacity(allocator, 1);
+        try session.rtcp_ssrc_states.ensureUnusedCapacity(allocator, 1);
+
+        const rtp_entry = session.rtp_ssrc_states.getOrPutAssumeCapacity(ssrc);
+        if (!rtp_entry.found_existing) rtp_entry.value_ptr.* = .{ .replay_detector = .init() };
+
+        const rtcp_entry = session.rtcp_ssrc_states.getOrPutAssumeCapacity(ssrc);
+        if (!rtcp_entry.found_existing) rtcp_entry.value_ptr.* = .{ .replay_detector = .init() };
+    }
+
     /// Encrypts an RTP packet using the SRTP session's cipher.
     pub fn encryptRtp(session: *Session, allocator: std.mem.Allocator, rtp_data: []const u8, dst: []u8) EncryptError![]const u8 {
         return try processRtp(session, allocator, rtp_data, dst, true);
@@ -385,6 +397,37 @@ test "Session.encryptRtcp: Aes128CmHmacSha1_80" {
     var dest: [1024]u8 = @splat(0);
     const encrypted = try session.encryptRtcp(testing.allocator, &plain_rtcp_aes_128_cm_hmac1_80, &dest);
     try testing.expectEqualSlices(u8, &encrypted_rtcp_aes_128_cm_hmac1_80, encrypted);
+}
+
+test "Session.addSsrc: encrypt does not allocate for a registered ssrc" {
+    var session = try Session.init(test_keying_material, .AesCm128HmacSha1_80);
+    defer session.deinit(testing.allocator);
+
+    const rtp_plain = &plain_rtp_aes_128_cm_hmac1_80;
+    const rtcp_plain = &plain_rtcp_aes_128_cm_hmac1_80;
+    const rtp_ssrc = std.mem.readInt(u32, rtp_plain[8..12], .big);
+    const rtcp_ssrc = std.mem.readInt(u32, rtcp_plain[4..8], .big);
+
+    var dest: [1024]u8 = undefined;
+    try testing.expectError(error.OutOfMemory, session.encryptRtp(testing.failing_allocator, rtp_plain, &dest));
+
+    try session.addSsrc(testing.allocator, rtp_ssrc);
+    try session.addSsrc(testing.allocator, rtp_ssrc);
+    try session.addSsrc(testing.allocator, rtcp_ssrc);
+    try testing.expectEqual(2, session.rtp_ssrc_states.count());
+    try testing.expectEqual(2, session.rtcp_ssrc_states.count());
+
+    var lazy = try Session.init(test_keying_material, .AesCm128HmacSha1_80);
+    defer lazy.deinit(testing.allocator);
+    var lazy_dest: [1024]u8 = undefined;
+
+    for (0..2) |_| {
+        const encrypted = try session.encryptRtp(testing.failing_allocator, rtp_plain, &dest);
+        try testing.expectEqualSlices(u8, try lazy.encryptRtp(testing.allocator, rtp_plain, &lazy_dest), encrypted);
+    }
+
+    const encrypted_rtcp = try session.encryptRtcp(testing.failing_allocator, rtcp_plain, &dest);
+    try testing.expectEqualSlices(u8, &encrypted_rtcp_aes_128_cm_hmac1_80, encrypted_rtcp);
 }
 
 test "Session: short packets and small destination buffers are rejected without state change" {
