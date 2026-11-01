@@ -61,6 +61,12 @@ fn LocalCredentials(comptime size: u8) type {
                 .password = self.getPassword(),
             };
         }
+
+        fn clear(self: *@This()) void {
+            self.user_len = 0;
+            self.pass_len = 0;
+            std.crypto.secureZero(u8, &self.buffer);
+        }
     };
 }
 
@@ -247,7 +253,13 @@ pub fn Agent(comptime config: struct {
         }
 
         pub fn close(agent: *Self) void {
+            if (agent.connection_state == .closed) return;
             agent.connection_state = .closed;
+            agent.credentials.clear();
+            if (agent.remote_credentials) |*rc| rc.clear();
+            agent.events_out.clear();
+            agent.responses.clear();
+            agent.events_out.pushBack(.{ .connection_state = .closed }) catch unreachable;
 
             agent.pairs.clearAndFree(agent.allocator);
             agent.pending_requests.clearAndFree(agent.allocator);
@@ -1843,6 +1855,19 @@ test "handleTimeout: stun server failure removes it and completes gathering" {
 
     try testing.expectEqual(0, agent.stun_clients.items.len);
     try testing.expectEqual(.complete, agent.gathering_state);
+}
+
+test "close: drops pending events and reports the closed state once" {
+    var core = try testNewAgent(.controlled);
+    defer core.deinit();
+
+    try core.setRemoteCredentials(.{ .username = "peer", .password = "peer-password-0123456789" }, 0);
+    core.close();
+    try expectConnectionStateEvent(&core, .closed);
+    try testing.expectEqual(null, core.pollEvent());
+
+    core.close();
+    try testing.expectEqual(null, core.pollEvent());
 }
 
 test "handleTimeout: new connection starts checking and schedules a connectivity check" {
