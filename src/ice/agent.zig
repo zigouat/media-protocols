@@ -61,6 +61,12 @@ fn LocalCredentials(comptime size: u8) type {
                 .password = self.getPassword(),
             };
         }
+
+        fn clear(self: *@This()) void {
+            self.user_len = 0;
+            self.pass_len = 0;
+            std.crypto.secureZero(u8, &self.buffer);
+        }
     };
 }
 
@@ -249,6 +255,8 @@ pub fn Agent(comptime config: struct {
         pub fn close(agent: *Self) void {
             if (agent.connection_state == .closed) return;
             agent.connection_state = .closed;
+            agent.credentials.clear();
+            if (agent.remote_credentials) |*rc| rc.clear();
             agent.events_out.clear();
             agent.responses.clear();
             agent.events_out.pushBack(.{ .connection_state = .closed }) catch unreachable;
