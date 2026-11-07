@@ -1,6 +1,6 @@
 .{
     .name = .media_protocols,
-    .version = "0.2.0",
+    .version = "0.3.0",
     .fingerprint = 0x41ccb1828fe25f58,
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
