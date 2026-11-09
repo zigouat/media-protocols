@@ -69,11 +69,11 @@ pub fn init(allocator: std.mem.Allocator, network_types: NetworkTypes) !IfIterat
         .windows => blk: {
             var size: windows.ULONG = 16 * 1024;
             it.buffer = try allocator.alloc(u8, size);
+            errdefer allocator.free(it.buffer);
+
             while (true) {
                 switch (GetAdaptersAddresses(0, 0, null, it.buffer.ptr, &size)) {
-                    WIN_ERROR_BUFFER_OVERFLOW => {
-                        it.buffer = try allocator.realloc(it.buffer, size);
-                    },
+                    WIN_ERROR_BUFFER_OVERFLOW => it.buffer = try allocator.realloc(it.buffer, size),
                     0 => {
                         it.ifa = @ptrCast(@alignCast(it.buffer.ptr));
                         break :blk it;
@@ -153,7 +153,7 @@ fn nextWindowsInterfaceAddress(it: *IfIterator) ?std.Io.net.IpAddress {
             switch (sockaddr.*.family) {
                 windows.ws2_32.AF.INET => {
                     if (!it.network_types.udp4) continue;
-                    const in: posix.sockaddr.in = @bitCast(sockaddr.*);
+                    const in: *posix.sockaddr.in = @ptrCast(@alignCast(sockaddr));
                     return .{ .ip4 = .{ .bytes = std.mem.toBytes(in.addr), .port = 0 } };
                 },
                 windows.ws2_32.AF.INET6 => {
