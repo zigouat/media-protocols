@@ -1,12 +1,11 @@
 const std = @import("std");
 const os = @import("builtin").os;
 
-pub fn build(b: *std.Build) void {
+pub fn build(b: *std.Build) !void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
     const media = b.dependency("media", .{ .target = target, .optimize = optimize });
-    const zbench = b.dependency("zbench", .{ .target = target, .optimize = optimize });
 
     const rtp = b.addModule("rtp", .{
         .root_source_file = b.path("src/rtp/rtp.zig"),
@@ -62,6 +61,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "stun", .module = stun },
         },
     });
+
     _ = b.addModule("protocols", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
@@ -92,7 +92,9 @@ pub fn build(b: *std.Build) void {
         }
     }
 
-    {
+    if (b.isRoot()) {
+        const zbench = try b.dependencyLazy("zbench", .{ .target = target, .optimize = optimize });
+
         const bench_step = b.step("bench", "Run all benchmarks");
 
         const benches = .{

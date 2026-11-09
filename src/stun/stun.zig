@@ -70,8 +70,8 @@ pub const MessageType = packed struct(u16) {
     _pad: u2 = 0,
 
     pub fn fromClassAndMethod(c: Class, m: Method) MessageType {
-        const m_int = @intFromEnum(m);
-        const cl_int = @intFromEnum(c);
+        const m_int = @backingInt(m);
+        const cl_int = @backingInt(c);
 
         return MessageType{
             .m1 = @intCast(m_int & 0x0F),
@@ -84,11 +84,11 @@ pub const MessageType = packed struct(u16) {
 
     pub fn method(self: MessageType) Method {
         const method_int = @as(u12, self.m3) << 7 | @as(u12, self.m2) << 4 | self.m1;
-        return @enumFromInt(method_int);
+        return @fromBackingInt(@intCast(method_int));
     }
 
     pub fn class(self: MessageType) Class {
-        return @enumFromInt((@as(u2, self.c2) << 1) | self.c1);
+        return @fromBackingInt(@intCast((@as(u2, self.c2) << 1) | self.c1));
     }
 };
 
@@ -356,7 +356,7 @@ pub const AttributeIterator = struct {
                 const class = attr_value[2] & 0x07;
                 if (class < 3 or class > 6 or attr_value[3] > 99) return error.InvalidAttribute;
                 break :blk .{ .error_code = .{
-                    .code = @enumFromInt(@as(u16, class) * 100 + attr_value[3]),
+                    .code = @fromBackingInt(@intCast(@as(u16, class) * 100 + attr_value[3])),
                     .reason = attr_value[4..attr_len],
                 } };
             },
@@ -366,7 +366,7 @@ pub const AttributeIterator = struct {
                 if (class < 3 or class > 6 or attr_value[3] > 99) return error.InvalidAttribute;
                 break :blk .{ .address_error_code = .{
                     .family = try parseFamily(attr_value[0]),
-                    .code = @enumFromInt(@as(u16, class) * 100 + attr_value[3]),
+                    .code = @fromBackingInt(@intCast(@as(u16, class) * 100 + attr_value[3])),
                     .reason = attr_value[4..attr_len],
                 } };
             },
@@ -392,7 +392,7 @@ pub const AttributeIterator = struct {
             },
             .requested_transport => blk: {
                 if (attr_len != 4) return error.InvalidAttribute;
-                break :blk .{ .requested_transport = @enumFromInt(attr_value[0]) };
+                break :blk .{ .requested_transport = @fromBackingInt(@intCast(attr_value[0])) };
             },
             .dont_fragment => blk: {
                 if (attr_len != 0) return error.InvalidAttribute;
@@ -590,17 +590,17 @@ pub const Writer = struct {
                 writeIpAddress(value, addr, w.buffer[8..20]);
             },
             .error_code => |err| {
-                const code = @intFromEnum(err.code);
+                const code = @backingInt(err.code);
                 std.mem.writeInt(u32, value[0..4], @as(u32, code / 100) << 8 | (code % 100), .big);
                 @memcpy(value[4..][0..err.reason.len], err.reason);
             },
             .address_error_code => |err| {
-                const code = @intFromEnum(err.code);
+                const code = @backingInt(err.code);
                 value[0..2].* = .{ familyByte(err.family), 0 };
                 std.mem.writeInt(u16, value[2..4], @as(u16, code / 100) << 8 | (code % 100), .big);
                 @memcpy(value[4..][0..err.reason.len], err.reason);
             },
-            .requested_transport => |transport| value[0..4].* = .{ @intFromEnum(transport), 0, 0, 0 },
+            .requested_transport => |transport| value[0..4].* = .{ @backingInt(transport), 0, 0, 0 },
             .channel_number => |ch| {
                 std.mem.writeInt(u16, value[0..2], ch, .big);
                 value[2..4].* = .{ 0, 0 };
@@ -656,7 +656,7 @@ pub const Writer = struct {
     /// Writes the attribute type and length, returns the padded value slice.
     fn reserveAttribute(w: *Writer, attr_type: AttributeType, size: u16) Error![]u8 {
         const out = try w.reserve(4 + std.mem.alignForward(usize, size, 4));
-        std.mem.writeInt(u16, out[0..2], @intFromEnum(attr_type), .big);
+        std.mem.writeInt(u16, out[0..2], @backingInt(attr_type), .big);
         std.mem.writeInt(u16, out[2..4], size, .big);
         return out[4..];
     }
@@ -1013,13 +1013,13 @@ test "Attribute: size" {
         .reason = "Not Supported",
     } }));
     try testing.expectEqual(0, Attribute.size(.use_candidate));
-    try testing.expectEqual(32, Attribute.size(.{ .userhash = &[_]u8{0} ** 32 }));
+    try testing.expectEqual(32, Attribute.size(.{ .userhash = &@as([32]u8, @splat(0)) }));
     try testing.expectEqual(4, Attribute.size(.{ .priority = 0x6E0001FF }));
     try testing.expectEqual(16, Attribute.size(.{ .software = "STUN test client" }));
     try testing.expectEqual(4, Attribute.size(.fingerprint));
     try testing.expectEqual(8, Attribute.size(.{ .ice_controlled = 0x932FF9B151263B36 }));
     try testing.expectEqual(8, Attribute.size(.{ .ice_controlling = 0x932FF9B151263B36 }));
-    try testing.expectEqual(0, Attribute.size(.{ .unknown = .{ @enumFromInt(0x8000), "data" } }));
+    try testing.expectEqual(0, Attribute.size(.{ .unknown = .{ @fromBackingInt(@intCast(0x8000)), "data" } }));
 }
 
 const allocate_request = [_]u8{

@@ -256,7 +256,7 @@ test "StunClient.handleRead: invalid stun message not processed" {
     var prng = std.Random.DefaultPrng.init(std.testing.random_seed);
     var client = testClient(prng.random());
 
-    try testing.expect(!try client.handleRead(&([_]u8{0} ** stun.header_size)));
+    try testing.expect(!try client.handleRead(&@as([stun.header_size]u8, @splat(0))));
 }
 
 test "StunClient.handleTimeout: does nothing before the deadline" {

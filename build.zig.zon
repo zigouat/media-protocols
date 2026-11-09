@@ -2,15 +2,16 @@
     .name = .media_protocols,
     .version = "0.3.0",
     .fingerprint = 0x41ccb1828fe25f58,
-    .minimum_zig_version = "0.16.0",
+    .minimum_zig_version = "0.17.1",
     .dependencies = .{
         .media = .{
-            .url = "git+https://github.com/zigouat/media.git?ref=v0.3.0#9dc3065fae941e2c6a33bae02c3407f6fa800762",
-            .hash = "media-0.3.0-qc-dCC4pAQAHSEtFNAIXgeVcf4TAMx5Dgs6skuw5HmRw",
+            .url = "git+https://github.com/zigouat/media.git#c8f2ae19ebac082c8477d0fff4b922e4929bc4d4",
+            .hash = "media-0.3.0-qc-dCH4pAQB-RYfNrbILOp6rsEvIL9m0v2OFAQIgAy1_",
         },
         .zbench = .{
-            .url = "https://github.com/hendriknielaender/zBench/archive/c24d128bfa80ec6a1b495b84ec827c6a0bec7865.tar.gz",
-            .hash = "zbench-0.11.2-YTdc76Q_AQAxonIKZ2-H1PdcESJGwyuYylw6RkPiBqyx",
+            .url = "git+https://github.com/hendriknielaender/zBench.git?ref=v0.14.1#f12a2262bcd9d300207890555c577da5e29de453",
+            .hash = "zbench-0.14.1-YTdc781OAQCR6wxqkgAwm9bG4TnFGzm8c9aE-ZPiTAU1",
+            .lazy = true,
         },
     },
     .paths = .{
