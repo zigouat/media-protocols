@@ -31,10 +31,10 @@ pub const Extension = struct {
         two_bytes = 0x1000,
         _,
 
-        pub inline fn fromInt(profile: u16) Profile {
+        pub fn fromInt(profile: u16) Profile {
             return switch (profile) {
                 0x1000...0x100F => .two_bytes,
-                else => |v| @enumFromInt(v),
+                else => |v| @fromBackingInt(v),
             };
         }
     };
@@ -103,7 +103,7 @@ pub const Extension = struct {
         w: *std.Io.Writer,
 
         pub fn init(profile: Profile, w: *std.Io.Writer) !Writer {
-            try w.writeInt(u16, @intFromEnum(profile), .big);
+            try w.writeInt(u16, @backingInt(profile), .big);
             return .{
                 .profile = profile,
                 .w = w,
@@ -176,7 +176,7 @@ pub const Extension = struct {
     }
 
     fn write(ext: *const Extension, writer: *std.Io.Writer) !void {
-        try writer.writeInt(u16, @intFromEnum(ext.profile), .big);
+        try writer.writeInt(u16, @backingInt(ext.profile), .big);
         try writer.writeInt(u16, @intCast(@divExact(ext.data.len, 4)), .big);
         try writer.writeAll(ext.data);
     }
@@ -192,7 +192,7 @@ pub const Extension = struct {
         ext.profile = .two_bytes;
         _ = try Iterator.init(ext);
 
-        ext.profile = @enumFromInt(0x9090);
+        ext.profile = @fromBackingInt(0x9090);
         try std.testing.expectError(error.UnsupportedProfile, Iterator.init(ext));
     }
 
@@ -564,7 +564,7 @@ test "packet with extension" {
 
     const parsed_packet = try Self.parse(packet[0..]);
     try std.testing.expect(parsed_packet.header.extension);
-    try std.testing.expectEqual(@as(Extension.Profile, @enumFromInt(0xBDDE)), parsed_packet.extension.?.profile);
+    try std.testing.expectEqual(@as(Extension.Profile, @fromBackingInt(0xBDDE)), parsed_packet.extension.?.profile);
     try std.testing.expectEqualSlices(u8, packet[16..28], parsed_packet.extension.?.data);
 }
 
@@ -619,16 +619,17 @@ test "getHeaderSize: fixed header, csrcs and extension" {
     try std.testing.expectEqual(12, try getHeaderSize(large_payload));
 
     // 3 csrcs
-    const csrc = [_]u8{ 0x83, 0x6F, 0x41, 0xFF, 0xD2, 0x14, 0x8B, 0xBA, 0x37, 0xB8, 0x30, 0x7F } ++ [_]u8{0} ** 12 ++ [_]u8{ 0x05, 0x00, 0x09 };
+    const csrcs: [12]u8 = @splat(0);
+    const csrc = [_]u8{ 0x83, 0x6F, 0x41, 0xFF, 0xD2, 0x14, 0x8B, 0xBA, 0x37, 0xB8, 0x30, 0x7F } ++ csrcs ++ [_]u8{ 0x05, 0x00, 0x09 };
     try std.testing.expectEqual(24, try getHeaderSize(&csrc));
 
     // 3-word extension
-    const ext = [_]u8{ 0x90, 0x6F, 0x41, 0xFF, 0xD2, 0x14, 0x8B, 0xBA, 0x37, 0xB8, 0x30, 0x7F, 0xBE, 0xDE, 0x00, 0x03 } ++ [_]u8{0} ** 12 ++ [_]u8{ 0x05, 0x00, 0x09 };
+    const ext = [_]u8{ 0x90, 0x6F, 0x41, 0xFF, 0xD2, 0x14, 0x8B, 0xBA, 0x37, 0xB8, 0x30, 0x7F, 0xBE, 0xDE, 0x00, 0x03 } ++ csrcs ++ [_]u8{ 0x05, 0x00, 0x09 };
     try std.testing.expectEqual(28, try getHeaderSize(&ext));
 
     // 3 csrcs, 3-word extension and padding
-    const all = [_]u8{ 0xB3, 0x6F, 0x41, 0xFF, 0xD2, 0x14, 0x8B, 0xBA, 0x37, 0xB8, 0x30, 0x7F } ++ [_]u8{0} ** 12 ++
-        [_]u8{ 0xBE, 0xDE, 0x00, 0x03 } ++ [_]u8{0} ** 12 ++ [_]u8{ 0x05, 0x00, 0x09, 0x00, 0x00, 0x00, 0x00, 0x04 };
+    const all = [_]u8{ 0xB3, 0x6F, 0x41, 0xFF, 0xD2, 0x14, 0x8B, 0xBA, 0x37, 0xB8, 0x30, 0x7F } ++ csrcs ++
+        [_]u8{ 0xBE, 0xDE, 0x00, 0x03 } ++ csrcs ++ [_]u8{ 0x05, 0x00, 0x09, 0x00, 0x00, 0x00, 0x00, 0x04 };
     try std.testing.expectEqual(40, try getHeaderSize(&all));
 
     try std.testing.expectError(error.MalformedPacket, getHeaderSize(plain[0..11]));
@@ -717,7 +718,7 @@ test "write packet with extension" {
             .ssrc = 0x37B8307F,
         },
         .extension = .{
-            .profile = @enumFromInt(0xBDDE),
+            .profile = @fromBackingInt(0xBDDE),
             .data = expected[16..28],
         },
         .payload = expected[28..33],

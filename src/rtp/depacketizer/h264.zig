@@ -29,7 +29,7 @@ pub fn init(packet_type: PacketType) Self {
 /// Depacketizes an H264 RTP packet to a writer.
 pub fn depacketize(self: *Self, payload: []const u8, w: *Writer) Depacketizer.Error!?Depacketizer.FrameInfo {
     const rtp_nal_header: h264.NalHeader = @bitCast(payload[0]);
-    switch (@intFromEnum(rtp_nal_header.nal_type)) {
+    switch (@backingInt(rtp_nal_header.nal_type)) {
         // Single NAL Unit Packet
         1...21 => {
             const slice = try w.writableSlice(annexb_start_code.len);
@@ -38,7 +38,7 @@ pub fn depacketize(self: *Self, payload: []const u8, w: *Writer) Depacketizer.Er
             return .{ .keyframe = rtp_nal_header.nal_type == .idr };
         },
         // STAP-A Packet
-        @intFromEnum(h264.NalType.stap_a) => {
+        @backingInt(h264.NalType.stap_a) => {
             @branchHint(.unlikely);
             var keyframe = false;
 
@@ -55,7 +55,7 @@ pub fn depacketize(self: *Self, payload: []const u8, w: *Writer) Depacketizer.Er
             return .{ .keyframe = keyframe };
         },
         // FU-A Packet
-        @intFromEnum(h264.NalType.fu_a) => {
+        @backingInt(h264.NalType.fu_a) => {
             @branchHint(.likely);
             const fu_header: FuHeader = @bitCast(payload[1]);
 
@@ -204,9 +204,9 @@ test "H264 Depacketize: Invalid StapA packet" {
 }
 
 test "H264 Depacketize: FU-A" {
-    const fua_start = [_]u8{ 0x7C, 0x85 } ++ [_]u8{0xAB} ** 160;
-    const fua_middle = [_]u8{ 0x7C, 0x05 } ++ [_]u8{0xCD} ** 160;
-    const fua_end = [_]u8{ 0x7C, 0x45 } ++ [_]u8{0xEF} ** 160;
+    const fua_start = [_]u8{ 0x7C, 0x85 } ++ @as([160]u8, @splat(0xAB));
+    const fua_middle = [_]u8{ 0x7C, 0x05 } ++ @as([160]u8, @splat(0xCD));
+    const fua_end = [_]u8{ 0x7C, 0x45 } ++ @as([160]u8, @splat(0xEF));
 
     var depacketizer: Self = .init(.annexb);
 
