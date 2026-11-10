@@ -373,6 +373,7 @@ pub const Credentials = struct {
 test {
     std.testing.refAllDecls(@This());
     _ = @import("agent.zig");
+    _ = @import("agent_test.zig");
     _ = @import("candidate_pair.zig");
     _ = @import("messages.zig");
 }
