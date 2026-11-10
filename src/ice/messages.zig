@@ -22,6 +22,38 @@ pub fn builUnauthenticatedBindingRequest(buffer: []u8, tx_id: [12]u8) ![]const u
     return w.final();
 }
 
+pub const BindingRequestConfig = struct {
+    tx_id: [12]u8,
+    username: []const u8,
+    remote_username: []const u8,
+    remote_password: []const u8,
+    use_candidate: bool,
+    role: ice.Role,
+    tie_breaker: u64,
+};
+
+pub fn buildAuthenticatedBindingRequest(buffer: []u8, config: BindingRequestConfig) error{WriteFailed}![]const u8 {
+    var w = stun.Writer.init(buffer, .{ .password = config.remote_password });
+    try w.writeHeader(.{
+        .message_type = .fromClassAndMethod(.request, .binding),
+        .transaction_id = config.tx_id,
+    });
+
+    var username = [_][]const u8{ config.remote_username, ":", config.username };
+    try w.writeRaw(.username, &username);
+    try w.writeAttribute(.{ .priority = ice.CandidateType.prflx.priority() });
+    const role_attribute: stun.Attribute = switch (config.role) {
+        .controlled => .{ .ice_controlled = config.tie_breaker },
+        .controlling => .{ .ice_controlling = config.tie_breaker },
+    };
+    if (config.use_candidate) try w.writeAttribute(.use_candidate);
+    try w.writeAttribute(role_attribute);
+    try w.writeAttribute(.{ .message_integrity = &.{} });
+    try w.writeAttribute(.fingerprint);
+
+    return w.final();
+}
+
 pub fn validateConsentFreshnessRequest(msg: *const stun.Message, password: []const u8) !void {
     var it = msg.iterateAttributes(password);
     var has_fingerprint: bool = false;
