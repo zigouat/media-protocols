@@ -20,6 +20,14 @@ pub const AddServerError = AllocError || error{
     UsernameTooLong,
 };
 
+pub const SetRemoteCredentialsError = AllocError || error{
+    CredentialsTooLong,
+    /// Credentials differ from the current ones; call `restart` first.
+    RestartRequired,
+    /// Only one of ufrag/pwd changed; a restart changes both (RFC 8839).
+    InvalidCredentials,
+};
+
 pub const NominatedPair = struct {
     local: CandidateIndex,
     remote: CandidateIndex,
@@ -149,16 +157,32 @@ pub fn Agent(comptime config: struct {
     stun_config: stun.Client.ClientConfig = .{ .max_transactions = 1 },
     turn_config: stun.turn.Config = .{},
 }) type {
+    const StunClient = stun.Client.Client(config.stun_config);
+    const TurnClient = stun.turn.TurnClient(config.turn_config);
+
     const Timers = struct {
         failed_timeout: u32,
         disconnected_timeout: u32,
         connectivity_check_interval: u16,
     };
 
+    const RestartState = struct {
+        local_credentials: LocalCredentials(config.auth_info_size),
+        remote_credentials: LocalCredentials(config.auth_info_size),
+        remote_candidate: RemoteCandidate,
+        nominated_pair: union(enum) {
+            host: Candidate,
+            relay: TurnClient,
+        },
+
+        fn deinit(self: *@This()) void {
+            self.local_credentials.clear();
+            self.remote_credentials.clear();
+        }
+    };
+
     return struct {
         const Self = @This();
-        const StunClient = stun.Client.Client(config.stun_config);
-        const TurnClient = stun.turn.TurnClient(config.turn_config);
 
         const max_events: u8 = 5;
         const initial_pairs_capacity: usize = @as(usize, config.max_candidates) * config.max_candidates / 2;
@@ -203,6 +227,8 @@ pub fn Agent(comptime config: struct {
         connectivity_check: ConnectivityChecks = .init_done,
         consent_freshness: bool,
 
+        ice_restart: ?*RestartState,
+
         const ConnectivityChecks = struct {
             index: u16,
             nomination_done: bool,
@@ -210,6 +236,14 @@ pub fn Agent(comptime config: struct {
 
             const init = ConnectivityChecks{ .index = 0, .nomination_done = false, .done = false };
             const init_done = ConnectivityChecks{ .index = 0, .nomination_done = false, .done = true };
+        };
+
+        const ConsentPath = struct {
+            local_credentials: *const LocalCredentials(config.auth_info_size),
+            remote_credentials: *const LocalCredentials(config.auth_info_size),
+            local: *const IpAddress,
+            remote: *const IpAddress,
+            turn_client: ?*TurnClient,
         };
 
         pub fn init(allocator: std.mem.Allocator, agent_config: Config) error{ OutOfMemory, CredentialsTooLong }!Self {
@@ -243,6 +277,7 @@ pub fn Agent(comptime config: struct {
                     .disconnected_timeout = agent_config.disconnected_timeout,
                     .connectivity_check_interval = agent_config.connectivity_check_interval,
                 },
+                .ice_restart = null,
             };
         }
 
@@ -250,6 +285,10 @@ pub fn Agent(comptime config: struct {
             agent.close();
             agent.events_out.clear();
             agent.responses.clear();
+            if (agent.ice_restart) |ice_restart| {
+                ice_restart.deinit();
+                agent.allocator.destroy(ice_restart);
+            }
         }
 
         pub fn close(agent: *Self) void {
@@ -355,9 +394,20 @@ pub fn Agent(comptime config: struct {
             }
         }
 
-        pub fn setRemoteCredentials(agent: *Self, credentials: ice.Credentials, now: i64) (AllocError || error{CredentialsTooLong})!void {
+        pub fn setRemoteCredentials(agent: *Self, credentials: ice.Credentials, now: i64) SetRemoteCredentialsError!void {
+            if (agent.remote_credentials) |*rc| {
+                const same_user = std.mem.eql(u8, rc.getUsername(), credentials.username);
+                const same_pass = std.mem.eql(u8, rc.getPassword(), credentials.password);
+                if (same_user and same_pass) return;
+                if (same_user or same_pass) return error.InvalidCredentials;
+                return error.RestartRequired;
+            }
+
             agent.remote_credentials = try .init(credentials.username, credentials.password);
-            try agent.setConnectionState(.checking, now);
+            switch (agent.connection_state) {
+                .new, .checking, .failed => try agent.setConnectionState(.checking, now),
+                else => {},
+            }
         }
 
         pub fn addServerReflexiveCandidate(core: *Self, base: IpAddress, mapped: IpAddress) AllocError!?CandidateIndex {
@@ -423,6 +473,46 @@ pub fn Agent(comptime config: struct {
 
             core.resumeConnectivityChecks();
             return idx;
+        }
+
+        pub fn restart(agent: *Self, new_credens: ice.Credentials) !void {
+            if (agent.ice_restart != null) return error.RestartInProgress;
+            switch (agent.connection_state) {
+                .closed => return error.Closed,
+                .new, .checking => return,
+                else => {},
+            }
+
+            const new_credentials: LocalCredentials(config.auth_info_size) = try .init(new_credens.username, new_credens.password);
+
+            // A failed agent has no usable pair to keep (RFC 7675).
+            if (agent.connection_state == .failed) {
+                agent.credentials.clear();
+                if (agent.remote_credentials) |*rc| rc.clear();
+            } else {
+                const nominated = agent.nominated_pair.?;
+                const local_candidate = &agent.candidates[nominated.local];
+                const state = try agent.allocator.create(RestartState);
+                state.* = .{
+                    .local_credentials = agent.credentials,
+                    .remote_credentials = agent.remote_credentials.?,
+                    .remote_candidate = agent.remote_candidates[nominated.remote],
+                    .nominated_pair = if (agent.findTurnClient(&local_candidate.base)) |turn_client|
+                        .{ .relay = turn_client.* }
+                    else
+                        .{ .host = local_candidate.* },
+                };
+                agent.ice_restart = state;
+            }
+
+            agent.credentials = new_credentials;
+            agent.remote_credentials = null;
+            agent.nominated_pair = null;
+            agent.selected_pair = null;
+            agent.pairs.clearAndFree(agent.allocator);
+            agent.pending_requests.clearAndFree(agent.allocator);
+            agent.stun_clients.clearAndFree(agent.allocator);
+            agent.turn_clients.clearAndFree(agent.allocator);
         }
 
         pub fn handleTimeout(agent: *Self, now: i64) AllocError!void {
@@ -576,16 +666,22 @@ pub fn Agent(comptime config: struct {
             };
 
             if (agent.consent_freshness) {
-                const payload = try agent.buildBindingRequest(agent.newTransactionId(), false, buffer);
-                const local_candidate = &agent.candidates[agent.nominated_pair.?.local];
-                const remote_addr = &agent.remote_candidates[agent.nominated_pair.?.remote].address;
+                const path = agent.consentPath();
+                const payload = try Messages.buildAuthenticatedBindingRequest(buffer, .{
+                    .tx_id = agent.newTransactionId(),
+                    .username = path.local_credentials.getUsername(),
+                    .remote_username = path.remote_credentials.getUsername(),
+                    .remote_password = path.remote_credentials.getPassword(),
+                    .use_candidate = false,
+                    .role = agent.role,
+                    .tie_breaker = agent.tie_breaker,
+                });
 
-                const result = try agent.maybeWrapInTurnMessage(
-                    &local_candidate.base,
-                    remote_addr,
-                    buffer,
-                    payload.len,
-                );
+                const result: stun.TransportMessage = if (path.turn_client) |turn_client| .{
+                    .from = path.local,
+                    .to = &turn_client.remote_addr,
+                    .data = buffer[0..try wrapInTurnMessage(turn_client, path.remote, buffer, payload.len)],
+                } else .{ .from = path.local, .to = path.remote, .data = payload };
 
                 agent.consent_freshness = false;
                 return result;
@@ -621,28 +717,6 @@ pub fn Agent(comptime config: struct {
                 core.nominated_pair = .{ .local = pair.local, .remote = pair.remote };
                 return;
             };
-        }
-
-        pub fn buildBindingRequest(core: *Self, tx_id: [12]u8, use_candidate: bool, buffer: []u8) error{WriteFailed}![]const u8 {
-            var w = stun.Writer.init(buffer, .{ .password = core.remote_credentials.?.getPassword() });
-            try w.writeHeader(.{
-                .message_type = .fromClassAndMethod(.request, .binding),
-                .transaction_id = tx_id,
-            });
-
-            var username = [_][]const u8{ core.remote_credentials.?.getUsername(), ":", core.credentials.getUsername() };
-            try w.writeRaw(.username, &username);
-            try w.writeAttribute(.{ .priority = ice.CandidateType.prflx.priority() });
-            const role_attribute: stun.Attribute = switch (core.role) {
-                .controlled => .{ .ice_controlled = core.tie_breaker },
-                .controlling => .{ .ice_controlling = core.tie_breaker },
-            };
-            if (use_candidate) try w.writeAttribute(.use_candidate);
-            try w.writeAttribute(role_attribute);
-            try w.writeAttribute(.{ .message_integrity = &.{} });
-            try w.writeAttribute(.fingerprint);
-
-            return w.final();
         }
 
         pub fn toggleRole(agent: *Self) void {
@@ -897,11 +971,15 @@ pub fn Agent(comptime config: struct {
             const local = agent.getPairLocal(pair);
             const remote = &agent.getPairRemote(pair).address;
 
-            const payload = try agent.buildBindingRequest(
-                tx_id,
-                agent.selected_pair != null and agent.selected_pair.? == idx,
-                buffer,
-            );
+            const payload = try Messages.buildAuthenticatedBindingRequest(buffer, .{
+                .tx_id = tx_id,
+                .username = agent.credentials.getUsername(),
+                .remote_username = agent.remote_credentials.?.getUsername(),
+                .remote_password = agent.remote_credentials.?.getPassword(),
+                .use_candidate = agent.selected_pair != null and agent.selected_pair.? == idx,
+                .role = agent.role,
+                .tie_breaker = agent.tie_breaker,
+            });
 
             const msg = try agent.maybeWrapInTurnMessage(
                 &local.base,
@@ -921,6 +999,37 @@ pub fn Agent(comptime config: struct {
         fn findTurnClient(agent: *Self, addr: *const IpAddress) ?*TurnClient {
             for (agent.turn_clients.items) |*turn_client| if (turn_client.local_addr.eql(addr)) return turn_client;
             return null;
+        }
+
+        /// The nominated pair and its credentials, or the pre-restart ones during a restart.
+        fn consentPath(agent: *Self) ConsentPath {
+            if (agent.ice_restart) |ice_restart| {
+                var path: ConsentPath = .{
+                    .local_credentials = &ice_restart.local_credentials,
+                    .remote_credentials = &ice_restart.remote_credentials,
+                    .local = undefined,
+                    .remote = &ice_restart.remote_candidate.address,
+                    .turn_client = null,
+                };
+                switch (ice_restart.nominated_pair) {
+                    .host => |*candidate| path.local = &candidate.base,
+                    .relay => |*client| {
+                        path.local = &client.local_addr;
+                        path.turn_client = client;
+                    },
+                }
+                return path;
+            }
+
+            const nominated = agent.nominated_pair.?;
+            const local = &agent.candidates[nominated.local].base;
+            return .{
+                .local_credentials = &agent.credentials,
+                .remote_credentials = &agent.remote_credentials.?,
+                .local = local,
+                .remote = &agent.remote_candidates[nominated.remote].address,
+                .turn_client = agent.findTurnClient(local),
+            };
         }
 
         fn nominatedTurnClient(agent: *Self) ?*TurnClient {
@@ -1031,17 +1140,21 @@ pub fn Agent(comptime config: struct {
                 .to = remote,
             };
 
-            const offset, const size = turn_client.getDataFrameSize(remote, data_len);
-            if (size > buffer.len) return error.WriteFailed;
-            @memmove(buffer[offset .. offset + data_len], buffer[0..data_len]);
-            turn_client.writeDataHeader(remote, buffer, data_len);
-            @memset(buffer[offset + data_len .. size], 0);
-
+            const size = try wrapInTurnMessage(turn_client, remote, buffer, data_len);
             return .{
                 .data = buffer[0..size],
                 .from = local,
                 .to = &turn_client.remote_addr,
             };
+        }
+
+        fn wrapInTurnMessage(turn_client: *TurnClient, addr: *const IpAddress, buffer: []u8, payload_len: usize) error{WriteFailed}!usize {
+            const offset, const size = turn_client.getDataFrameSize(addr, payload_len);
+            if (size > buffer.len) return error.WriteFailed;
+            @memmove(buffer[offset .. offset + payload_len], buffer[0..payload_len]);
+            turn_client.writeDataHeader(addr, buffer, payload_len);
+            @memset(buffer[offset + payload_len .. size], 0);
+            return size;
         }
 
         fn handleSuccessResponse(core: *Self, msg: *const stun.Message, base_addr: *const IpAddress, from: *const IpAddress) !void {
@@ -2360,16 +2473,22 @@ test "setRemoteCredentials: connectivity checks start immediately and cover pair
     try testing.expectEqual(null, try core.pollTransmit(&tx_buf));
 }
 
-test "setRemoteCredentials: replaces and frees the previous value" {
+test "setRemoteCredentials: same is a no-op, changed requires restart" {
     var core = try testNewAgent(.controlled);
     defer core.deinit();
 
     try core.setRemoteCredentials(.{ .username = "first", .password = "first-password-0123456789" }, 0);
+    try core.setRemoteCredentials(.{ .username = "first", .password = "first-password-0123456789" }, 0);
+    try testing.expectError(
+        error.RestartRequired,
+        core.setRemoteCredentials(.{ .username = "second", .password = "second-password-0123456789" }, 0),
+    );
+    try testing.expectError(
+        error.InvalidCredentials,
+        core.setRemoteCredentials(.{ .username = "first", .password = "second-password-0123456789" }, 0),
+    );
     try testing.expectEqualStrings("first", core.remote_credentials.?.getUsername());
-
-    try core.setRemoteCredentials(.{ .username = "second", .password = "second-password-0123456789" }, 0);
-    try testing.expectEqualStrings("second", core.remote_credentials.?.getUsername());
-    try testing.expectEqualStrings("second-password-0123456789", core.remote_credentials.?.getPassword());
+    try testing.expectEqualStrings("first-password-0123456789", core.remote_credentials.?.getPassword());
 }
 
 test "pollTransmit: keeps the message queued on WriteFailed" {
