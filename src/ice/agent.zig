@@ -105,7 +105,7 @@ const Response = struct {
     tx_id: [12]u8,
     local: CandidateIndex,
     remote: CandidateIndex,
-    kind: enum(u2) { success, role_conflict } = .success,
+    kind: enum(u2) { success, role_conflict, success_restart } = .success,
 };
 
 /// The maximum number of binding requests sent on a pair before it is
@@ -226,6 +226,8 @@ pub fn Agent(comptime config: struct {
 
         connectivity_check: ConnectivityChecks = .init_done,
         consent_freshness: bool,
+        /// Only the response to this request refreshes consent (RFC 7675).
+        consent_tx_id: ?[12]u8 = null,
 
         ice_restart: ?*RestartState,
 
@@ -238,9 +240,7 @@ pub fn Agent(comptime config: struct {
             const init_done = ConnectivityChecks{ .index = 0, .nomination_done = false, .done = true };
         };
 
-        const ConsentPath = struct {
-            local_credentials: *const LocalCredentials(config.auth_info_size),
-            remote_credentials: *const LocalCredentials(config.auth_info_size),
+        const DataPath = struct {
             local: *const IpAddress,
             remote: *const IpAddress,
             turn_client: ?*TurnClient,
@@ -285,10 +285,6 @@ pub fn Agent(comptime config: struct {
             agent.close();
             agent.events_out.clear();
             agent.responses.clear();
-            if (agent.ice_restart) |ice_restart| {
-                ice_restart.deinit();
-                agent.allocator.destroy(ice_restart);
-            }
         }
 
         pub fn close(agent: *Self) void {
@@ -296,6 +292,7 @@ pub fn Agent(comptime config: struct {
             agent.connection_state = .closed;
             agent.credentials.clear();
             if (agent.remote_credentials) |*rc| rc.clear();
+            agent.clearRestart();
             agent.events_out.clear();
             agent.responses.clear();
             agent.events_out.pushBack(.{ .connection_state = .closed }) catch unreachable;
@@ -404,6 +401,12 @@ pub fn Agent(comptime config: struct {
             }
 
             agent.remote_credentials = try .init(credentials.username, credentials.password);
+            if (agent.ice_restart != null) {
+                agent.connectivity_check = .init;
+                agent.connectivity_check_deadline = now + agent.timers.connectivity_check_interval;
+                return;
+            }
+
             switch (agent.connection_state) {
                 .new, .checking, .failed => try agent.setConnectionState(.checking, now),
                 else => {},
@@ -475,44 +478,58 @@ pub fn Agent(comptime config: struct {
             return idx;
         }
 
+        /// Restarts ICE with new local credentials (RFC 8445 §9).
+        ///
+        /// Gathering starts over: local addresses and servers must be added again.
         pub fn restart(agent: *Self, new_credens: ice.Credentials) !void {
             if (agent.ice_restart != null) return error.RestartInProgress;
-            switch (agent.connection_state) {
-                .closed => return error.Closed,
-                .new, .checking => return,
-                else => {},
-            }
+            if (agent.connection_state == .closed) return error.Closed;
 
             const new_credentials: LocalCredentials(config.auth_info_size) = try .init(new_credens.username, new_credens.password);
 
-            // A failed agent has no usable pair to keep (RFC 7675).
-            if (agent.connection_state == .failed) {
+            // Nothing was checked against the peer yet.
+            if (agent.connection_state == .new) {
                 agent.credentials.clear();
-                if (agent.remote_credentials) |*rc| rc.clear();
-            } else {
-                const nominated = agent.nominated_pair.?;
-                const local_candidate = &agent.candidates[nominated.local];
-                const state = try agent.allocator.create(RestartState);
-                state.* = .{
-                    .local_credentials = agent.credentials,
-                    .remote_credentials = agent.remote_credentials.?,
-                    .remote_candidate = agent.remote_candidates[nominated.remote],
-                    .nominated_pair = if (agent.findTurnClient(&local_candidate.base)) |turn_client|
-                        .{ .relay = turn_client.* }
-                    else
-                        .{ .host = local_candidate.* },
-                };
-                agent.ice_restart = state;
+                agent.credentials = new_credentials;
+                return;
+            }
+
+            switch (agent.connection_state) {
+                .checking, .failed => {
+                    agent.credentials.clear();
+                    if (agent.remote_credentials) |*rc| rc.clear();
+                },
+                else => {
+                    const nominated = agent.nominated_pair.?;
+                    const local_candidate = &agent.candidates[nominated.local];
+                    const state = try agent.allocator.create(RestartState);
+                    state.* = .{
+                        .local_credentials = agent.credentials,
+                        .remote_credentials = agent.remote_credentials.?,
+                        .remote_candidate = agent.remote_candidates[nominated.remote],
+                        .nominated_pair = if (agent.findTurnClient(&local_candidate.base)) |turn_client|
+                            .{ .relay = turn_client.* }
+                        else
+                            .{ .host = local_candidate.* },
+                    };
+                    agent.ice_restart = state;
+                },
             }
 
             agent.credentials = new_credentials;
             agent.remote_credentials = null;
             agent.nominated_pair = null;
             agent.selected_pair = null;
-            agent.pairs.clearAndFree(agent.allocator);
-            agent.pending_requests.clearAndFree(agent.allocator);
-            agent.stun_clients.clearAndFree(agent.allocator);
-            agent.turn_clients.clearAndFree(agent.allocator);
+            agent.connectivity_check = .init_done;
+            agent.pairs.clearRetainingCapacity();
+            agent.pending_requests.clearRetainingCapacity();
+            agent.responses.clear();
+            agent.stun_clients.clearRetainingCapacity();
+            agent.turn_clients.clearRetainingCapacity();
+            agent.gathering_state = .new;
+            agent.gathering_done = false;
+            agent.candidates_len = 0;
+            agent.remote_candidates_len = 0;
         }
 
         pub fn handleTimeout(agent: *Self, now: i64) AllocError!void {
@@ -532,6 +549,11 @@ pub fn Agent(comptime config: struct {
                 if (!try agent.handleTurnClientEvents(turn_idx, now)) turn_idx += 1;
             }
 
+            if (agent.restartTurnClient()) |turn_client| {
+                turn_client.handleTimeout(now) catch {};
+                while (turn_client.pollEvent()) |_| {}
+            }
+
             if (now >= agent.connectivity_check_deadline) {
                 agent.connectivity_check_deadline = now + agent.timers.connectivity_check_interval;
                 if (agent.nominated_pair == null) agent.connectivity_check = .init;
@@ -542,7 +564,8 @@ pub fn Agent(comptime config: struct {
 
             if (now >= agent.keep_alive_deadline) {
                 agent.keep_alive_deadline = now + keep_alive_interval;
-                if (agent.connection_state == .connected) {
+                // `completed` drops the checklist, which the new generation still needs.
+                if (agent.connection_state == .connected and agent.ice_restart == null) {
                     try agent.setConnectionState(.completed, now);
                 }
                 agent.consent_freshness = true;
@@ -550,7 +573,14 @@ pub fn Agent(comptime config: struct {
 
             if (now >= agent.disconnected_connection_deadline) {
                 switch (agent.connection_state) {
-                    .checking, .disconnected => try agent.setConnectionState(.failed, now),
+                    .checking => try agent.setConnectionState(.failed, now),
+                    .disconnected => if (agent.ice_restart != null) {
+                        // The pre-restart pair is lost; the new generation carries on.
+                        agent.clearRestart();
+                        agent.consent_freshness = false;
+                        agent.keep_alive_deadline = std.math.maxInt(i64);
+                        try agent.setConnectionState(if (agent.remote_credentials != null) .checking else .failed, now);
+                    } else try agent.setConnectionState(.failed, now),
                     else => try agent.setConnectionState(.disconnected, now),
                 }
             }
@@ -576,62 +606,56 @@ pub fn Agent(comptime config: struct {
                 .data = data,
             };
 
-            for (agent.turn_clients.items, 0..) |*turn_client, i| {
-                if (turn_client.local_addr.eql(new_message.to) and turn_client.remote_addr.eql(new_message.from)) {
-                    // ignore malformed messages
-                    turn_client.handleRead(new_message.data, now) catch return .consumed;
-                    _ = try agent.handleTurnClientEvents(i, now);
-                    return .consumed;
-                }
-            }
+            if (try agent.maybeHandleTurnMessage(&new_message, now)) return .consumed;
 
-            switch (agent.connection_state) {
-                .completed, .disconnected, .failed => |state| {
-                    agent.disconnected_connection_deadline = now + agent.timers.disconnected_timeout;
+            if (try agent.maybeHandleConsentResponse(&new_message, now)) return .consumed;
+
+            if (agent.maybeHandleOldGenerationMessage(&new_message) catch return .consumed) return .consumed;
+
+            // During a restart, everything else belongs to the new generation.
+            if (agent.ice_restart == null) switch (agent.connection_state) {
+                .completed, .disconnected, .failed => {
                     msg = stun.Message.parse(new_message.data) catch return .consumed;
-                    if (state == .disconnected) try agent.setConnectionState(.completed, now);
                     if (try agent.handleConsentFreshness(&msg, new_message.to, new_message.from)) |resp| {
                         agent.queueResponse(resp);
                     }
 
                     return .consumed;
                 },
-                else => {
-                    for (agent.stun_clients.items, 0..) |*stun_server, i| {
-                        if (stun_server.local_addr.eql(new_message.to)) if (try stun_server.handleRead(new_message.data)) {
-                            _ = try agent.handleStunClientEvents(i);
-                            return .consumed;
-                        };
-                    }
+                else => {},
+            };
 
-                    return agent.handleStunMessage(new_message, now);
-                },
+            for (agent.stun_clients.items, 0..) |*stun_server, i| {
+                if (stun_server.local_addr.eql(new_message.to)) if (try stun_server.handleRead(new_message.data)) {
+                    _ = try agent.handleStunClientEvents(i);
+                    return .consumed;
+                };
             }
+
+            return agent.handleStunMessage(new_message, now);
         }
 
         /// Frames application data for the nominated pair. Must be called after nomination.
         ///
         /// The payload must already be at `buffer[header_size..]`, see `getDataFrameSize`.
         pub fn handleWrite(agent: *Self, buffer: []u8, payload_len: usize) error{WriteFailed}!stun.TransportMessage {
-            std.debug.assert(agent.nominated_pair != null);
-            const pair = agent.nominated_pair.?;
-            const local = &agent.candidates[pair.local].base;
-            const remote = &agent.remote_candidates[pair.remote].address;
+            std.debug.assert(agent.nominated_pair != null or agent.ice_restart != null);
+            const path = agent.activePath();
 
-            if (agent.nominatedTurnClient()) |turn_client| {
-                const header_size, const size = turn_client.getDataFrameSize(remote, payload_len);
+            if (path.turn_client) |turn_client| {
+                const header_size, const size = turn_client.getDataFrameSize(path.remote, payload_len);
                 if (size > buffer.len) return error.WriteFailed;
-                turn_client.writeDataHeader(remote, buffer, payload_len);
+                turn_client.writeDataHeader(path.remote, buffer, payload_len);
                 const padding = buffer[header_size + payload_len .. size];
                 switch (padding.len) {
                     inline 0...3 => |len| padding[0..len].* = @splat(0),
                     else => unreachable,
                 }
-                return .{ .data = buffer[0..size], .from = local, .to = &turn_client.remote_addr };
+                return .{ .data = buffer[0..size], .from = path.local, .to = &turn_client.remote_addr };
             }
 
             if (payload_len > buffer.len) return error.WriteFailed;
-            return .{ .data = buffer[0..payload_len], .from = local, .to = remote };
+            return .{ .data = buffer[0..payload_len], .from = path.local, .to = path.remote };
         }
 
         pub fn pollEvent(core: *Self) ?Event {
@@ -639,19 +663,42 @@ pub fn Agent(comptime config: struct {
         }
 
         pub fn pollTransmit(agent: *Self, buffer: []u8) error{WriteFailed}!?stun.TransportMessage {
-            if (agent.responses.peekFront()) |resp| {
-                const remote = &agent.remote_candidates[resp.remote].address;
-                const password = agent.credentials.getPassword();
+            while (agent.responses.peekFront()) |resp| {
+                if (resp.kind == .success_restart and agent.ice_restart == null) {
+                    _ = agent.responses.popFront();
+                    continue;
+                }
+
+                const active_path = if (resp.kind == .success_restart)
+                    agent.activePath()
+                else
+                    DataPath{
+                        .local = &agent.candidates[resp.local].base,
+                        .remote = &agent.remote_candidates[resp.remote].address,
+                        .turn_client = agent.findTurnClient(&agent.candidates[resp.local].base),
+                    };
+
+                const password = if (resp.kind == .success_restart)
+                    agent.ice_restart.?.local_credentials.getPassword()
+                else
+                    agent.credentials.getPassword();
                 const payload = switch (resp.kind) {
-                    .success => try Messages.buildSuccessResponse(resp.tx_id, password, remote, buffer),
+                    .success, .success_restart => try Messages.buildSuccessResponse(resp.tx_id, password, active_path.remote, buffer),
                     .role_conflict => try Messages.buildRoleConflictErrorMessage(resp.tx_id, password, buffer),
                 };
-                const result = try agent.maybeWrapInTurnMessage(
-                    &agent.candidates[resp.local].base,
-                    remote,
-                    buffer,
-                    payload.len,
-                );
+
+                const result: stun.TransportMessage = blk: {
+                    if (active_path.turn_client) |turn_client| {
+                        const size = try wrapInTurnMessage(turn_client, active_path.remote, buffer, payload.len);
+                        break :blk .{
+                            .from = active_path.local,
+                            .to = &turn_client.remote_addr,
+                            .data = buffer[0..size],
+                        };
+                    }
+
+                    break :blk .{ .from = active_path.local, .to = active_path.remote, .data = buffer[0..payload.len] };
+                };
 
                 _ = agent.responses.popFront();
                 return result;
@@ -665,13 +712,20 @@ pub fn Agent(comptime config: struct {
                 return msg;
             };
 
+            if (agent.restartTurnClient()) |turn_client| if (try turn_client.pollTransmit(buffer)) |msg| {
+                return msg;
+            };
+
             if (agent.consent_freshness) {
-                const path = agent.consentPath();
+                const path = agent.activePath();
+                const local_credentials, const remote_credentials = agent.consentCredentials();
+                const tx_id = agent.newTransactionId();
+
                 const payload = try Messages.buildAuthenticatedBindingRequest(buffer, .{
-                    .tx_id = agent.newTransactionId(),
-                    .username = path.local_credentials.getUsername(),
-                    .remote_username = path.remote_credentials.getUsername(),
-                    .remote_password = path.remote_credentials.getPassword(),
+                    .tx_id = tx_id,
+                    .username = local_credentials.getUsername(),
+                    .remote_username = remote_credentials.getUsername(),
+                    .remote_password = remote_credentials.getPassword(),
                     .use_candidate = false,
                     .role = agent.role,
                     .tie_breaker = agent.tie_breaker,
@@ -684,6 +738,7 @@ pub fn Agent(comptime config: struct {
                 } else .{ .from = path.local, .to = path.remote, .data = payload };
 
                 agent.consent_freshness = false;
+                agent.consent_tx_id = tx_id;
                 return result;
             }
 
@@ -699,6 +754,10 @@ pub fn Agent(comptime config: struct {
             };
 
             for (agent.turn_clients.items) |*turn_client| if (turn_client.pollTimeout()) |d| {
+                deadline = @min(deadline, d);
+            };
+
+            if (agent.restartTurnClient()) |turn_client| if (turn_client.pollTimeout()) |d| {
                 deadline = @min(deadline, d);
             };
 
@@ -736,10 +795,10 @@ pub fn Agent(comptime config: struct {
         /// Returns the header size and total frame size of a payload sent on the nominated pair.
         /// The header size is non-zero only for relay candidates. Must be called after nomination.
         pub fn getDataFrameSize(agent: *Self, payload_len: usize) struct { u32, usize } {
-            std.debug.assert(agent.nominated_pair != null);
-            const turn_client = agent.nominatedTurnClient() orelse return .{ 0, payload_len };
-            const remote = &agent.remote_candidates[agent.nominated_pair.?.remote].address;
-            return turn_client.getDataFrameSize(remote, payload_len);
+            std.debug.assert(agent.nominated_pair != null or agent.ice_restart != null);
+            const path = agent.activePath();
+            const turn_client = path.turn_client orelse return .{ 0, payload_len };
+            return turn_client.getDataFrameSize(path.remote, payload_len);
         }
 
         fn newTransactionId(agent: *Self) [12]u8 {
@@ -827,6 +886,7 @@ pub fn Agent(comptime config: struct {
             }
 
             if (!was_nominated) if (agent.nominated_pair) |nominated| {
+                agent.clearRestart();
                 try agent.events_out.pushBack(.{ .nominated = nominated });
                 try agent.setConnectionState(.connected, now);
             };
@@ -926,12 +986,14 @@ pub fn Agent(comptime config: struct {
 
         /// Check pairs added after the current round finished without waiting for the next interval.
         fn resumeConnectivityChecks(agent: *Self) void {
-            if (agent.connection_state == .checking and agent.nominated_pair == null) agent.connectivity_check.done = false;
+            const checking = agent.connection_state == .checking or agent.ice_restart != null;
+            if (checking and agent.nominated_pair == null) agent.connectivity_check.done = false;
         }
 
         fn nextConnectivityCheck(agent: *Self, buffer: []u8) !?stun.TransportMessage {
             const check = &agent.connectivity_check;
-            if (check.done) return null;
+            // After a restart, checks wait for the peer's new credentials.
+            if (check.done or agent.remote_credentials == null) return null;
 
             if (!check.nomination_done) {
                 const msg = if (agent.selected_pair) |idx|
@@ -1001,12 +1063,10 @@ pub fn Agent(comptime config: struct {
             return null;
         }
 
-        /// The nominated pair and its credentials, or the pre-restart ones during a restart.
-        fn consentPath(agent: *Self) ConsentPath {
+        /// The nominated pair, or the pre-restart one during a restart.
+        fn activePath(agent: *Self) DataPath {
             if (agent.ice_restart) |ice_restart| {
-                var path: ConsentPath = .{
-                    .local_credentials = &ice_restart.local_credentials,
-                    .remote_credentials = &ice_restart.remote_credentials,
+                var path: DataPath = .{
                     .local = undefined,
                     .remote = &ice_restart.remote_candidate.address,
                     .turn_client = null,
@@ -1022,14 +1082,51 @@ pub fn Agent(comptime config: struct {
             }
 
             const nominated = agent.nominated_pair.?;
-            const local = &agent.candidates[nominated.local].base;
             return .{
-                .local_credentials = &agent.credentials,
-                .remote_credentials = &agent.remote_credentials.?,
-                .local = local,
+                .local = &agent.candidates[nominated.local].base,
                 .remote = &agent.remote_candidates[nominated.remote].address,
-                .turn_client = agent.findTurnClient(local),
+                .turn_client = agent.nominatedTurnClient(),
             };
+        }
+
+        fn maybeHandleTurnMessage(agent: *Self, message: *const stun.TransportMessage, now: i64) !bool {
+            // The pre-restart client may share its socket and server with a new one;
+            // each ignores transactions it doesn't own.
+            var consumed = false;
+            if (agent.restartTurnClient()) |turn_client| {
+                if (turn_client.local_addr.eql(message.to) and turn_client.remote_addr.eql(message.from)) {
+                    turn_client.handleRead(message.data, now) catch return true;
+                    while (turn_client.pollEvent()) |_| {}
+                    consumed = true;
+                }
+            }
+
+            for (agent.turn_clients.items, 0..) |*turn_client, i| {
+                if (turn_client.local_addr.eql(message.to) and turn_client.remote_addr.eql(message.from)) {
+                    // ignore malformed messages
+                    turn_client.handleRead(message.data, now) catch return true;
+                    _ = try agent.handleTurnClientEvents(i, now);
+                    return true;
+                }
+            }
+
+            return consumed;
+        }
+
+        fn restartTurnClient(agent: *Self) ?*TurnClient {
+            const ice_restart = agent.ice_restart orelse return null;
+            return switch (ice_restart.nominated_pair) {
+                .relay => |*turn_client| turn_client,
+                .host => null,
+            };
+        }
+
+        fn clearRestart(agent: *Self) void {
+            const ice_restart = agent.ice_restart orelse return;
+            ice_restart.deinit();
+            agent.allocator.destroy(ice_restart);
+            agent.ice_restart = null;
+            agent.consent_tx_id = null;
         }
 
         fn nominatedTurnClient(agent: *Self) ?*TurnClient {
@@ -1203,6 +1300,62 @@ pub fn Agent(comptime config: struct {
                     .status = .succeeded,
                 });
             }
+        }
+
+        fn maybeHandleOldGenerationMessage(agent: *Self, message: *const stun.TransportMessage) !bool {
+            const ice_restart = agent.ice_restart orelse return false;
+            const msg = try stun.Message.parse(message.data);
+            if (msg.header.message_type.class() != .request) return false;
+
+            var it = msg.iterateAttributes(&.{});
+            const username = blk: {
+                while (try it.next()) |attr| {
+                    if (attr == .username) {
+                        const pos = std.mem.findScalarPos(u8, attr.username, 0, ':') orelse return true;
+                        break :blk attr.username[0..pos];
+                    }
+                } else return true; // Each stun request must have a username attribute
+            };
+
+            if (!std.mem.eql(u8, username, ice_restart.local_credentials.getUsername())) return false;
+
+            const path = agent.activePath();
+            if (!message.to.eql(path.local) or !message.from.eql(path.remote)) return true;
+
+            try Messages.validateConsentFreshnessRequest(&msg, ice_restart.local_credentials.getPassword());
+            agent.queueResponse(.{ .kind = .success_restart, .tx_id = msg.header.transaction_id, .local = 0, .remote = 0 });
+            return true;
+        }
+
+        fn maybeHandleConsentResponse(agent: *Self, message: *const stun.TransportMessage, now: i64) !bool {
+            const tx_id = agent.consent_tx_id orelse return false;
+            const msg = stun.Message.parse(message.data) catch return false;
+            if (msg.header.message_type.class() != .success_response) return false;
+            if (!std.mem.eql(u8, &tx_id, &msg.header.transaction_id)) return false;
+
+            _, const remote_credentials = agent.consentCredentials();
+            _ = Messages.parseAndValidateStunResponse(&msg, remote_credentials.getPassword()) catch return true;
+            agent.consent_tx_id = null;
+
+            switch (agent.connection_state) {
+                .failed => return true,
+                // `completed` would drop the new generation's checklist.
+                .disconnected => if (agent.ice_restart != null) {
+                    try agent.events_out.pushBack(.{ .connection_state = .completed });
+                    agent.connection_state = .completed;
+                } else try agent.setConnectionState(.completed, now),
+                else => {},
+            }
+
+            agent.disconnected_connection_deadline = now + agent.timers.disconnected_timeout;
+            return true;
+        }
+
+        fn consentCredentials(agent: *Self) struct { *LocalCredentials(config.auth_info_size), *LocalCredentials(config.auth_info_size) } {
+            return if (agent.ice_restart) |ice_restart|
+                .{ &ice_restart.local_credentials, &ice_restart.remote_credentials }
+            else
+                .{ &agent.credentials, &agent.remote_credentials.? };
         }
 
         fn handleConsentFreshness(agent: *Self, msg: *const stun.Message, to: *const IpAddress, from: *const IpAddress) !?Response {
