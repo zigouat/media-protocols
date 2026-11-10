@@ -20,6 +20,13 @@ pub const AddServerError = AllocError || error{
     UsernameTooLong,
 };
 
+pub const RestartError = error{
+    Closed,
+    /// The previous restart's new generation hasn't nominated a pair yet.
+    RestartInProgress,
+    CredentialsTooLong,
+};
+
 pub const SetRemoteCredentialsError = AllocError || error{
     CredentialsTooLong,
     /// Credentials differ from the current ones; call `restart` first.
@@ -230,6 +237,8 @@ pub fn Agent(comptime config: struct {
         consent_tx_id: ?[12]u8 = null,
 
         ice_restart: ?*RestartState,
+        /// Restart credentials advertised but not applied yet.
+        pending_credentials: ?LocalCredentials(config.auth_info_size) = null,
 
         const ConnectivityChecks = struct {
             index: u16,
@@ -293,6 +302,7 @@ pub fn Agent(comptime config: struct {
             agent.credentials.clear();
             if (agent.remote_credentials) |*rc| rc.clear();
             agent.clearRestart();
+            agent.discardRestart();
             agent.events_out.clear();
             agent.responses.clear();
             agent.events_out.pushBack(.{ .connection_state = .closed }) catch unreachable;
@@ -309,8 +319,10 @@ pub fn Agent(comptime config: struct {
             return if (core.remote_credentials) |*rc| rc.toIceCredentials() else null;
         }
 
+        /// The credentials to advertise: the staged ones during a pending restart.
         pub fn getLocalCredentials(core: *const Self) ice.Credentials {
-            return core.credentials.toIceCredentials();
+            const credentials = if (core.pending_credentials) |*pending| pending else &core.credentials;
+            return credentials.toIceCredentials();
         }
 
         pub fn getNominatedRemoteAddress(core: *const Self) ?IpAddress {
@@ -478,28 +490,43 @@ pub fn Agent(comptime config: struct {
             return idx;
         }
 
-        /// Restarts ICE with new local credentials (RFC 8445 §9).
+        /// Stages new local credentials for an ICE restart (RFC 8445 §9) without touching the
+        /// live session: `getLocalCredentials` returns them so an offer can advertise them.
         ///
-        /// Gathering starts over: local addresses and servers must be added again.
-        pub fn restart(agent: *Self, new_credens: ice.Credentials) !void {
-            if (agent.ice_restart != null) return error.RestartInProgress;
+        /// Offerer: stage when creating the offer, `applyRestart` when the local description is
+        /// set, `discardRestart` on rollback. Staging again replaces the previous credentials.
+        pub fn stageRestart(agent: *Self, credentials: ice.Credentials) RestartError!void {
             if (agent.connection_state == .closed) return error.Closed;
+            if (agent.ice_restart != null) return error.RestartInProgress;
 
-            const new_credentials: LocalCredentials(config.auth_info_size) = try .init(new_credens.username, new_credens.password);
+            const pending: LocalCredentials(config.auth_info_size) = try .init(credentials.username, credentials.password);
+            agent.discardRestart();
+            agent.pending_credentials = pending;
+        }
 
-            // Nothing was checked against the peer yet.
-            if (agent.connection_state == .new) {
-                agent.credentials.clear();
-                agent.credentials = new_credentials;
-                return;
-            }
+        /// Applies the staged restart; a no-op when nothing is staged.
+        ///
+        /// A working pair keeps carrying data until the new generation nominates one.
+        /// Gathering starts over: local addresses and servers must be added again.
+        pub fn applyRestart(agent: *Self) AllocError!void {
+            if (agent.pending_credentials == null) return;
+            std.debug.assert(agent.ice_restart == null);
 
             switch (agent.connection_state) {
+                .closed => unreachable, // close() discards staged credentials
+                // Nothing was checked against the peer yet.
+                .new => {
+                    agent.credentials.clear();
+                    agent.credentials = agent.pending_credentials.?;
+                    agent.pending_credentials = null;
+                    return;
+                },
+                // No usable pair to keep; a failed one has lost consent (RFC 7675).
                 .checking, .failed => {
                     agent.credentials.clear();
                     if (agent.remote_credentials) |*rc| rc.clear();
                 },
-                else => {
+                .connected, .completed, .disconnected => {
                     const nominated = agent.nominated_pair.?;
                     const local_candidate = &agent.candidates[nominated.local];
                     const state = try agent.allocator.create(RestartState);
@@ -516,7 +543,8 @@ pub fn Agent(comptime config: struct {
                 },
             }
 
-            agent.credentials = new_credentials;
+            agent.credentials = agent.pending_credentials.?;
+            agent.pending_credentials = null;
             agent.remote_credentials = null;
             agent.nominated_pair = null;
             agent.selected_pair = null;
@@ -530,6 +558,21 @@ pub fn Agent(comptime config: struct {
             agent.gathering_done = false;
             agent.candidates_len = 0;
             agent.remote_candidates_len = 0;
+        }
+
+        /// Drops staged restart credentials (rollback); the live session is untouched.
+        pub fn discardRestart(agent: *Self) void {
+            if (agent.pending_credentials) |*pending| pending.clear();
+            agent.pending_credentials = null;
+        }
+
+        /// Stages and applies a restart in one step.
+        ///
+        /// Answerer: when `setRemoteCredentials` returns `error.RestartRequired`, restart with
+        /// new local credentials, then set the remote ones again.
+        pub fn restart(agent: *Self, credentials: ice.Credentials) (RestartError || AllocError)!void {
+            try agent.stageRestart(credentials);
+            try agent.applyRestart();
         }
 
         pub fn handleTimeout(agent: *Self, now: i64) AllocError!void {
@@ -1475,7 +1518,7 @@ fn testTurnServer(address: IpAddress) Server {
 fn testNewAgent(role: ice.Role) !TestAgent {
     return TestAgent.init(testing.allocator, .{
         .role = role,
-        .credentials = .{ .username = "user", .password = "VOkJxbRl1RmTxUk/WvJxBt" },
+        .credentials = .{ .username = "user", .password = test_local_password },
         .random = rand.random(),
     });
 }
@@ -1592,6 +1635,66 @@ fn expectGatheringStateEvent(core: *TestAgent, state: ice.GatheringState) !void 
 fn testRespond(core: *TestAgent, msg: *const stun.Message, base: *const IpAddress, from: *const IpAddress, buffer: []u8) !stun.TransportMessage {
     core.queueResponse((try core.handleRequest(msg, base, from)) orelse return error.ExpectedResponse);
     return (try core.pollTransmit(buffer)) orelse error.ExpectedTransmit;
+}
+
+const test_local_password = "VOkJxbRl1RmTxUk/WvJxBt";
+const test_peer_password = "peer-password-0123456789";
+const test_new_credentials: ice.Credentials = .{ .username = "user2", .password = "user2-password-0123456789" };
+const test_new_peer: ice.Credentials = .{ .username = "peer2", .password = "peer2-password-0123456789" };
+
+const TestAddrs = struct {
+    local: IpAddress,
+    remote: IpAddress,
+    other: IpAddress,
+    server: IpAddress,
+    relayed: IpAddress,
+    new_local: IpAddress,
+    new_remote: IpAddress,
+
+    fn init() !TestAddrs {
+        return .{
+            .local = try IpAddress.parse("10.0.0.10", 4000),
+            .remote = try IpAddress.parse("192.168.1.10", 1000),
+            .other = try IpAddress.parse("192.168.1.66", 1000),
+            .server = try IpAddress.parse("203.0.113.1", 3478),
+            .relayed = try IpAddress.parse("203.0.113.9", 40000),
+            .new_local = try IpAddress.parse("10.0.0.20", 4000),
+            .new_remote = try IpAddress.parse("192.168.1.20", 1000),
+        };
+    }
+};
+
+/// A completed agent nominated on `local` -> `remote`, relayed through `server` if `relay`.
+fn testCompletedAgent(role: ice.Role, relay: bool, addrs: *const TestAddrs) !TestAgent {
+    var core = try testNewAgent(role);
+    errdefer core.deinit();
+    if (relay) try core.addServer(addrs.local, testTurnServer(addrs.server), 0);
+    core.connection_state = .completed;
+    core.remote_credentials = try .init("peer", test_peer_password);
+    core.candidates[0] = if (relay) .initRelay(addrs.local, addrs.relayed) else .initHost(addrs.local);
+    core.candidates_len = 1;
+    core.remote_candidates[0] = testRemoteCandidate(addrs.remote);
+    core.remote_candidates_len = 1;
+    core.nominated_pair = .{ .local = 0, .remote = 0 };
+    return core;
+}
+
+/// Fails unless the message carries a MESSAGE-INTEGRITY that verifies with `password`.
+fn expectSignedWith(data: []const u8, password: []const u8) !void {
+    const msg = try stun.Message.parse(data);
+    var it = msg.iterateAttributes(password);
+    var signed = false;
+    while (try it.next()) |attr| if (attr == .message_integrity) {
+        signed = true;
+    };
+    try testing.expect(signed);
+}
+
+fn testUsername(data: []const u8) ![]const u8 {
+    const msg = try stun.Message.parse(data);
+    var it = msg.iterateAttributes(&.{});
+    while (try it.next()) |attr| if (attr == .username) return attr.username;
+    return error.ExpectedAttribute;
 }
 
 test "handleRequest: generate success response" {
@@ -2953,4 +3056,246 @@ test "handleWrite: adds turn header in place and passes host data through" {
     try testing.expect(attr.xor_peer_address.eql(&remote));
 
     try testing.expectError(error.WriteFailed, agent.handleWrite(buffer[0 .. size - 1], payload.len));
+}
+
+test "stageRestart/discardRestart/applyRestart: staged credentials are advertised without touching the live session" {
+    const addrs = try TestAddrs.init();
+    var core = try testCompletedAgent(.controlling, false, &addrs);
+    defer core.deinit();
+
+    var buffer: [1024]u8 = undefined;
+    var tx_buf: [1024]u8 = undefined;
+
+    try core.applyRestart(); // nothing staged
+    try testing.expectEqual(null, core.ice_restart);
+
+    const too_long: [65]u8 = @splat('a');
+    try testing.expectError(error.CredentialsTooLong, core.stageRestart(.{ .username = &too_long, .password = "x" }));
+    try core.stageRestart(.{ .username = "first", .password = "first-password-0123456789" });
+    try core.stageRestart(test_new_credentials);
+    try testing.expectEqualStrings("user2", core.getLocalCredentials().username);
+    try testing.expectEqualStrings("user", core.credentials.getUsername());
+
+    // The live session still authenticates with the current credentials.
+    const req = try testBuildRequest(.{ .ice_controlled = 1, .username = "user:peer" }, test_local_password, &buffer);
+    _ = try core.handleRead(.{ .from = &addrs.remote, .to = &addrs.local, .data = req.bytes }, 0);
+    const resp = (try core.pollTransmit(&tx_buf)) orelse return error.ExpectedTransmit;
+    try expectSignedWith(resp.data, test_local_password);
+
+    core.discardRestart();
+    try testing.expectEqualStrings("user", core.getLocalCredentials().username);
+    try core.applyRestart();
+    try testing.expectEqual(null, core.ice_restart);
+
+    try core.stageRestart(test_new_credentials);
+    core.close();
+    try testing.expectEqual(null, core.pending_credentials);
+    try testing.expectError(error.Closed, core.stageRestart(test_new_credentials));
+}
+
+test "applyRestart: a completed agent keeps the pre-restart pair for data and consent" {
+    const addrs = try TestAddrs.init();
+    var core = try testCompletedAgent(.controlling, false, &addrs);
+    defer core.deinit();
+
+    var buffer: [1024]u8 = undefined;
+    var tx_buf: [1024]u8 = undefined;
+
+    core.queueResponse(.{ .tx_id = @splat(1), .local = 0, .remote = 0 });
+    try core.restart(test_new_credentials);
+
+    try testing.expect(core.ice_restart != null);
+    try testing.expectEqual(.completed, core.connection_state);
+    try testing.expectEqual(null, core.pollEvent());
+    try testing.expectEqual(null, core.remote_credentials);
+    try testing.expectEqual(null, core.nominated_pair);
+    try testing.expectEqual(0, core.candidates_len);
+    try testing.expectEqual(0, core.remote_candidates_len);
+    try testing.expectEqual(.new, core.gathering_state);
+    try testing.expectEqual(null, try core.pollTransmit(&tx_buf)); // previous generation's response dropped
+
+    // Data and consent still use the pre-restart pair and credentials.
+    const data = try core.handleWrite(&buffer, 4);
+    try testing.expect(data.from.eql(&addrs.local) and data.to.eql(&addrs.remote));
+
+    core.consent_freshness = true;
+    const consent = (try core.pollTransmit(&tx_buf)) orelse return error.ExpectedTransmit;
+    try testing.expect(consent.to.eql(&addrs.remote));
+    try testing.expectEqualStrings("peer:user", try testUsername(consent.data));
+    try expectSignedWith(consent.data, test_peer_password);
+
+    // Old-credentials requests are answered on the pre-restart pair only.
+    const req = try testBuildRequest(.{ .ice_controlled = 1, .username = "user:peer" }, test_local_password, &buffer);
+    _ = try core.handleRead(.{ .from = &addrs.other, .to = &addrs.local, .data = req.bytes }, 0);
+    try testing.expectEqual(null, try core.pollTransmit(&tx_buf));
+
+    _ = try core.handleRead(.{ .from = &addrs.remote, .to = &addrs.local, .data = req.bytes }, 0);
+    const resp = (try core.pollTransmit(&tx_buf)) orelse return error.ExpectedTransmit;
+    try testing.expect(resp.from.eql(&addrs.local) and resp.to.eql(&addrs.remote));
+    try expectSignedWith(resp.data, test_local_password);
+
+    // The new generation's checks start without changing the reported state.
+    try core.setRemoteCredentials(test_new_peer, 100);
+    try testing.expectEqual(.completed, core.connection_state);
+    try testing.expectEqual(null, core.pollEvent());
+    try testing.expect(!core.connectivity_check.done);
+    try testing.expectEqual(@as(i64, 100 + core.timers.connectivity_check_interval), core.connectivity_check_deadline);
+}
+
+test "applyRestart: the new generation's nomination ends the restart" {
+    const addrs = try TestAddrs.init();
+    var core = try testCompletedAgent(.controlled, false, &addrs);
+    defer core.deinit();
+
+    var buffer: [1024]u8 = undefined;
+    var tx_buf: [1024]u8 = undefined;
+
+    try core.restart(test_new_credentials);
+    try core.setRemoteCredentials(test_new_peer, 0);
+    _ = try core.addLocalCandidate(.initHost(addrs.new_local));
+    try core.addRemoteCandidate(.initHost(addrs.new_remote), 0);
+
+    // New-generation requests are answered with the new password.
+    const req = try testBuildRequest(.{ .ice_controlling = 1, .username = "user2:peer2" }, test_new_credentials.password, &buffer);
+    _ = try core.handleRead(.{ .from = &addrs.new_remote, .to = &addrs.new_local, .data = req.bytes }, 0);
+    const resp = (try core.pollTransmit(&tx_buf)) orelse return error.ExpectedTransmit;
+    try expectSignedWith(resp.data, test_new_credentials.password);
+
+    core.pairs.items[0].nominate_on_binding = true;
+    try core.pending_requests.append(testing.allocator, .{ .transaction_id = @splat(2), .pair = 0 });
+    const success = try testBuildResponse(@splat(2), addrs.new_local, test_new_peer.password, &buffer);
+    _ = try core.handleRead(.{ .from = &addrs.new_remote, .to = &addrs.new_local, .data = success.bytes }, 0);
+
+    try expectEvent(&core, .nominated);
+    try expectConnectionStateEvent(&core, .connected);
+    try testing.expectEqual(null, core.ice_restart);
+
+    const data = try core.handleWrite(&buffer, 4);
+    try testing.expect(data.from.eql(&addrs.new_local) and data.to.eql(&addrs.new_remote));
+}
+
+test "applyRestart: a relayed pre-restart pair keeps its TURN client running" {
+    const addrs = try TestAddrs.init();
+    var core = try testCompletedAgent(.controlling, true, &addrs);
+    defer core.deinit();
+
+    var buffer: [1024]u8 = undefined;
+    var tx_buf: [1024]u8 = undefined;
+
+    try TestAgent.startAllocation(core.findTurnClient(&addrs.local).?, 0);
+    try core.restart(test_new_credentials);
+    try testing.expectEqual(0, core.turn_clients.items.len);
+    const turn_client = core.restartTurnClient() orelse return error.ExpectedTurnClient;
+
+    // Its requests, timers and responses are still served.
+    const allocate = (try core.pollTransmit(&tx_buf)) orelse return error.ExpectedTransmit;
+    try testing.expect(allocate.from.eql(&addrs.local) and allocate.to.eql(&addrs.server));
+    try testing.expectEqual(turn_client.pollTimeout(), core.pollTimeout());
+
+    const tx_id = (try stun.Message.parse(allocate.data)).header.transaction_id;
+    const allocated = try testTurnAllocateSuccessResponse(&buffer, tx_id, addrs.relayed, addrs.local, 600);
+    const result = try core.handleRead(.{ .from = &addrs.server, .to = &addrs.local, .data = allocated }, 0);
+    try testing.expectEqual(.consumed, std.meta.activeTag(result));
+    try testing.expect(turn_client.hasAllocation());
+
+    // Consent and data are relayed to the pre-restart peer.
+    core.consent_freshness = true;
+    const consent = (try core.pollTransmit(&tx_buf)) orelse return error.ExpectedTransmit;
+    try testing.expect(consent.from.eql(&addrs.local) and consent.to.eql(&addrs.server));
+    const indication = try stun.Message.parse(consent.data);
+    try testing.expectEqual(.send, indication.header.message_type.method());
+    var it = indication.iterateAttributes(&.{});
+    const attr = try it.next() orelse return error.ExpectedAttribute;
+    try testing.expect(attr.xor_peer_address.eql(&addrs.remote));
+
+    const data = try core.handleWrite(&buffer, 4);
+    try testing.expect(data.to.eql(&addrs.server));
+}
+
+test "applyRestart: a checking or failed agent keeps no pair and checks once the new remote credentials arrive" {
+    const addrs = try TestAddrs.init();
+    var tx_buf: [1024]u8 = undefined;
+
+    for ([_]ice.ConnectionState{ .checking, .failed }) |state| {
+        var core = try testNewAgent(.controlling);
+        defer core.deinit();
+        core.connection_state = state;
+        core.remote_credentials = try .init("peer", test_peer_password);
+
+        try core.restart(test_new_credentials);
+        try testing.expectEqual(null, core.ice_restart);
+        try testing.expectEqual(null, core.remote_credentials);
+
+        // Checks wait for the peer's new credentials.
+        _ = try core.addLocalCandidate(.initHost(addrs.local));
+        try core.addRemoteCandidate(.initHost(addrs.remote), 0);
+        core.connectivity_check = .init;
+        try testing.expectEqual(null, try core.pollTransmit(&tx_buf));
+
+        try core.setRemoteCredentials(test_new_peer, 0);
+        try testing.expectEqual(.checking, core.connection_state);
+        const check = (try core.pollTransmit(&tx_buf)) orelse return error.ExpectedTransmit;
+        try testing.expect(check.to.eql(&addrs.remote));
+        try testing.expectEqualStrings("peer2:user2", try testUsername(check.data));
+        try expectSignedWith(check.data, test_new_peer.password);
+    }
+}
+
+test "handleTimeout: losing the pre-restart pair hands over to the new generation" {
+    const addrs = try TestAddrs.init();
+    var tx_buf: [1024]u8 = undefined;
+
+    for ([_]bool{ true, false }) |has_remote_credentials| {
+        var core = try testCompletedAgent(.controlling, false, &addrs);
+        defer core.deinit();
+        core.connection_state = .disconnected;
+
+        try core.restart(test_new_credentials);
+        if (has_remote_credentials) try core.setRemoteCredentials(test_new_peer, 0);
+        core.consent_freshness = true;
+        core.disconnected_connection_deadline = 1000;
+
+        try core.handleTimeout(1000);
+
+        const expected: ice.ConnectionState = if (has_remote_credentials) .checking else .failed;
+        try expectConnectionStateEvent(&core, expected);
+        try testing.expectEqual(null, core.ice_restart);
+        try testing.expectEqual(null, try core.pollTransmit(&tx_buf)); // no consent without a pair
+    }
+}
+
+test "handleRead: only an authenticated response to the last consent request refreshes consent" {
+    const addrs = try TestAddrs.init();
+    var core = try testCompletedAgent(.controlling, false, &addrs);
+    defer core.deinit();
+
+    var buffer: [1024]u8 = undefined;
+    var tx_buf: [1024]u8 = undefined;
+
+    core.connection_state = .disconnected;
+    core.disconnected_connection_deadline = 500;
+    core.consent_freshness = true;
+    const consent = (try core.pollTransmit(&tx_buf)) orelse return error.ExpectedTransmit;
+    const tx_id = (try stun.Message.parse(consent.data)).header.transaction_id;
+
+    const wrong_tx = try testBuildResponse(@splat(9), addrs.local, test_peer_password, &buffer);
+    _ = try core.handleRead(.{ .from = &addrs.remote, .to = &addrs.local, .data = wrong_tx.bytes }, 100);
+    const wrong_password = try testBuildResponse(tx_id, addrs.local, "wrong-password-012345678", &buffer);
+    _ = try core.handleRead(.{ .from = &addrs.remote, .to = &addrs.local, .data = wrong_password.bytes }, 100);
+    try testing.expectEqual(.disconnected, core.connection_state);
+    try testing.expectEqual(500, core.disconnected_connection_deadline);
+
+    const valid = try testBuildResponse(tx_id, addrs.local, test_peer_password, &buffer);
+    _ = try core.handleRead(.{ .from = &addrs.remote, .to = &addrs.local, .data = valid.bytes }, 100);
+    try expectConnectionStateEvent(&core, .completed);
+    try testing.expectEqual(@as(i64, 100 + core.timers.disconnected_timeout), core.disconnected_connection_deadline);
+    try testing.expectEqual(null, core.consent_tx_id);
+
+    // Consent lost for good: a late response doesn't revive a failed agent.
+    core.connection_state = .failed;
+    core.disconnected_connection_deadline = std.math.maxInt(i64);
+    core.consent_tx_id = tx_id;
+    _ = try core.handleRead(.{ .from = &addrs.remote, .to = &addrs.local, .data = valid.bytes }, 200);
+    try testing.expectEqual(.failed, core.connection_state);
+    try testing.expectEqual(std.math.maxInt(i64), core.disconnected_connection_deadline);
 }
