@@ -112,7 +112,17 @@ const Response = struct {
     tx_id: [12]u8,
     local: CandidateIndex,
     remote: CandidateIndex,
-    kind: enum(u2) { success, role_conflict, success_restart } = .success,
+    kind: Kind = .success,
+
+    const Kind = enum(u3) { success, role_conflict, success_restart, bad_request, unauthorized };
+
+    fn authErrorKind(err: anyerror) ?Kind {
+        return switch (err) {
+            error.BadRequest => .bad_request,
+            error.Unauthorized => .unauthorized,
+            else => null,
+        };
+    }
 };
 
 /// The maximum number of binding requests sent on a pair before it is
@@ -749,6 +759,8 @@ pub fn Agent(comptime config: struct {
                 const payload = switch (resp.kind) {
                     .success, .success_restart => try Messages.buildSuccessResponse(resp.tx_id, password, active_path.remote, buffer),
                     .role_conflict => try Messages.buildRoleConflictErrorMessage(resp.tx_id, password, buffer),
+                    .bad_request => try Messages.buildAuthErrorResponse(resp.tx_id, error.BadRequest, buffer),
+                    .unauthorized => try Messages.buildAuthErrorResponse(resp.tx_id, error.Unauthorized, buffer),
                 };
 
                 const result: stun.TransportMessage = blk: {
@@ -1246,6 +1258,12 @@ pub fn Agent(comptime config: struct {
                         agent.tie_breaker,
                     );
                 },
+                error.BadRequest, error.Unauthorized => return .{
+                    .kind = Response.authErrorKind(err).?,
+                    .tx_id = msg.header.transaction_id,
+                    .local = agent.findLocalBase(base_addr) orelse return null,
+                    .remote = agent.findRemoteCandidate(from) orelse return null,
+                },
                 else => |e| return e,
             };
 
@@ -1392,7 +1410,7 @@ pub fn Agent(comptime config: struct {
             const path = agent.activePath();
             if (!message.to.eql(path.local) or !message.from.eql(path.remote)) return true;
 
-            try Messages.validateConsentFreshnessRequest(&msg, ice_restart.local_credentials.getPassword());
+            try Messages.validateConsentFreshnessRequest(&msg, ice_restart.local_credentials.toIceCredentials());
             agent.queueResponse(.{ .kind = .success_restart, .tx_id = msg.header.transaction_id, .local = 0, .remote = 0 });
             return true;
         }
@@ -1433,8 +1451,13 @@ pub fn Agent(comptime config: struct {
         fn handleConsentFreshness(agent: *Self, msg: *const stun.Message, to: *const IpAddress, from: *const IpAddress) !?Response {
             switch (msg.header.message_type.class()) {
                 .request => {
-                    Messages.validateConsentFreshnessRequest(msg, agent.credentials.getPassword()) catch return null;
+                    const kind: Response.Kind = if (Messages.validateConsentFreshnessRequest(msg, agent.credentials.toIceCredentials()))
+                        .success
+                    else |err|
+                        Response.authErrorKind(err) orelse return null;
+
                     return .{
+                        .kind = kind,
                         .tx_id = msg.header.transaction_id,
                         .local = agent.findLocalBase(to) orelse return null,
                         .remote = agent.findRemoteCandidate(from) orelse return null,
@@ -1613,7 +1636,7 @@ test "handleRequest: generate success response" {
     const msg = try testBuildRequest(.{
         .ice_controlling = 0x10000,
         .priority = 0x9090,
-        .username = core.credentials.getUsername(),
+        .username = "user:peer",
     }, core.credentials.getPassword(), &buffer);
 
     const resp = try testRespond(&core, &msg, &base_addr, &from, &resp_buffer);
@@ -1649,7 +1672,7 @@ test "handleRequest: create peer reflexive candidate" {
     const msg = try testBuildRequest(.{
         .ice_controlling = 0x10000,
         .priority = 0x9090,
-        .username = core.credentials.getUsername(),
+        .username = "user:peer",
     }, core.credentials.getPassword(), &buffer);
 
     _ = try core.handleRequest(&msg, &base_addr, &from);
@@ -1689,7 +1712,7 @@ test "handleRequest: nominate peer" {
     const msg = try testBuildRequest(.{
         .ice_controlling = 0x10000,
         .priority = 0x9090,
-        .username = agent.credentials.getUsername(),
+        .username = "user:peer",
         .use_candidate = true,
     }, agent.credentials.getPassword(), &buffer);
 
@@ -1719,7 +1742,7 @@ test "handleRequest: role conflict" {
         const msg = try testBuildRequest(.{
             .ice_controlled = std.math.maxInt(u64),
             .priority = 0x9090,
-            .username = core.credentials.getUsername(),
+            .username = "user:peer",
         }, core.credentials.getPassword(), &buffer);
 
         // Unknown sender: no response.
@@ -1745,7 +1768,7 @@ test "handleRequest: role conflict" {
         const msg = try testBuildRequest(.{
             .ice_controlled = 0,
             .priority = 0x9090,
-            .username = core.credentials.getUsername(),
+            .username = "user:peer",
         }, core.credentials.getPassword(), &buffer);
 
         const resp = try testRespond(&core, &msg, &base_addr, &from, &resp_buffer);
@@ -1773,7 +1796,7 @@ test "pollTransmit: keeps the message queued on WriteFailed" {
     const req = try testBuildRequest(.{
         .ice_controlling = 0x10000,
         .priority = 0x9090,
-        .username = agent.credentials.getUsername(),
+        .username = "user:peer",
     }, agent.credentials.getPassword(), &req_buf);
     agent.queueResponse((try agent.handleRequest(&req, &local, &remote)) orelse return error.ExpectedResponse);
 
@@ -1834,7 +1857,7 @@ test "maybeWrapInTurnMessage: relay candidate responses are wrapped as a TURN se
     const msg = try testBuildRequest(.{
         .ice_controlling = 0x10000,
         .priority = 0x9090,
-        .username = core.credentials.getUsername(),
+        .username = "user:peer",
     }, core.credentials.getPassword(), &buffer);
 
     _ = try core.pollTransmit(&resp_buffer); // drain the allocate request

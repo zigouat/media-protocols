@@ -527,7 +527,7 @@ test "handleRead: unwraps a TURN data indication before further processing" {
         const inner = try testBuildRequest(.{
             .ice_controlling = 0x10000,
             .priority = 0x9090,
-            .username = core.credentials.getUsername(),
+            .username = "user:peer",
         }, core.credentials.getPassword(), &buffer);
 
         const indication = try testTurnDataIndication(&indication_buf, peer, inner.bytes);
@@ -904,7 +904,7 @@ test "handleInput: completed state answers stun requests via consent freshness" 
     const msg = try testBuildRequest(.{
         .ice_controlling = 0x10000,
         .priority = 0x9090,
-        .username = core.credentials.getUsername(),
+        .username = "user:peer",
     }, core.credentials.getPassword(), &buffer);
 
     const result = try core.handleRead(.{ .from = &from, .to = &base_addr, .data = msg.bytes }, 0);
@@ -934,7 +934,7 @@ test "handleInput: stun request produces a response event" {
     const msg = try testBuildRequest(.{
         .ice_controlling = 0x10000,
         .priority = 0x9090,
-        .username = core.credentials.getUsername(),
+        .username = "user:peer",
     }, core.credentials.getPassword(), &buffer);
 
     _ = try core.handleRead(.{ .from = &from, .to = &base_addr, .data = msg.bytes }, 0);
@@ -963,7 +963,7 @@ test "handleInput: role conflict switches role and produces a response" {
     const msg = try testBuildRequest(.{
         .ice_controlled = 0,
         .priority = 0x9090,
-        .username = core.credentials.getUsername(),
+        .username = "user:peer",
     }, core.credentials.getPassword(), &buffer);
 
     _ = try core.handleRead(.{ .from = &from, .to = &base_addr, .data = msg.bytes }, 0);
@@ -1462,6 +1462,41 @@ test "handleRead: only an authenticated response to the last consent request ref
     _ = try core.handleRead(.{ .from = &addrs.remote, .to = &addrs.local, .data = valid.bytes }, 200);
     try testing.expectEqual(.failed, core.connection_state);
     try testing.expectEqual(std.math.maxInt(i64), core.disconnected_connection_deadline);
+}
+
+test "handleRead: unauthenticated requests get a 401 from known senders only" {
+    const addrs = try TestAddrs.init();
+    var buffer: [1024]u8 = undefined;
+    var tx_buf: [1024]u8 = undefined;
+
+    // Wrong ufrag, then wrong password, in completed (consent) and checking (connectivity checks).
+    const requests = [_]struct { username: []const u8, password: []const u8 }{
+        .{ .username = "other:peer", .password = test_local_password },
+        .{ .username = "user:peer", .password = "wrong-password-0123456789" },
+    };
+
+    for ([_]ice.ConnectionState{ .completed, .checking }) |state| for (requests) |r| {
+        var core = try testCompletedAgent(.controlling, false, &addrs);
+        defer core.deinit();
+        if (state == .checking) {
+            core.nominated_pair = null;
+            core.connection_state = .checking;
+        }
+
+        const req = try testBuildRequest(.{ .ice_controlled = 1, .username = r.username }, r.password, &buffer);
+        _ = try core.handleRead(.{ .from = &addrs.other, .to = &addrs.local, .data = req.bytes }, 0);
+        try testing.expectEqual(null, try core.pollTransmit(&tx_buf));
+
+        _ = try core.handleRead(.{ .from = &addrs.remote, .to = &addrs.local, .data = req.bytes }, 0);
+        const resp = (try core.pollTransmit(&tx_buf)) orelse return error.ExpectedTransmit;
+        try testing.expect(resp.from.eql(&addrs.local) and resp.to.eql(&addrs.remote));
+
+        const msg = try stun.Message.parse(resp.data);
+        try testing.expectEqual(.error_response, msg.header.message_type.class());
+        var it = msg.iterateAttributes(&.{});
+        try testing.expectEqual(.unauthorized, (try it.next()).?.error_code.code);
+        try testing.expectEqual(0, core.pairs.items.len);
+    };
 }
 
 test "applyRestart: a completed agent keeps the pre-restart pair for data and consent" {
