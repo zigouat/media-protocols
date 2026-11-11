@@ -54,18 +54,20 @@ pub fn buildAuthenticatedBindingRequest(buffer: []u8, config: BindingRequestConf
     return w.final();
 }
 
-pub fn validateConsentFreshnessRequest(msg: *const stun.Message, password: []const u8) !void {
-    var it = msg.iterateAttributes(password);
-    var has_fingerprint: bool = false;
-    var has_message_integrity = false;
+pub const AuthError = error{ BadRequest, Unauthorized };
 
-    while (try it.next()) |attribute| switch (attribute) {
+pub fn validateConsentFreshnessRequest(msg: *const stun.Message, credentials: ice.Credentials) !void {
+    var it = msg.iterateAttributes(credentials.password);
+    var auth: Auth = .{};
+    var has_fingerprint = false;
+
+    while (try auth.next(&it)) |attribute| switch (attribute) {
         .fingerprint => has_fingerprint = true,
-        .message_integrity => has_message_integrity = true,
         else => {},
     };
 
-    if (!has_fingerprint or !has_message_integrity) return error.InvalidStunMessage;
+    try auth.check(credentials.username);
+    if (!has_fingerprint) return error.InvalidStunMessage;
 }
 
 pub fn parseAndValidateStunRequest(
@@ -75,22 +77,22 @@ pub fn parseAndValidateStunRequest(
     tie_breaker: u64,
 ) !StunRequest {
     var it = msg.iterateAttributes(credentials.password);
-    var has_fingerprint: bool = false;
-    var has_message_integrity = false;
+    var auth: Auth = .{};
+    var has_fingerprint = false;
     var stun_request: StunRequest = .{};
 
-    while (try it.next()) |attribute| switch (attribute) {
+    while (try auth.next(&it)) |attribute| switch (attribute) {
         .username => |u| stun_request.username = u,
         .ice_controlled => |v| stun_request.ice_controlled = v,
         .ice_controlling => |v| stun_request.ice_controlling = v,
         .use_candidate => stun_request.use_candidate = true,
         .priority => |p| stun_request.priority = p,
         .fingerprint => has_fingerprint = true,
-        .message_integrity => has_message_integrity = true,
         else => {},
     };
 
-    if (!has_fingerprint or !has_message_integrity)
+    try auth.check(credentials.username);
+    if (!has_fingerprint)
         return error.InvalidStunMessage;
     if (stun_request.ice_controlling == null and stun_request.ice_controlled == null or
         stun_request.ice_controlling != null and stun_request.ice_controlled != null)
@@ -112,8 +114,6 @@ pub fn parseAndValidateStunRequest(
 
     if (stun_request.use_candidate and role == .controlling)
         return error.InvalidStunMessage;
-
-    //TODO: check username
 
     return stun_request;
 }
@@ -159,6 +159,20 @@ pub fn buildRoleConflictErrorMessage(transaction_id: [12]u8, pwd: []const u8, bu
     return w.final();
 }
 
+pub fn buildAuthErrorResponse(tx_id: [12]u8, err: AuthError, buffer: []u8) stun.Writer.Error![]const u8 {
+    var w = stun.Writer.init(buffer, .{});
+    try w.writeHeader(.{
+        .message_type = .fromClassAndMethod(.error_response, .binding),
+        .transaction_id = tx_id,
+    });
+    try w.writeAttribute(.{ .error_code = switch (err) {
+        error.BadRequest => .{ .code = .bad_request, .reason = "Bad Request" },
+        error.Unauthorized => .{ .code = .unauthorized, .reason = "Unauthorized" },
+    } });
+    try w.writeAttribute(.fingerprint);
+    return w.final();
+}
+
 pub fn getMappedAddress(resp: []const u8, tx_id: [12]u8) !IpAddress {
     const msg = try stun.Message.parse(resp);
     if (!std.mem.eql(u8, &msg.header.transaction_id, &tx_id)) return error.TransactionIdMismatch;
@@ -177,12 +191,46 @@ pub fn getMappedAddress(resp: []const u8, tx_id: [12]u8) !IpAddress {
     }
 }
 
+const Auth = struct {
+    username: ?[]const u8 = null,
+    has_message_integrity: bool = false,
+    integrity_failed: bool = false,
+
+    fn next(auth: *Auth, it: *stun.AttributeIterator) !?stun.Attribute {
+        const attribute = it.next() catch |err| switch (err) {
+            error.MessageIntegrityCheckFailed => {
+                auth.has_message_integrity = true;
+                auth.integrity_failed = true;
+                return null;
+            },
+            else => |e| return e,
+        } orelse return null;
+
+        switch (attribute) {
+            .username => |u| auth.username = u,
+            .message_integrity => auth.has_message_integrity = true,
+            else => {},
+        }
+        return attribute;
+    }
+
+    /// RFC 5389 §10.1.2 checks in order. The username is valid if it is `<local ufrag>:<remote ufrag>` (RFC 8445 §7.3).
+    fn check(auth: *const Auth, local_ufrag: []const u8) AuthError!void {
+        const username = auth.username orelse return error.BadRequest;
+        if (!auth.has_message_integrity) return error.BadRequest;
+
+        const separator = std.mem.findScalar(u8, username, ':') orelse return error.Unauthorized;
+        if (!std.mem.eql(u8, username[0..separator], local_ufrag)) return error.Unauthorized;
+        if (auth.integrity_failed) return error.Unauthorized;
+    }
+};
+
 const testing = std.testing;
 const test_password = "VOkJxbRl1RmTxUk/WvJxBt";
 const test_credentials: ice.Credentials = .{ .username = "user", .password = test_password };
 
 const RequestOptions = struct {
-    username: ?[]const u8 = null,
+    username: ?[]const u8 = "user:peer",
     priority: ?u32 = null,
     ice_controlling: ?u64 = null,
     ice_controlled: ?u64 = null,
@@ -226,14 +274,14 @@ fn buildResponse(buffer: []u8, addr: ?IpAddress, message_integrity: bool, finger
 test "parseAndValidateStunRequest: valid controlling request" {
     var buffer: [256]u8 = undefined;
     const msg = try buildRequest(&buffer, .{
-        .username = "evtj:h6vY",
+        .username = "user:h6vY",
         .priority = 0x6E0001FF,
         .ice_controlling = 100,
         .use_candidate = true,
     });
 
     const request = try parseAndValidateStunRequest(&msg, test_credentials, .controlled, 50);
-    try testing.expectEqualStrings("evtj:h6vY", request.username);
+    try testing.expectEqualStrings("user:h6vY", request.username);
     try testing.expectEqual(@as(u32, 0x6E0001FF), request.priority);
     try testing.expectEqual(@as(?u64, 100), request.ice_controlling);
     try testing.expectEqual(@as(?u64, null), request.ice_controlled);
@@ -246,10 +294,37 @@ test "parseAndValidateStunRequest: missing fingerprint" {
     try testing.expectError(error.InvalidStunMessage, parseAndValidateStunRequest(&msg, test_credentials, .controlled, 50));
 }
 
-test "parseAndValidateStunRequest: missing message integrity" {
+test "parseAndValidateStunRequest/validateConsentFreshnessRequest: short-term credential checks" {
     var buffer: [256]u8 = undefined;
-    const msg = try buildRequest(&buffer, .{ .ice_controlling = 100, .message_integrity = false });
-    try testing.expectError(error.InvalidStunMessage, parseAndValidateStunRequest(&msg, test_credentials, .controlled, 50));
+    const cases = [_]struct { opts: RequestOptions, credentials: ice.Credentials, err: AuthError }{
+        .{ .opts = .{ .ice_controlling = 100, .message_integrity = false }, .credentials = test_credentials, .err = error.BadRequest },
+        .{ .opts = .{ .ice_controlling = 100, .username = null }, .credentials = test_credentials, .err = error.BadRequest },
+        .{ .opts = .{ .ice_controlling = 100, .username = "other:peer" }, .credentials = test_credentials, .err = error.Unauthorized },
+        .{ .opts = .{ .ice_controlling = 100, .username = "user" }, .credentials = test_credentials, .err = error.Unauthorized },
+        .{ .opts = .{ .ice_controlling = 100 }, .credentials = .{ .username = "user", .password = "wrong-password" }, .err = error.Unauthorized },
+    };
+
+    for (cases) |case| {
+        const msg = try buildRequest(&buffer, case.opts);
+        try testing.expectError(case.err, parseAndValidateStunRequest(&msg, case.credentials, .controlled, 50));
+        try testing.expectError(case.err, validateConsentFreshnessRequest(&msg, case.credentials));
+    }
+
+    const msg = try buildRequest(&buffer, .{ .ice_controlling = 100 });
+    try validateConsentFreshnessRequest(&msg, test_credentials);
+}
+
+test "buildAuthErrorResponse: error code and fingerprint, no integrity or username" {
+    var buffer: [256]u8 = undefined;
+    const data = try buildAuthErrorResponse(@splat(7), error.Unauthorized, &buffer);
+    const msg = try stun.Message.parse(data);
+    try testing.expectEqual(.error_response, msg.header.message_type.class());
+    try testing.expectEqual(@as([12]u8, @splat(7)), msg.header.transaction_id);
+
+    var it = msg.iterateAttributes(&.{});
+    try testing.expectEqual(.unauthorized, (try it.next()).?.error_code.code);
+    try testing.expectEqual(.fingerprint, @as(stun.AttributeType, (try it.next()).?));
+    try testing.expectEqual(null, try it.next());
 }
 
 test "parseAndValidateStunRequest: missing ice role attribute" {

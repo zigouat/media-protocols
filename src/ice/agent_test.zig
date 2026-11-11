@@ -527,7 +527,7 @@ test "handleRead: unwraps a TURN data indication before further processing" {
         const inner = try testBuildRequest(.{
             .ice_controlling = 0x10000,
             .priority = 0x9090,
-            .username = core.credentials.getUsername(),
+            .username = "user:peer",
         }, core.credentials.getPassword(), &buffer);
 
         const indication = try testTurnDataIndication(&indication_buf, peer, inner.bytes);
@@ -904,7 +904,7 @@ test "handleInput: completed state answers stun requests via consent freshness" 
     const msg = try testBuildRequest(.{
         .ice_controlling = 0x10000,
         .priority = 0x9090,
-        .username = core.credentials.getUsername(),
+        .username = "user:peer",
     }, core.credentials.getPassword(), &buffer);
 
     const result = try core.handleRead(.{ .from = &from, .to = &base_addr, .data = msg.bytes }, 0);
@@ -934,7 +934,7 @@ test "handleInput: stun request produces a response event" {
     const msg = try testBuildRequest(.{
         .ice_controlling = 0x10000,
         .priority = 0x9090,
-        .username = core.credentials.getUsername(),
+        .username = "user:peer",
     }, core.credentials.getPassword(), &buffer);
 
     _ = try core.handleRead(.{ .from = &from, .to = &base_addr, .data = msg.bytes }, 0);
@@ -963,7 +963,7 @@ test "handleInput: role conflict switches role and produces a response" {
     const msg = try testBuildRequest(.{
         .ice_controlled = 0,
         .priority = 0x9090,
-        .username = core.credentials.getUsername(),
+        .username = "user:peer",
     }, core.credentials.getPassword(), &buffer);
 
     _ = try core.handleRead(.{ .from = &from, .to = &base_addr, .data = msg.bytes }, 0);
@@ -1317,7 +1317,7 @@ test "stageRestart/discardRestart/applyRestart: staged credentials are advertise
     var buffer: [1024]u8 = undefined;
     var tx_buf: [1024]u8 = undefined;
 
-    try core.applyRestart(); // nothing staged
+    try core.applyRestart(0); // nothing staged
     try testing.expectEqual(null, core.ice_restart);
 
     const too_long: [65]u8 = @splat('a');
@@ -1335,7 +1335,7 @@ test "stageRestart/discardRestart/applyRestart: staged credentials are advertise
 
     core.discardRestart();
     try testing.expectEqualStrings("user", core.getLocalCredentials().username);
-    try core.applyRestart();
+    try core.applyRestart(0);
     try testing.expectEqual(null, core.ice_restart);
 
     try core.stageRestart(test_new_credentials);
@@ -1352,7 +1352,7 @@ test "applyRestart: the new generation's nomination ends the restart" {
     var buffer: [1024]u8 = undefined;
     var tx_buf: [1024]u8 = undefined;
 
-    try core.restart(test_new_credentials);
+    try core.restart(test_new_credentials, 0);
     try core.setRemoteCredentials(test_new_peer, 0);
     _ = try core.addLocalCandidate(.initHost(addrs.new_local));
     try core.addRemoteCandidate(.initHost(addrs.new_remote), 0);
@@ -1386,7 +1386,7 @@ test "applyRestart: a checking or failed agent keeps no pair and checks once the
         core.connection_state = state;
         core.remote_credentials = try .init("peer", test_peer_password);
 
-        try core.restart(test_new_credentials);
+        try core.restart(test_new_credentials, 0);
         try testing.expectEqual(null, core.ice_restart);
         try testing.expectEqual(null, core.remote_credentials);
 
@@ -1414,7 +1414,7 @@ test "handleTimeout: losing the pre-restart pair hands over to the new generatio
         defer core.deinit();
         core.connection_state = .disconnected;
 
-        try core.restart(test_new_credentials);
+        try core.restart(test_new_credentials, 0);
         if (has_remote_credentials) try core.setRemoteCredentials(test_new_peer, 0);
         core.consent_freshness = true;
         core.disconnected_connection_deadline = 1000;
@@ -1464,6 +1464,41 @@ test "handleRead: only an authenticated response to the last consent request ref
     try testing.expectEqual(std.math.maxInt(i64), core.disconnected_connection_deadline);
 }
 
+test "handleRead: unauthenticated requests get a 401 from known senders only" {
+    const addrs = try TestAddrs.init();
+    var buffer: [1024]u8 = undefined;
+    var tx_buf: [1024]u8 = undefined;
+
+    // Wrong ufrag, then wrong password, in completed (consent) and checking (connectivity checks).
+    const requests = [_]struct { username: []const u8, password: []const u8 }{
+        .{ .username = "other:peer", .password = test_local_password },
+        .{ .username = "user:peer", .password = "wrong-password-0123456789" },
+    };
+
+    for ([_]ice.ConnectionState{ .completed, .checking }) |state| for (requests) |r| {
+        var core = try testCompletedAgent(.controlling, false, &addrs);
+        defer core.deinit();
+        if (state == .checking) {
+            core.nominated_pair = null;
+            core.connection_state = .checking;
+        }
+
+        const req = try testBuildRequest(.{ .ice_controlled = 1, .username = r.username }, r.password, &buffer);
+        _ = try core.handleRead(.{ .from = &addrs.other, .to = &addrs.local, .data = req.bytes }, 0);
+        try testing.expectEqual(null, try core.pollTransmit(&tx_buf));
+
+        _ = try core.handleRead(.{ .from = &addrs.remote, .to = &addrs.local, .data = req.bytes }, 0);
+        const resp = (try core.pollTransmit(&tx_buf)) orelse return error.ExpectedTransmit;
+        try testing.expect(resp.from.eql(&addrs.local) and resp.to.eql(&addrs.remote));
+
+        const msg = try stun.Message.parse(resp.data);
+        try testing.expectEqual(.error_response, msg.header.message_type.class());
+        var it = msg.iterateAttributes(&.{});
+        try testing.expectEqual(.unauthorized, (try it.next()).?.error_code.code);
+        try testing.expectEqual(0, core.pairs.items.len);
+    };
+}
+
 test "applyRestart: a completed agent keeps the pre-restart pair for data and consent" {
     const addrs = try TestAddrs.init();
     var agent = try testCompletedAgent(.controlling, false, &addrs);
@@ -1475,7 +1510,7 @@ test "applyRestart: a completed agent keeps the pre-restart pair for data and co
     // Queue a response to the previous generation.
     const req = try testBuildRequest(.{ .ice_controlled = 1, .username = "user:peer" }, test_local_password, &buffer);
     _ = try agent.handleRead(.{ .from = &addrs.remote, .to = &addrs.local, .data = req.bytes }, 0);
-    try agent.restart(test_new_credentials);
+    try agent.restart(test_new_credentials, 0);
 
     try testing.expect(agent.ice_restart != null);
     try testing.expectEqual(.completed, agent.connection_state);
@@ -1522,7 +1557,7 @@ test "applyRestart: a relayed pre-restart pair keeps its TURN client running" {
     var buffer: [1024]u8 = undefined;
     var tx_buf: [1024]u8 = undefined;
 
-    try agent.restart(test_new_credentials);
+    try agent.restart(test_new_credentials, 0);
     try testing.expectEqual(0, agent.turn_clients.items.len);
     const turn_client = &agent.ice_restart.?.nominated_pair.relay;
 
