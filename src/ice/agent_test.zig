@@ -1317,7 +1317,7 @@ test "stageRestart/discardRestart/applyRestart: staged credentials are advertise
     var buffer: [1024]u8 = undefined;
     var tx_buf: [1024]u8 = undefined;
 
-    try core.applyRestart(); // nothing staged
+    try core.applyRestart(0); // nothing staged
     try testing.expectEqual(null, core.ice_restart);
 
     const too_long: [65]u8 = @splat('a');
@@ -1335,7 +1335,7 @@ test "stageRestart/discardRestart/applyRestart: staged credentials are advertise
 
     core.discardRestart();
     try testing.expectEqualStrings("user", core.getLocalCredentials().username);
-    try core.applyRestart();
+    try core.applyRestart(0);
     try testing.expectEqual(null, core.ice_restart);
 
     try core.stageRestart(test_new_credentials);
@@ -1352,7 +1352,7 @@ test "applyRestart: the new generation's nomination ends the restart" {
     var buffer: [1024]u8 = undefined;
     var tx_buf: [1024]u8 = undefined;
 
-    try core.restart(test_new_credentials);
+    try core.restart(test_new_credentials, 0);
     try core.setRemoteCredentials(test_new_peer, 0);
     _ = try core.addLocalCandidate(.initHost(addrs.new_local));
     try core.addRemoteCandidate(.initHost(addrs.new_remote), 0);
@@ -1386,7 +1386,7 @@ test "applyRestart: a checking or failed agent keeps no pair and checks once the
         core.connection_state = state;
         core.remote_credentials = try .init("peer", test_peer_password);
 
-        try core.restart(test_new_credentials);
+        try core.restart(test_new_credentials, 0);
         try testing.expectEqual(null, core.ice_restart);
         try testing.expectEqual(null, core.remote_credentials);
 
@@ -1414,7 +1414,7 @@ test "handleTimeout: losing the pre-restart pair hands over to the new generatio
         defer core.deinit();
         core.connection_state = .disconnected;
 
-        try core.restart(test_new_credentials);
+        try core.restart(test_new_credentials, 0);
         if (has_remote_credentials) try core.setRemoteCredentials(test_new_peer, 0);
         core.consent_freshness = true;
         core.disconnected_connection_deadline = 1000;
@@ -1475,7 +1475,7 @@ test "applyRestart: a completed agent keeps the pre-restart pair for data and co
     // Queue a response to the previous generation.
     const req = try testBuildRequest(.{ .ice_controlled = 1, .username = "user:peer" }, test_local_password, &buffer);
     _ = try agent.handleRead(.{ .from = &addrs.remote, .to = &addrs.local, .data = req.bytes }, 0);
-    try agent.restart(test_new_credentials);
+    try agent.restart(test_new_credentials, 0);
 
     try testing.expect(agent.ice_restart != null);
     try testing.expectEqual(.completed, agent.connection_state);
@@ -1522,7 +1522,7 @@ test "applyRestart: a relayed pre-restart pair keeps its TURN client running" {
     var buffer: [1024]u8 = undefined;
     var tx_buf: [1024]u8 = undefined;
 
-    try agent.restart(test_new_credentials);
+    try agent.restart(test_new_credentials, 0);
     try testing.expectEqual(0, agent.turn_clients.items.len);
     const turn_client = &agent.ice_restart.?.nominated_pair.relay;
 
