@@ -1,6 +1,6 @@
 const CandidatePair = @This();
 
-pub const CandidateIndex = u7;
+pub const CandidateIndex = @import("common.zig").CandidateIndex;
 
 /// Enum describing the status of a candidate pair in the ICE process.
 pub const Status = enum(u2) {
