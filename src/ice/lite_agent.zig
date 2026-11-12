@@ -665,16 +665,103 @@ fn testBuildRequest(req: Messages.StunRequest, peer_password: []const u8, buffer
     return try stun.Message.parse(w.final());
 }
 
-fn testRespond(core: *TestAgent, msg: *const stun.Message, base: *const IpAddress, from: *const IpAddress, buffer: []u8) !stun.TransportMessage {
-    core.queueResponse((try core.handleRequest(msg, base, from)) orelse return error.ExpectedResponse);
-    return (try core.pollTransmit(buffer)) orelse error.ExpectedTransmit;
+fn testRespond(agent: *TestAgent, msg: *const stun.Message, base: *const IpAddress, from: *const IpAddress, buffer: []u8) !stun.TransportMessage {
+    agent.queueResponse((try agent.handleRequest(msg, base, from)) orelse return error.ExpectedResponse);
+    return (try agent.pollTransmit(buffer)) orelse error.ExpectedTransmit;
 }
 
 const test_local_password = "VOkJxbRl1RmTxUk/WvJxBt";
+const test_peer: ice.Credentials = .{ .username = "peer", .password = "peer-password-0123456789" };
+const test_new_credentials: ice.Credentials = .{ .username = "user2", .password = "user2-password-0123456789" };
+const test_new_peer: ice.Credentials = .{ .username = "peer2", .password = "peer2-password-0123456789" };
 
-test "handleRequest: generate success response" {
-    var core = try testNewAgent(.controlled);
-    defer core.deinit();
+const TestAddrs = struct {
+    local: IpAddress,
+    remote: IpAddress,
+    other: IpAddress,
+    new_local: IpAddress,
+    new_remote: IpAddress,
+
+    fn init() !TestAddrs {
+        return .{
+            .local = try IpAddress.parse("10.0.0.10", 4000),
+            .remote = try IpAddress.parse("192.168.1.10", 1000),
+            .other = try IpAddress.parse("192.168.1.66", 1000),
+            .new_local = try IpAddress.parse("10.0.0.20", 4000),
+            .new_remote = try IpAddress.parse("192.168.1.20", 1000),
+        };
+    }
+};
+
+/// Brings `agent` to `connected` on `addrs.local` <-> `addrs.remote` at t=0 and drains its events.
+fn testConnect(agent: anytype, addrs: *const TestAddrs) !void {
+    var buffer: [1024]u8 = undefined;
+    var tx_buf: [1024]u8 = undefined;
+
+    try agent.addLocalAddrs(&.{addrs.local});
+    try agent.addRemoteCandidate(.initHost(addrs.remote));
+    try agent.setRemoteCredentials(test_peer, 0);
+
+    const req = try testBuildRequest(.{ .ice_controlling = 1, .username = "user:peer", .use_candidate = true }, test_local_password, &buffer);
+    _ = try agent.handleRead(.{ .from = &addrs.remote, .to = &addrs.local, .data = req.bytes }, 0);
+    _ = (try agent.pollTransmit(&tx_buf)) orelse return error.ExpectedTransmit;
+    try testing.expectEqual(.connected, agent.connection_state);
+    while (agent.pollEvent()) |_| {}
+}
+
+fn testBuildResponse(tx_id: [12]u8, addr: IpAddress, password: []const u8, buffer: []u8) !stun.Message {
+    var w = stun.Writer.init(buffer, .{ .password = password });
+    try w.writeHeader(.{
+        .message_type = .fromClassAndMethod(.success_response, .binding),
+        .transaction_id = tx_id,
+    });
+    try w.writeAttribute(.{ .xor_mapped_address = addr });
+    try w.writeAttribute(.{ .message_integrity = &.{} });
+    try w.writeAttribute(.fingerprint);
+    return try stun.Message.parse(w.final());
+}
+
+fn expectConnectionStateEvent(agent: anytype, state: ice.ConnectionState) !void {
+    switch (agent.pollEvent() orelse return error.ExpectedEvent) {
+        .connection_state => |s| try testing.expectEqual(state, s),
+        else => return error.UnexpectedEvent,
+    }
+}
+
+fn expectGatheringStateEvent(agent: anytype, state: ice.GatheringState) !void {
+    switch (agent.pollEvent() orelse return error.ExpectedEvent) {
+        .gathering_state => |s| try testing.expectEqual(state, s),
+        else => return error.UnexpectedEvent,
+    }
+}
+
+fn expectNominatedEvent(agent: anytype, pair: NominatedPair) !void {
+    switch (agent.pollEvent() orelse return error.ExpectedEvent) {
+        .nominated => |p| try testing.expectEqual(pair, p),
+        else => return error.UnexpectedEvent,
+    }
+}
+
+fn expectSignedWith(data: []const u8, password: []const u8) !void {
+    const msg = try stun.Message.parse(data);
+    var it = msg.iterateAttributes(password);
+    var signed = false;
+    while (try it.next()) |attr| if (attr == .message_integrity) {
+        signed = true;
+    };
+    try testing.expect(signed);
+}
+
+fn testUsername(data: []const u8) ![]const u8 {
+    const msg = try stun.Message.parse(data);
+    var it = msg.iterateAttributes(&.{});
+    while (try it.next()) |attr| if (attr == .username) return attr.username;
+    return error.ExpectedAttribute;
+}
+
+test "LiteAgent.handleRequest: generate success response" {
+    var agent = try testNewAgent(.controlled);
+    defer agent.deinit();
 
     var buffer: [1024]u8 = undefined;
     var resp_buffer: [1024]u8 = undefined;
@@ -682,22 +769,22 @@ test "handleRequest: generate success response" {
     const base_addr = try IpAddress.parse("192.168.1.100", 1000);
     const from = try IpAddress.parse("192.168.1.120", 2000);
 
-    try core.addLocalAddrs(&.{base_addr});
+    try agent.addLocalAddrs(&.{base_addr});
 
     const msg = try testBuildRequest(.{
         .ice_controlling = 0x10000,
         .priority = 0x9090,
         .username = "user:peer",
-    }, core.credentials.getPassword(), &buffer);
+    }, agent.credentials.getPassword(), &buffer);
 
-    const resp = try testRespond(&core, &msg, &base_addr, &from, &resp_buffer);
+    const resp = try testRespond(&agent, &msg, &base_addr, &from, &resp_buffer);
     const resp_msg = try stun.Message.parse(resp.data);
 
     try testing.expectEqual(.success_response, resp_msg.header.message_type.class());
     try testing.expectEqual(.binding, resp_msg.header.message_type.method());
     try testing.expectEqual(msg.header.transaction_id, resp_msg.header.transaction_id);
 
-    var it = resp_msg.iterateAttributes(core.credentials.getPassword());
+    var it = resp_msg.iterateAttributes(agent.credentials.getPassword());
     var attr = try it.next() orelse return error.ExpectedAttribute;
     try testing.expect(attr.xor_mapped_address.eql(&from));
 
@@ -709,43 +796,43 @@ test "handleRequest: generate success response" {
     try testing.expectEqual(null, try it.next());
 }
 
-test "handleRequest: create peer reflexive candidate" {
-    var core = try testNewAgent(.controlled);
-    defer core.deinit();
+test "LiteAgent.handleRequest: create peer reflexive candidate" {
+    var agent = try testNewAgent(.controlled);
+    defer agent.deinit();
 
     var buffer: [1024]u8 = undefined;
 
     const base_addr = try IpAddress.parse("192.168.1.100", 1000);
     const from = try IpAddress.parse("192.168.1.120", 2000);
 
-    try core.addLocalAddrs(&.{base_addr});
+    try agent.addLocalAddrs(&.{base_addr});
 
     const msg = try testBuildRequest(.{
         .ice_controlling = 0x10000,
         .priority = 0x9090,
         .username = "user:peer",
-    }, core.credentials.getPassword(), &buffer);
+    }, agent.credentials.getPassword(), &buffer);
 
-    _ = try core.handleRequest(&msg, &base_addr, &from);
+    _ = try agent.handleRequest(&msg, &base_addr, &from);
 
-    try testing.expectEqual(1, core.remote_candidates_len);
-    const remote = core.remote_candidates[0];
+    try testing.expectEqual(1, agent.remote_candidates_len);
+    const remote = agent.remote_candidates[0];
     try testing.expect(remote.address.eql(&from));
     try testing.expectEqual(.prflx, remote.candidate_type);
     try testing.expectEqual(remote.priority, 0x9090);
 
     // Send request again
-    _ = try core.handleRequest(&msg, &base_addr, &from);
-    try testing.expectEqual(1, core.remote_candidates_len); // no new peer is created
+    _ = try agent.handleRequest(&msg, &base_addr, &from);
+    try testing.expectEqual(1, agent.remote_candidates_len); // no new peer is created
 
     // A signaled candidate for an already known address updates its type and priority, no duplicate is added.
-    try core.addRemoteCandidate(.initHost(from));
-    try testing.expectEqual(1, core.remote_candidates_len);
-    try testing.expectEqual(.host, core.remote_candidates[0].candidate_type);
-    try testing.expectEqual(ice.CandidateType.host.priority(), core.remote_candidates[0].priority);
+    try agent.addRemoteCandidate(.initHost(from));
+    try testing.expectEqual(1, agent.remote_candidates_len);
+    try testing.expectEqual(.host, agent.remote_candidates[0].candidate_type);
+    try testing.expectEqual(ice.CandidateType.host.priority(), agent.remote_candidates[0].priority);
 }
 
-test "handleRequest: nominate peer" {
+test "LiteAgent.handleRequest: nominate peer" {
     var agent = try testNewAgent(.controlled);
     defer agent.deinit();
 
@@ -768,21 +855,21 @@ test "handleRequest: nominate peer" {
     try testing.expectEqual(NominatedPair{ .local = 0, .remote = 0 }, agent.nominated_pair.?);
 }
 
-test "handleRequest: role conflict" {
-    var core = try testNewAgent(.controlled);
-    defer core.deinit();
+test "LiteAgent.handleRequest: role conflict" {
+    var agent = try testNewAgent(.controlled);
+    defer agent.deinit();
 
     var buffer: [1024]u8 = undefined;
     var resp_buffer: [1024]u8 = undefined;
 
     const base_addr = try IpAddress.parse("192.168.1.100", 1000);
     const from = try IpAddress.parse("192.168.1.120", 2000);
-    try core.addLocalAddrs(&.{base_addr});
+    try agent.addLocalAddrs(&.{base_addr});
 
     // Unknown sender: no response.
-    const unknown = try testBuildRequest(.{ .ice_controlled = 0, .priority = 0x9090, .username = "user:peer" }, core.credentials.getPassword(), &buffer);
-    try testing.expectEqual(null, try core.handleRequest(&unknown, &base_addr, &from));
-    try core.addRemoteCandidate(.initHost(from));
+    const unknown = try testBuildRequest(.{ .ice_controlled = 0, .priority = 0x9090, .username = "user:peer" }, agent.credentials.getPassword(), &buffer);
+    try testing.expectEqual(null, try agent.handleRequest(&unknown, &base_addr, &from));
+    try agent.addRemoteCandidate(.initHost(from));
 
     // Whichever side wins the tie-breaker, the role never flips.
     for ([_]u64{ std.math.maxInt(u64), 0 }) |peer_tie_breaker| {
@@ -790,17 +877,17 @@ test "handleRequest: role conflict" {
             .ice_controlled = peer_tie_breaker,
             .priority = 0x9090,
             .username = "user:peer",
-        }, core.credentials.getPassword(), &buffer);
+        }, agent.credentials.getPassword(), &buffer);
 
-        const resp = try testRespond(&core, &msg, &base_addr, &from, &resp_buffer);
+        const resp = try testRespond(&agent, &msg, &base_addr, &from, &resp_buffer);
         const resp_msg = try stun.Message.parse(resp.data);
 
         try testing.expectEqual(.error_response, resp_msg.header.message_type.class());
         try testing.expectEqual(.binding, resp_msg.header.message_type.method());
         try testing.expectEqual(msg.header.transaction_id, resp_msg.header.transaction_id);
-        try testing.expectEqual(.controlled, core.role);
+        try testing.expectEqual(.controlled, agent.role);
 
-        var it = resp_msg.iterateAttributes(core.credentials.getPassword());
+        var it = resp_msg.iterateAttributes(agent.credentials.getPassword());
         const attr = (try it.next()).?;
         try testing.expectEqual(.error_code, @as(stun.AttributeType, attr));
         try testing.expectEqual(.role_conflict, attr.error_code.code);
@@ -808,7 +895,7 @@ test "handleRequest: role conflict" {
     }
 }
 
-test "pollTransmit: keeps the message queued on WriteFailed" {
+test "LiteAgent.pollTransmit: keeps the message queued on WriteFailed" {
     var small: [stun.header_size - 1]u8 = undefined;
     var tx_buf: [1024]u8 = undefined;
     var req_buf: [1024]u8 = undefined;
@@ -847,4 +934,284 @@ test "pollTransmit: keeps the message queued on WriteFailed" {
     try testing.expectEqual(.request, (try stun.Message.parse(consent.data)).header.message_type.class());
     try testing.expect(consent.to.eql(&remote));
     try testing.expectEqual(null, try agent.pollTransmit(&tx_buf));
+}
+
+test "LiteAgent.addLocalAddrs: reports new candidates, skips duplicates and completes on an empty list" {
+    const addrs = try TestAddrs.init();
+    var agent = try testNewAgent(.controlled);
+    defer agent.deinit();
+
+    try agent.addLocalAddrs(&.{ addrs.local, addrs.new_local, addrs.local });
+    try expectGatheringStateEvent(&agent, .gathering);
+    try testing.expectEqual(Event{ .candidate = .{ 0, 1 } }, agent.pollEvent().?);
+    try testing.expectEqual(2, agent.candidates_len);
+
+    try agent.addLocalAddrs(&.{addrs.local}); // only duplicates: no candidate event
+    try testing.expectEqual(null, agent.pollEvent());
+
+    try agent.addLocalAddrs(&.{});
+    try expectGatheringStateEvent(&agent, .complete);
+    try testing.expectError(error.GatheringDone, agent.addLocalAddrs(&.{addrs.other}));
+}
+
+test "LiteAgent.setRemoteCredentials: starts checking; same is a no-op, changed requires a restart" {
+    var agent = try testNewAgent(.controlled);
+    defer agent.deinit();
+
+    try agent.setRemoteCredentials(test_peer, 0);
+    try expectConnectionStateEvent(&agent, .checking);
+    try testing.expectEqual(@as(?i64, agent.failed_timeout), agent.pollTimeout());
+
+    try agent.setRemoteCredentials(test_peer, 10);
+    try testing.expectEqual(null, agent.pollEvent());
+
+    try testing.expectError(error.InvalidCredentials, agent.setRemoteCredentials(.{ .username = "peer", .password = test_new_peer.password }, 10));
+    try testing.expectError(error.RestartRequired, agent.setRemoteCredentials(test_new_peer, 10));
+    try testing.expectEqualStrings("peer", agent.getRemoteCredentials().?.username);
+}
+
+test "LiteAgent.handleRead: USE-CANDIDATE nominates the pair and connects" {
+    const addrs = try TestAddrs.init();
+    var agent = try testNewAgent(.controlled);
+    defer agent.deinit();
+
+    var buffer: [1024]u8 = undefined;
+    var tx_buf: [1024]u8 = undefined;
+
+    try agent.addLocalAddrs(&.{addrs.local});
+    try agent.addRemoteCandidate(.initHost(addrs.remote));
+    try agent.setRemoteCredentials(test_peer, 0);
+    while (agent.pollEvent()) |_| {}
+
+    // A plain check is answered but nominates nothing.
+    const check = try testBuildRequest(.{ .ice_controlling = 1, .username = "user:peer" }, test_local_password, &buffer);
+    try testing.expectEqual(ReadResult.consumed, try agent.handleRead(.{ .from = &addrs.remote, .to = &addrs.local, .data = check.bytes }, 0));
+    _ = (try agent.pollTransmit(&tx_buf)) orelse return error.ExpectedTransmit;
+    try testing.expectEqual(null, agent.pollEvent());
+
+    const nominate = try testBuildRequest(.{ .ice_controlling = 1, .username = "user:peer", .use_candidate = true }, test_local_password, &buffer);
+    _ = try agent.handleRead(.{ .from = &addrs.remote, .to = &addrs.local, .data = nominate.bytes }, 0);
+
+    const resp = (try agent.pollTransmit(&tx_buf)) orelse return error.ExpectedTransmit;
+    try testing.expect(resp.from.eql(&addrs.local) and resp.to.eql(&addrs.remote));
+    try testing.expectEqual(.success_response, (try stun.Message.parse(resp.data)).header.message_type.class());
+    try expectSignedWith(resp.data, test_local_password);
+
+    try expectNominatedEvent(&agent, .{ .local = 0, .remote = 0 });
+    try expectConnectionStateEvent(&agent, .connected);
+    try testing.expect(agent.getNominatedRemoteAddress().?.eql(&addrs.remote));
+
+    // A later nomination from another address doesn't move the selected pair.
+    _ = try agent.handleRead(.{ .from = &addrs.other, .to = &addrs.local, .data = nominate.bytes }, 0);
+    try testing.expectEqual(NominatedPair{ .local = 0, .remote = 0 }, agent.nominated_pair.?);
+    try testing.expectEqual(null, agent.pollEvent());
+
+    const data = try agent.handleWrite(&buffer, 4);
+    try testing.expect(data.from.eql(&addrs.local) and data.to.eql(&addrs.remote));
+    try testing.expectEqualDeep(ReadResult{ .app_data = "data" }, try agent.handleRead(.{ .from = &addrs.other, .to = &addrs.local, .data = "data" }, 0));
+}
+
+test "LiteAgent.handleRead: drops malformed requests and app data from unknown senders" {
+    const addrs = try TestAddrs.init();
+    var agent = try testNewAgent(.controlled);
+    defer agent.deinit();
+
+    var buffer: [1024]u8 = undefined;
+    var tx_buf: [1024]u8 = undefined;
+
+    try agent.addLocalAddrs(&.{addrs.local});
+    try agent.addRemoteCandidate(.initHost(addrs.remote));
+    try agent.setRemoteCredentials(test_peer, 0);
+
+    // No ICE-CONTROLLING/ICE-CONTROLLED attribute.
+    const malformed = try testBuildRequest(.{ .username = "user:peer" }, test_local_password, &buffer);
+    try testing.expectEqual(ReadResult.consumed, try agent.handleRead(.{ .from = &addrs.remote, .to = &addrs.local, .data = malformed.bytes }, 0));
+    try testing.expectEqual(null, try agent.pollTransmit(&tx_buf));
+
+    try testing.expectEqual(ReadResult.consumed, try agent.handleRead(.{ .from = &addrs.other, .to = &addrs.local, .data = "data" }, 0));
+    try testing.expectEqualDeep(ReadResult{ .app_data = "data" }, try agent.handleRead(.{ .from = &addrs.remote, .to = &addrs.local, .data = "data" }, 0));
+}
+
+test "LiteAgent.handleRead: unauthenticated requests get a 401 from known senders only" {
+    const addrs = try TestAddrs.init();
+    var buffer: [1024]u8 = undefined;
+    var tx_buf: [1024]u8 = undefined;
+
+    // Wrong ufrag, then wrong password, in checking and completed (consent).
+    const requests = [_]ice.Credentials{
+        .{ .username = "other:peer", .password = test_local_password },
+        .{ .username = "user:peer", .password = "wrong-password-0123456789" },
+    };
+
+    for ([_]ice.ConnectionState{ .checking, .completed }) |state| for (requests) |r| {
+        var agent = try testNewAgent(.controlled);
+        defer agent.deinit();
+        try testConnect(&agent, &addrs);
+        if (state == .checking) {
+            agent.nominated_pair = null;
+            agent.connection_state = .checking;
+        } else agent.connection_state = .completed;
+
+        const req = try testBuildRequest(.{ .ice_controlling = 1, .username = r.username, .use_candidate = true }, r.password, &buffer);
+        _ = try agent.handleRead(.{ .from = &addrs.other, .to = &addrs.local, .data = req.bytes }, 0);
+        try testing.expectEqual(null, try agent.pollTransmit(&tx_buf));
+        try testing.expectEqual(1, agent.remote_candidates_len); // no peer reflexive candidate
+
+        _ = try agent.handleRead(.{ .from = &addrs.remote, .to = &addrs.local, .data = req.bytes }, 0);
+        const resp = (try agent.pollTransmit(&tx_buf)) orelse return error.ExpectedTransmit;
+        try testing.expect(resp.from.eql(&addrs.local) and resp.to.eql(&addrs.remote));
+
+        const msg = try stun.Message.parse(resp.data);
+        try testing.expectEqual(.error_response, msg.header.message_type.class());
+        var it = msg.iterateAttributes(&.{});
+        try testing.expectEqual(.unauthorized, (try it.next()).?.error_code.code);
+        if (state == .checking) try testing.expectEqual(null, agent.nominated_pair);
+    };
+}
+
+test "LiteAgent.handleTimeout: checking fails after failed_timeout" {
+    var agent = try testNewAgent(.controlled);
+    defer agent.deinit();
+
+    try agent.setRemoteCredentials(test_peer, 0);
+    try expectConnectionStateEvent(&agent, .checking);
+
+    try agent.handleTimeout(agent.failed_timeout - 1);
+    try testing.expectEqual(null, agent.pollEvent());
+
+    try agent.handleTimeout(agent.failed_timeout);
+    try expectConnectionStateEvent(&agent, .failed);
+    try testing.expectEqual(null, agent.pollTimeout());
+}
+
+test "LiteAgent.handleTimeout: consent freshness keeps the connection alive, its loss disconnects then fails" {
+    const addrs = try TestAddrs.init();
+    var agent = try testNewAgent(.controlled);
+    defer agent.deinit();
+    try testConnect(&agent, &addrs);
+
+    var buffer: [1024]u8 = undefined;
+    var tx_buf: [1024]u8 = undefined;
+
+    try testing.expectEqual(@as(?i64, keep_alive_interval), agent.pollTimeout());
+
+    // Keep-alive completes the connection and sends a consent request on the nominated pair.
+    var now: i64 = keep_alive_interval;
+    try agent.handleTimeout(now);
+    try expectConnectionStateEvent(&agent, .completed);
+    const consent = (try agent.pollTransmit(&tx_buf)) orelse return error.ExpectedTransmit;
+    try testing.expect(consent.from.eql(&addrs.local) and consent.to.eql(&addrs.remote));
+    try testing.expectEqualStrings("peer:user", try testUsername(consent.data));
+    try expectSignedWith(consent.data, test_peer.password);
+    const tx_id = (try stun.Message.parse(consent.data)).header.transaction_id;
+
+    // Only an authenticated response to that request refreshes consent.
+    const deadline = agent.disconnected_connection_deadline;
+    const forged = try testBuildResponse(tx_id, addrs.local, "wrong-password-0123456789", &buffer);
+    _ = try agent.handleRead(.{ .from = &addrs.remote, .to = &addrs.local, .data = forged.bytes }, now + 100);
+    try testing.expectEqual(deadline, agent.disconnected_connection_deadline);
+
+    const valid = try testBuildResponse(tx_id, addrs.local, test_peer.password, &buffer);
+    _ = try agent.handleRead(.{ .from = &addrs.remote, .to = &addrs.local, .data = valid.bytes }, now + 100);
+    try testing.expectEqual(now + 100 + agent.disconnected_timeout, agent.disconnected_connection_deadline);
+    try testing.expectEqual(null, agent.consent_tx_id);
+
+    // Unanswered consent: disconnected, then back to completed on a late response.
+    now = agent.disconnected_connection_deadline;
+    try agent.handleTimeout(now);
+    const late = (try agent.pollTransmit(&tx_buf)) orelse return error.ExpectedTransmit;
+    try expectConnectionStateEvent(&agent, .disconnected);
+
+    const late_resp = try testBuildResponse((try stun.Message.parse(late.data)).header.transaction_id, addrs.local, test_peer.password, &buffer);
+    _ = try agent.handleRead(.{ .from = &addrs.remote, .to = &addrs.local, .data = late_resp.bytes }, now);
+    try expectConnectionStateEvent(&agent, .completed);
+
+    // Consent lost for good.
+    now = agent.disconnected_connection_deadline;
+    try agent.handleTimeout(now);
+    try expectConnectionStateEvent(&agent, .disconnected);
+    try agent.handleTimeout(agent.disconnected_connection_deadline);
+    try expectConnectionStateEvent(&agent, .failed);
+    try testing.expectEqual(null, agent.pollTimeout());
+}
+
+test "LiteAgent.applyRestart: graceful restart keeps the old pair until the new generation nominates" {
+    const addrs = try TestAddrs.init();
+    var agent = try testNewAgent(.controlled);
+    defer agent.deinit();
+    try testConnect(&agent, &addrs);
+
+    var buffer: [1024]u8 = undefined;
+    var tx_buf: [1024]u8 = undefined;
+
+    try agent.restart(test_new_credentials, 0);
+    try testing.expectEqual(.connected, agent.connection_state);
+    try testing.expectEqual(null, agent.pollEvent());
+    try testing.expectEqual(null, agent.nominated_pair);
+
+    // Data and old-credentials requests still use the pre-restart pair.
+    const data = try agent.handleWrite(&buffer, 4);
+    try testing.expect(data.from.eql(&addrs.local) and data.to.eql(&addrs.remote));
+
+    const old_req = try testBuildRequest(.{ .ice_controlling = 1, .username = "user:peer" }, test_local_password, &buffer);
+    _ = try agent.handleRead(.{ .from = &addrs.remote, .to = &addrs.local, .data = old_req.bytes }, 0);
+    const old_resp = (try agent.pollTransmit(&tx_buf)) orelse return error.ExpectedTransmit;
+    try testing.expect(old_resp.from.eql(&addrs.local) and old_resp.to.eql(&addrs.remote));
+    try expectSignedWith(old_resp.data, test_local_password);
+
+    // The new generation's nomination switches over.
+    try agent.setRemoteCredentials(test_new_peer, 0);
+    try agent.addLocalAddrs(&.{addrs.new_local});
+    try agent.addRemoteCandidate(.initHost(addrs.new_remote));
+    while (agent.pollEvent()) |_| {}
+
+    const new_req = try testBuildRequest(.{ .ice_controlling = 1, .username = "user2:peer2", .use_candidate = true }, test_new_credentials.password, &buffer);
+    _ = try agent.handleRead(.{ .from = &addrs.new_remote, .to = &addrs.new_local, .data = new_req.bytes }, 0);
+    const new_resp = (try agent.pollTransmit(&tx_buf)) orelse return error.ExpectedTransmit;
+    try expectSignedWith(new_resp.data, test_new_credentials.password);
+
+    try expectNominatedEvent(&agent, .{ .local = 0, .remote = 0 });
+    try expectConnectionStateEvent(&agent, .connected);
+    try testing.expect(!agent.restarting());
+
+    const new_data = try agent.handleWrite(&buffer, 4);
+    try testing.expect(new_data.from.eql(&addrs.new_local) and new_data.to.eql(&addrs.new_remote));
+}
+
+test "LiteAgent.applyRestart: hard restart drops the pair and goes back to checking" {
+    const addrs = try TestAddrs.init();
+    var agent = try Agent(.{ .restart_mode = .hard }).init(testing.allocator, .{
+        .role = .controlled,
+        .credentials = .{ .username = "user", .password = test_local_password },
+        .random = rand.random(),
+    });
+    defer agent.deinit();
+    try testConnect(&agent, &addrs);
+
+    var tx_buf: [1024]u8 = undefined;
+
+    try agent.restart(test_new_credentials, 0);
+    try expectConnectionStateEvent(&agent, .checking);
+    try testing.expectEqual(null, agent.nominated_pair);
+    try testing.expectEqual(null, agent.getRemoteCredentials());
+    try testing.expectEqualStrings("user2", agent.getLocalCredentials().username);
+
+    // No keep-alive consent without a pair.
+    try testing.expectEqual(@as(?i64, agent.failed_timeout), agent.pollTimeout());
+    try agent.handleTimeout(keep_alive_interval);
+    try testing.expectEqual(null, try agent.pollTransmit(&tx_buf));
+}
+
+test "LiteAgent.close: reports closed once and stops everything" {
+    const addrs = try TestAddrs.init();
+    var agent = try testNewAgent(.controlled);
+    defer agent.deinit();
+    try testConnect(&agent, &addrs);
+
+    agent.close();
+    agent.close();
+    try expectConnectionStateEvent(&agent, .closed);
+    try testing.expectEqual(null, agent.pollEvent());
+    try testing.expectEqual(null, agent.pollTimeout());
+    try testing.expectError(error.Closed, agent.stageRestart(test_new_credentials));
 }
