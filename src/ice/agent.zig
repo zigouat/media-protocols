@@ -7,94 +7,30 @@ const stun = @import("stun");
 const ice = @import("ice.zig");
 const CandidatePair = @import("candidate_pair.zig");
 const Messages = @import("messages.zig");
+const common = @import("common.zig");
 
 const Candidate = ice.Candidate;
 const CandidateIndex = CandidatePair.CandidateIndex;
 const IpAddress = std.Io.net.IpAddress;
 const Logger = std.log.scoped(.ice);
 const AllocError = std.mem.Allocator.Error;
+const LocalCredentials = common.LocalCredentials;
+const Response = common.Response;
+
+pub const RestartError = common.RestartError;
+pub const SetRemoteCredentialsError = common.SetRemoteCredentialsError;
+pub const NominatedPair = common.NominatedPair;
+pub const RemoteCandidate = common.RemoteCandidate;
+pub const Event = common.Event;
+pub const ReadResult = common.ReadResult;
+pub const RestartMode = common.RestartMode;
+pub const keep_alive_interval = common.keep_alive_interval;
+pub const Config = common.Config;
 
 pub const AddServerError = AllocError || error{
     GatheringDone,
     /// The TURN username exceeds `stun.turn.max_username_len`.
     UsernameTooLong,
-};
-
-pub const RestartError = error{
-    Closed,
-    /// The previous restart's new generation hasn't nominated a pair yet.
-    RestartInProgress,
-    CredentialsTooLong,
-};
-
-pub const SetRemoteCredentialsError = AllocError || error{
-    CredentialsTooLong,
-    /// Credentials differ from the current ones; call `restart` first.
-    RestartRequired,
-    /// Only one of ufrag/pwd changed; a restart changes both (RFC 8839).
-    InvalidCredentials,
-};
-
-pub const NominatedPair = struct {
-    local: CandidateIndex,
-    remote: CandidateIndex,
-};
-
-pub const RemoteCandidate = struct {
-    address: IpAddress,
-    candidate_type: ice.CandidateType,
-    priority: u32,
-};
-
-fn LocalCredentials(comptime size: u8) type {
-    return struct {
-        buffer: [size]u8,
-        user_len: u8,
-        pass_len: u8,
-
-        pub fn init(username: []const u8, password: []const u8) error{CredentialsTooLong}!@This() {
-            if (username.len + password.len > size) return error.CredentialsTooLong;
-            var credentials: @This() = undefined;
-            @memcpy(credentials.buffer[0..username.len], username);
-            @memcpy(credentials.buffer[username.len .. username.len + password.len], password);
-            credentials.user_len = @intCast(username.len);
-            credentials.pass_len = @intCast(password.len);
-            return credentials;
-        }
-
-        pub fn getUsername(self: *const @This()) []const u8 {
-            return self.buffer[0..self.user_len];
-        }
-
-        pub fn getPassword(self: *const @This()) []const u8 {
-            return self.buffer[self.user_len .. self.user_len + self.pass_len];
-        }
-
-        pub fn toIceCredentials(self: *const @This()) ice.Credentials {
-            return .{
-                .username = self.getUsername(),
-                .password = self.getPassword(),
-            };
-        }
-
-        pub fn clear(self: *@This()) void {
-            self.user_len = 0;
-            self.pass_len = 0;
-            std.crypto.secureZero(u8, &self.buffer);
-        }
-    };
-}
-
-pub const Event = union(enum) {
-    connection_state: ice.ConnectionState,
-    gathering_state: ice.GatheringState,
-    nominated: NominatedPair,
-    candidate: struct { CandidateIndex, CandidateIndex }, // range inclusive
-};
-
-pub const ReadResult = union(enum) {
-    app_data: []const u8,
-    consumed: void,
 };
 
 /// A resolved STUN or TURN server.
@@ -108,41 +44,9 @@ const PendingRequest = struct {
     pair: u16,
 };
 
-const Response = struct {
-    tx_id: [12]u8,
-    local: CandidateIndex,
-    remote: CandidateIndex,
-    kind: Kind = .success,
-
-    const Kind = enum(u3) { success, role_conflict, success_restart, bad_request, unauthorized };
-
-    fn authErrorKind(err: anyerror) ?Kind {
-        return switch (err) {
-            error.BadRequest => .bad_request,
-            error.Unauthorized => .unauthorized,
-            else => null,
-        };
-    }
-};
-
 /// The maximum number of binding requests sent on a pair before it is
 /// considered failed.
 pub const max_binding_requests: usize = 7;
-pub const keep_alive_interval: i64 = 4 * std.time.ms_per_s;
-
-pub const Config = struct {
-    /// The role of the agent.
-    role: ice.Role,
-    credentials: ice.Credentials,
-    /// A random number generator implementation used for generating transaction IDs and tie breakers.
-    random: std.Random,
-    /// The time in milliseconds after which a connection is considered failed if no data is received or no connection is established.
-    failed_timeout: u32 = 25 * std.time.ms_per_s,
-    /// The time in milliseconds after which a connection is considered disconnected if no data is received.
-    disconnected_timeout: u32 = 5 * std.time.ms_per_s,
-    /// The interval between connectivity checks in milliseconds. This is the time between sending binding requests on all pairs.
-    connectivity_check_interval: u16 = 200,
-};
 
 /// Compare addresses by IP only, ignoring port.
 fn ipEql(a: *const IpAddress, b: *const IpAddress) bool {
@@ -166,13 +70,6 @@ fn calculatePairPriority(l: u32, r: u32, role: ice.Role) u64 {
     const last_part: u8 = if (g > d) 1 else 0;
     return (@as(u64, 1) << 32) * @min(g, d) + 2 * @max(g, d) + last_part;
 }
-
-pub const RestartMode = enum {
-    /// The old nominated pair is kept so media and data can still flow until the new session nominates a pair.
-    graceful,
-    /// The whole session is dropped and restarted, which may cause a temporary disruption of media and data.
-    hard,
-};
 
 pub fn Agent(comptime config: struct {
     auth_info_size: u8 = 64,
@@ -334,18 +231,18 @@ pub fn Agent(comptime config: struct {
             agent.remote_candidates_len = 0;
         }
 
-        pub fn getRemoteCredentials(core: *const Self) ?ice.Credentials {
-            return if (core.remote_credentials) |*rc| rc.toIceCredentials() else null;
+        pub fn getRemoteCredentials(agent: *const Self) ?ice.Credentials {
+            return if (agent.remote_credentials) |*rc| rc.toIceCredentials() else null;
         }
 
         /// The credentials to advertise: the staged ones during a pending restart.
-        pub fn getLocalCredentials(core: *const Self) ice.Credentials {
-            const credentials = if (core.pending_credentials) |*pending| pending else &core.credentials;
+        pub fn getLocalCredentials(agent: *const Self) ice.Credentials {
+            const credentials = if (agent.pending_credentials) |*pending| pending else &agent.credentials;
             return credentials.toIceCredentials();
         }
 
-        pub fn getNominatedRemoteAddress(core: *const Self) ?IpAddress {
-            return if (core.nominated_pair) |nominated| core.remote_candidates[nominated.remote].address else null;
+        pub fn getNominatedRemoteAddress(agent: *const Self) ?IpAddress {
+            return if (agent.nominated_pair) |nominated| agent.remote_candidates[nominated.remote].address else null;
         }
 
         /// Add local addresses to the agent. The first call starts gathering.
@@ -449,34 +346,34 @@ pub fn Agent(comptime config: struct {
             }
         }
 
-        pub fn addServerReflexiveCandidate(core: *Self, base: IpAddress, mapped: IpAddress) AllocError!?CandidateIndex {
-            for (core.candidates[0..core.candidates_len]) |candidate|
+        pub fn addServerReflexiveCandidate(agent: *Self, base: IpAddress, mapped: IpAddress) AllocError!?CandidateIndex {
+            for (agent.candidates[0..agent.candidates_len]) |candidate|
                 if (candidate.candidate_type == .host and ipEql(&candidate.base, &mapped)) return null;
 
             const candidate = Candidate.initServerReflexive(base, mapped);
-            return try core.addLocalCandidate(candidate);
+            return try agent.addLocalCandidate(candidate);
         }
 
-        pub fn addRemoteCandidate(core: *Self, remote_candidate: Candidate, now: i64) AllocError!void {
-            const remote_idx = try core.appendRemoteCandidate(remote_candidate);
+        pub fn addRemoteCandidate(agent: *Self, remote_candidate: Candidate, now: i64) AllocError!void {
+            const remote_idx = try agent.appendRemoteCandidate(remote_candidate);
 
-            outer_loop: for (core.candidates[0..core.candidates_len], 0..) |candidate, local_idx| {
+            outer_loop: for (agent.candidates[0..agent.candidates_len], 0..) |candidate, local_idx| {
                 if (std.meta.activeTag(remote_candidate.address) != std.meta.activeTag(candidate.base)) continue;
-                for (core.pairs.items) |*pair| {
-                    const local = core.getPairLocal(pair);
-                    const remote = core.getPairRemote(pair);
+                for (agent.pairs.items) |*pair| {
+                    const local = agent.getPairLocal(pair);
+                    const remote = agent.getPairRemote(pair);
                     if (local.base.eql(&candidate.base) and remote.address.eql(&remote_candidate.address))
                         continue :outer_loop;
                 }
 
-                try core.pairs.append(core.allocator, .{
+                try agent.pairs.append(agent.allocator, .{
                     .local = @intCast(local_idx),
                     .remote = remote_idx,
-                    .priority = calculatePairPriority(candidate.priority, remote_candidate.priority, core.role),
+                    .priority = calculatePairPriority(candidate.priority, remote_candidate.priority, agent.role),
                 });
 
                 if (candidate.candidate_type == .relay) {
-                    if (core.findTurnClient(&candidate.base)) |turn_client| {
+                    if (agent.findTurnClient(&candidate.base)) |turn_client| {
                         turn_client.createPermission(remote_candidate.address, now) catch |err| {
                             Logger.warn("Cannot create permissions for {f}: {}\n", .{ remote_candidate.address, err });
                         };
@@ -484,33 +381,33 @@ pub fn Agent(comptime config: struct {
                 }
             }
 
-            core.resumeConnectivityChecks();
+            agent.resumeConnectivityChecks();
         }
 
         /// Returns `false` if an identical candidate already exists.
-        pub fn addLocalCandidate(core: *Self, candidate: Candidate) AllocError!?CandidateIndex {
-            for (core.candidates[0..core.candidates_len]) |*existing| if (existing.eql(&candidate)) return null;
+        pub fn addLocalCandidate(agent: *Self, candidate: Candidate) AllocError!?CandidateIndex {
+            for (agent.candidates[0..agent.candidates_len]) |*existing| if (existing.eql(&candidate)) return null;
 
-            const idx = try core.appendCandidate(candidate);
+            const idx = try agent.appendCandidate(candidate);
 
-            outer_loop: for (core.remote_candidates[0..core.remote_candidates_len], 0..) |remote_candidate, remote_idx| {
+            outer_loop: for (agent.remote_candidates[0..agent.remote_candidates_len], 0..) |remote_candidate, remote_idx| {
                 if (std.meta.activeTag(remote_candidate.address) != std.meta.activeTag(candidate.base)) continue;
 
-                for (core.pairs.items) |*pair| {
-                    const local = core.getPairLocal(pair);
-                    const remote = core.getPairRemote(pair);
+                for (agent.pairs.items) |*pair| {
+                    const local = agent.getPairLocal(pair);
+                    const remote = agent.getPairRemote(pair);
                     if (local.base.eql(&candidate.base) and remote.address.eql(&remote_candidate.address))
                         continue :outer_loop;
                 }
 
-                try core.pairs.append(core.allocator, .{
+                try agent.pairs.append(agent.allocator, .{
                     .local = idx,
                     .remote = @intCast(remote_idx),
-                    .priority = calculatePairPriority(candidate.priority, remote_candidate.priority, core.role),
+                    .priority = calculatePairPriority(candidate.priority, remote_candidate.priority, agent.role),
                 });
             }
 
-            core.resumeConnectivityChecks();
+            agent.resumeConnectivityChecks();
             return idx;
         }
 
@@ -731,13 +628,13 @@ pub fn Agent(comptime config: struct {
             return .{ .data = buffer[0..payload_len], .from = path.local, .to = path.remote };
         }
 
-        pub fn pollEvent(core: *Self) ?Event {
-            return core.events_out.popFront();
+        pub fn pollEvent(agent: *Self) ?Event {
+            return agent.events_out.popFront();
         }
 
         pub fn pollTransmit(agent: *Self, buffer: []u8) error{WriteFailed}!?stun.TransportMessage {
             while (agent.responses.peekFront()) |resp| {
-                const restart_resp = config.restart_mode == .graceful and resp.kind == .success_restart;
+                const restart_resp = config.restart_mode == .graceful and resp.pair == null;
                 if (restart_resp and !agent.restarting()) {
                     _ = agent.responses.popFront();
                     continue;
@@ -747,9 +644,9 @@ pub fn Agent(comptime config: struct {
                     agent.activePath()
                 else
                     DataPath{
-                        .local = &agent.candidates[resp.local].base,
-                        .remote = &agent.remote_candidates[resp.remote].address,
-                        .turn_client = agent.findTurnClient(&agent.candidates[resp.local].base),
+                        .local = &agent.candidates[resp.pair.?.local].base,
+                        .remote = &agent.remote_candidates[resp.pair.?.remote].address,
+                        .turn_client = agent.findTurnClient(&agent.candidates[resp.pair.?.local].base),
                     };
 
                 const password = if (restart_resp)
@@ -757,7 +654,7 @@ pub fn Agent(comptime config: struct {
                 else
                     agent.credentials.getPassword();
                 const payload = switch (resp.kind) {
-                    .success, .success_restart => try Messages.buildSuccessResponse(resp.tx_id, password, active_path.remote, buffer),
+                    .success => try Messages.buildSuccessResponse(resp.tx_id, password, active_path.remote, buffer),
                     .role_conflict => try Messages.buildRoleConflictErrorMessage(resp.tx_id, password, buffer),
                     .bad_request => try Messages.buildAuthErrorResponse(resp.tx_id, error.BadRequest, buffer),
                     .unauthorized => try Messages.buildAuthErrorResponse(resp.tx_id, error.Unauthorized, buffer),
@@ -846,10 +743,10 @@ pub fn Agent(comptime config: struct {
             return if (deadline == std.math.maxInt(i64)) null else deadline;
         }
 
-        pub fn detectNominatedPair(core: *Self) void {
-            if (core.role == .controlling or core.nominated_pair != null) return;
-            for (core.pairs.items) |pair| if (pair.nominated) {
-                core.nominated_pair = .{ .local = pair.local, .remote = pair.remote };
+        pub fn detectNominatedPair(agent: *Self) void {
+            if (agent.role == .controlling or agent.nominated_pair != null) return;
+            for (agent.pairs.items) |pair| if (pair.nominated) {
+                agent.nominated_pair = .{ .local = pair.local, .remote = pair.remote };
                 return;
             };
         }
@@ -890,19 +787,19 @@ pub fn Agent(comptime config: struct {
             };
         }
 
-        fn appendCandidate(core: *Self, candidate: Candidate) error{OutOfMemory}!CandidateIndex {
-            if (core.candidates_len >= config.max_candidates) return error.OutOfMemory;
-            const idx = core.candidates_len;
-            core.candidates[idx] = candidate;
-            core.candidates_len += 1;
+        fn appendCandidate(agent: *Self, candidate: Candidate) error{OutOfMemory}!CandidateIndex {
+            if (agent.candidates_len >= config.max_candidates) return error.OutOfMemory;
+            const idx = agent.candidates_len;
+            agent.candidates[idx] = candidate;
+            agent.candidates_len += 1;
             return idx;
         }
 
-        fn appendRemoteCandidate(core: *Self, candidate: Candidate) AllocError!CandidateIndex {
-            if (core.remote_candidates_len >= config.max_remote_candidates) return error.OutOfMemory;
-            const idx = core.remote_candidates_len;
-            core.remote_candidates[idx] = .{ .address = candidate.address, .candidate_type = candidate.candidate_type, .priority = candidate.priority };
-            core.remote_candidates_len += 1;
+        fn appendRemoteCandidate(agent: *Self, candidate: Candidate) AllocError!CandidateIndex {
+            if (agent.remote_candidates_len >= config.max_remote_candidates) return error.OutOfMemory;
+            const idx = agent.remote_candidates_len;
+            agent.remote_candidates[idx] = .{ .address = candidate.address, .candidate_type = candidate.candidate_type, .priority = candidate.priority };
+            agent.remote_candidates_len += 1;
             return idx;
         }
 
@@ -1246,8 +1143,10 @@ pub fn Agent(comptime config: struct {
                 error.RoleConflict => return .{
                     .kind = .role_conflict,
                     .tx_id = msg.header.transaction_id,
-                    .local = agent.findLocalBase(base_addr) orelse return error.NoLocalCandidate,
-                    .remote = agent.findRemoteCandidate(from) orelse return null,
+                    .pair = .{
+                        .local = agent.findLocalBase(base_addr) orelse return error.NoLocalCandidate,
+                        .remote = agent.findRemoteCandidate(from) orelse return null,
+                    },
                 },
                 error.SwitchRole => blk: {
                     agent.toggleRole();
@@ -1261,8 +1160,10 @@ pub fn Agent(comptime config: struct {
                 error.BadRequest, error.Unauthorized => return .{
                     .kind = Response.authErrorKind(err).?,
                     .tx_id = msg.header.transaction_id,
-                    .local = agent.findLocalBase(base_addr) orelse return null,
-                    .remote = agent.findRemoteCandidate(from) orelse return null,
+                    .pair = .{
+                        .local = agent.findLocalBase(base_addr) orelse return null,
+                        .remote = agent.findRemoteCandidate(from) orelse return null,
+                    },
                 },
                 else => |e| return e,
             };
@@ -1302,8 +1203,7 @@ pub fn Agent(comptime config: struct {
 
             return .{
                 .tx_id = msg.header.transaction_id,
-                .local = local_candidate,
-                .remote = remote_candidate,
+                .pair = .{ .local = local_candidate, .remote = remote_candidate },
             };
         }
 
@@ -1342,12 +1242,12 @@ pub fn Agent(comptime config: struct {
             return size;
         }
 
-        fn handleSuccessResponse(core: *Self, msg: *const stun.Message, base_addr: *const IpAddress, from: *const IpAddress) !void {
+        fn handleSuccessResponse(agent: *Self, msg: *const stun.Message, base_addr: *const IpAddress, from: *const IpAddress) !void {
             const pending_request = blk: {
                 const tx_id = msg.header.transaction_id;
-                for (core.pending_requests.items, 0..) |pr, i| {
+                for (agent.pending_requests.items, 0..) |pr, i| {
                     if (std.mem.eql(u8, &pr.transaction_id, &tx_id)) {
-                        const pending_request = core.pending_requests.swapRemove(i);
+                        const pending_request = agent.pending_requests.swapRemove(i);
                         break :blk pending_request;
                     }
                 }
@@ -1355,36 +1255,36 @@ pub fn Agent(comptime config: struct {
                 return;
             };
 
-            const expected_pair = core.pairs.items[pending_request.pair];
-            if (!core.getPairLocal(&expected_pair).base.eql(base_addr) or !core.getPairRemote(&expected_pair).address.eql(from)) return;
+            const expected_pair = agent.pairs.items[pending_request.pair];
+            if (!agent.getPairLocal(&expected_pair).base.eql(base_addr) or !agent.getPairRemote(&expected_pair).address.eql(from)) return;
 
-            if (core.findCandidatePair(base_addr, from)) |candidate_pair| {
-                const mapped_address = try Messages.parseAndValidateStunResponse(msg, core.remote_credentials.?.getPassword());
+            if (agent.findCandidatePair(base_addr, from)) |candidate_pair| {
+                const mapped_address = try Messages.parseAndValidateStunResponse(msg, agent.remote_credentials.?.getPassword());
 
                 if (mapped_address.eql(base_addr)) {
                     candidate_pair.status = .succeeded;
-                    core.maybeSetNominatedField(candidate_pair);
+                    agent.maybeSetNominatedField(candidate_pair);
                     return;
                 }
                 candidate_pair.status = .failed;
 
-                const local_idx = core.findLocalCandidate(base_addr, &mapped_address) orelse blk: {
+                const local_idx = agent.findLocalCandidate(base_addr, &mapped_address) orelse blk: {
                     const prflx_candidate: Candidate = .initPeerReflexive(base_addr.*, mapped_address);
-                    break :blk try core.appendCandidate(prflx_candidate);
+                    break :blk try agent.appendCandidate(prflx_candidate);
                 };
-                const local_candidate = core.candidates[local_idx];
-                const remote_candidate = core.getPairRemote(candidate_pair);
+                const local_candidate = agent.candidates[local_idx];
+                const remote_candidate = agent.getPairRemote(candidate_pair);
 
-                if (core.findCandidatePairByLocalAndRemote(&local_candidate, from)) |existing_candidate_pair| {
+                if (agent.findCandidatePairByLocalAndRemote(&local_candidate, from)) |existing_candidate_pair| {
                     existing_candidate_pair.status = .succeeded;
-                    core.maybeSetNominatedField(existing_candidate_pair);
+                    agent.maybeSetNominatedField(existing_candidate_pair);
                     return;
                 }
 
-                try core.pairs.append(core.allocator, .{
+                try agent.pairs.append(agent.allocator, .{
                     .local = local_idx,
                     .remote = candidate_pair.remote,
-                    .priority = calculatePairPriority(local_candidate.priority, remote_candidate.priority, core.role),
+                    .priority = calculatePairPriority(local_candidate.priority, remote_candidate.priority, agent.role),
                     .status = .succeeded,
                 });
             }
@@ -1411,7 +1311,7 @@ pub fn Agent(comptime config: struct {
             if (!message.to.eql(path.local) or !message.from.eql(path.remote)) return true;
 
             try Messages.validateConsentFreshnessRequest(&msg, ice_restart.local_credentials.toIceCredentials());
-            agent.queueResponse(.{ .kind = .success_restart, .tx_id = msg.header.transaction_id, .local = 0, .remote = 0 });
+            agent.queueResponse(.{ .tx_id = msg.header.transaction_id, .pair = null });
             return true;
         }
 
@@ -1459,8 +1359,10 @@ pub fn Agent(comptime config: struct {
                     return .{
                         .kind = kind,
                         .tx_id = msg.header.transaction_id,
-                        .local = agent.findLocalBase(to) orelse return null,
-                        .remote = agent.findRemoteCandidate(from) orelse return null,
+                        .pair = .{
+                            .local = agent.findLocalBase(to) orelse return null,
+                            .remote = agent.findRemoteCandidate(from) orelse return null,
+                        },
                     };
                 },
                 else => {},
@@ -1469,21 +1371,21 @@ pub fn Agent(comptime config: struct {
             return null;
         }
 
-        fn pairsEql(core: *Self, pair1: *const CandidatePair, pair2: *const CandidatePair) bool {
-            const local1 = core.getPairLocal(pair1);
-            const remote1 = core.getPairRemote(pair1);
+        fn pairsEql(agent: *Self, pair1: *const CandidatePair, pair2: *const CandidatePair) bool {
+            const local1 = agent.getPairLocal(pair1);
+            const remote1 = agent.getPairRemote(pair1);
 
-            const local2 = core.getPairLocal(pair2);
-            const remote2 = core.getPairRemote(pair2);
+            const local2 = agent.getPairLocal(pair2);
+            const remote2 = agent.getPairRemote(pair2);
 
             return local1.base.eql(&local2.base) and local1.address.eql(&local2.address) and
                 remote1.address.eql(&remote2.address);
         }
 
-        fn selectBestPair(core: *Self) ?u8 {
+        fn selectBestPair(agent: *Self) ?u8 {
             var selected_idx: ?u8 = null;
             var best_priority: u64 = 0;
-            for (core.pairs.items, 0..) |candidate_pair, idx| if (candidate_pair.status == .succeeded) {
+            for (agent.pairs.items, 0..) |candidate_pair, idx| if (candidate_pair.status == .succeeded) {
                 if (selected_idx == null or candidate_pair.priority > best_priority) {
                     selected_idx = @intCast(idx);
                     best_priority = candidate_pair.priority;
@@ -1493,11 +1395,11 @@ pub fn Agent(comptime config: struct {
             return selected_idx;
         }
 
-        fn findCandidatePair(core: *Self, local: *const IpAddress, remote: *const IpAddress) ?*CandidatePair {
+        fn findCandidatePair(agent: *Self, local: *const IpAddress, remote: *const IpAddress) ?*CandidatePair {
             var pair: ?*CandidatePair = null;
-            for (core.pairs.items) |*candidate| {
-                const local_c = core.getPairLocal(candidate);
-                const remote_c = core.getPairRemote(candidate);
+            for (agent.pairs.items) |*candidate| {
+                const local_c = agent.getPairLocal(candidate);
+                const remote_c = agent.getPairRemote(candidate);
                 if (local_c.base.eql(local) and remote_c.address.eql(remote)) {
                     if (pair == null or candidate.status != .failed and pair.?.status == .failed) pair = candidate;
                 }
@@ -1519,37 +1421,37 @@ pub fn Agent(comptime config: struct {
             }
         }
 
-        fn findLocalCandidate(core: *Self, base: *const IpAddress, addr: *const IpAddress) ?CandidateIndex {
-            for (core.candidates[0..core.candidates_len], 0..) |candidate, idx| {
+        fn findLocalCandidate(agent: *Self, base: *const IpAddress, addr: *const IpAddress) ?CandidateIndex {
+            for (agent.candidates[0..agent.candidates_len], 0..) |candidate, idx| {
                 if (candidate.base.eql(base) and candidate.address.eql(addr)) return @intCast(idx);
             }
             return null;
         }
 
-        fn findLocalBase(core: *Self, base: *const IpAddress) ?CandidateIndex {
-            for (core.candidates[0..core.candidates_len], 0..) |candidate, idx| if (candidate.base.eql(base)) return @intCast(idx);
+        fn findLocalBase(agent: *Self, base: *const IpAddress) ?CandidateIndex {
+            for (agent.candidates[0..agent.candidates_len], 0..) |candidate, idx| if (candidate.base.eql(base)) return @intCast(idx);
             return null;
         }
 
-        fn findRemoteCandidate(core: *Self, addr: *const IpAddress) ?CandidateIndex {
-            for (core.remote_candidates[0..core.remote_candidates_len], 0..) |candidate, idx| if (candidate.address.eql(addr)) return @intCast(idx);
+        fn findRemoteCandidate(agent: *Self, addr: *const IpAddress) ?CandidateIndex {
+            for (agent.remote_candidates[0..agent.remote_candidates_len], 0..) |candidate, idx| if (candidate.address.eql(addr)) return @intCast(idx);
             return null;
         }
 
-        fn findCandidatePairByLocalAndRemote(core: *Self, local: *const Candidate, remote: *const IpAddress) ?*CandidatePair {
-            for (core.pairs.items) |*candidate| {
-                if (core.getPairLocal(candidate).eql(local) and core.getPairRemote(candidate).address.eql(remote))
+        fn findCandidatePairByLocalAndRemote(agent: *Self, local: *const Candidate, remote: *const IpAddress) ?*CandidatePair {
+            for (agent.pairs.items) |*candidate| {
+                if (agent.getPairLocal(candidate).eql(local) and agent.getPairRemote(candidate).address.eql(remote))
                     return candidate;
             }
             return null;
         }
 
-        fn getPairLocal(core: *Self, pair: *const CandidatePair) *const Candidate {
-            return &core.candidates[pair.local];
+        fn getPairLocal(agent: *Self, pair: *const CandidatePair) *const Candidate {
+            return &agent.candidates[pair.local];
         }
 
-        fn getPairRemote(core: *Self, pair: *const CandidatePair) *const RemoteCandidate {
-            return &core.remote_candidates[pair.remote];
+        fn getPairRemote(agent: *Self, pair: *const CandidatePair) *const RemoteCandidate {
+            return &agent.remote_candidates[pair.remote];
         }
     };
 }

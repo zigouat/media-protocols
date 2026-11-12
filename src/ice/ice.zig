@@ -1,4 +1,5 @@
 pub const agent = @import("agent.zig");
+pub const lite_agent = @import("lite_agent.zig");
 pub const IfIterator = @import("if_iterator.zig");
 pub const ParsedServerUrl = @import("parsed_server_url.zig");
 
@@ -375,5 +376,6 @@ test {
     _ = @import("agent.zig");
     _ = @import("agent_test.zig");
     _ = @import("candidate_pair.zig");
+    _ = @import("common.zig");
     _ = @import("messages.zig");
 }
