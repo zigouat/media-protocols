@@ -757,6 +757,7 @@ pub fn Agent(comptime config: struct {
                 .controlled => agent.role = .controlling,
             }
             agent.tie_breaker = agent.random.int(u64);
+            agent.pending_requests.clearRetainingCapacity();
 
             for (agent.pairs.items) |*pair| {
                 const local = agent.getPairLocal(pair);
@@ -855,6 +856,7 @@ pub fn Agent(comptime config: struct {
                     try agent.handleSuccessResponse(&msg, message.to, message.from);
                     agent.detectNominatedPair();
                 },
+                .error_response => agent.handleErrorResponse(&msg) catch {},
                 else => {},
             }
 
@@ -1243,17 +1245,7 @@ pub fn Agent(comptime config: struct {
         }
 
         fn handleSuccessResponse(agent: *Self, msg: *const stun.Message, base_addr: *const IpAddress, from: *const IpAddress) !void {
-            const pending_request = blk: {
-                const tx_id = msg.header.transaction_id;
-                for (agent.pending_requests.items, 0..) |pr, i| {
-                    if (std.mem.eql(u8, &pr.transaction_id, &tx_id)) {
-                        const pending_request = agent.pending_requests.swapRemove(i);
-                        break :blk pending_request;
-                    }
-                }
-
-                return;
-            };
+            const pending_request = agent.takePendingRequest(msg) orelse return;
 
             const expected_pair = agent.pairs.items[pending_request.pair];
             if (!agent.getPairLocal(&expected_pair).base.eql(base_addr) or !agent.getPairRemote(&expected_pair).address.eql(from)) return;
@@ -1288,6 +1280,33 @@ pub fn Agent(comptime config: struct {
                     .status = .succeeded,
                 });
             }
+        }
+
+        fn handleErrorResponse(agent: *Self, msg: *const stun.Message) !void {
+            _ = agent.takePendingRequest(msg) orelse return;
+
+            var stun_error: ?stun.StunError = null;
+            var integrity: bool = false;
+            var it = msg.iterateAttributes(agent.remote_credentials.?.getPassword());
+            while (try it.next()) |attr| switch (attr) {
+                .error_code => |err| stun_error = err,
+                .message_integrity => integrity = true,
+                else => {},
+            };
+
+            if (!integrity or stun_error == null) return;
+            if (stun_error.?.code == .role_conflict) agent.toggleRole();
+        }
+
+        fn takePendingRequest(agent: *Self, msg: *const stun.Message) ?PendingRequest {
+            const tx_id = msg.header.transaction_id;
+            for (agent.pending_requests.items, 0..) |pr, i| {
+                if (std.mem.eql(u8, &pr.transaction_id, &tx_id)) {
+                    return agent.pending_requests.swapRemove(i);
+                }
+            }
+
+            return null;
         }
 
         fn maybeHandleOldGenerationMessage(agent: *Self, message: *const stun.TransportMessage) !bool {
