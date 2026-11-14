@@ -60,6 +60,18 @@ fn testBuildResponse(tx_id: [12]u8, addr: IpAddress, password: []const u8, buffe
     return try stun.Message.parse(w.final());
 }
 
+fn testBuildErrorResponse(tx_id: [12]u8, code: stun.StunErrorCode, reason: []const u8, password: []const u8, buffer: []u8) ![]const u8 {
+    var w = stun.Writer.init(buffer, .{ .password = password });
+    try w.writeHeader(.{
+        .message_type = .fromClassAndMethod(.error_response, .binding),
+        .transaction_id = tx_id,
+    });
+    try w.writeAttribute(.{ .error_code = .{ .code = code, .reason = reason } });
+    try w.writeAttribute(.{ .message_integrity = &.{} });
+    try w.writeAttribute(.fingerprint);
+    return w.final();
+}
+
 /// Unauthenticated STUN binding success response, as stun.Client expects.
 fn testStunBindingResponse(buffer: []u8, tx_id: [12]u8, addr: IpAddress) ![]const u8 {
     var w = stun.Writer.init(buffer, .{});
@@ -835,7 +847,7 @@ test "toggleRole: flips role, tie breaker and pair priorities" {
     try testing.expectEqual(controlling_priority, core.pairs.items[0].priority);
 }
 
-test "handleInput: drops non-stun data from an unknown remote before connected" {
+test "handleRead: drops non-stun data from an unknown remote before connected" {
     var core = try testNewAgent(.controlled);
     defer core.deinit();
 
@@ -848,7 +860,7 @@ test "handleInput: drops non-stun data from an unknown remote before connected" 
     try testing.expectEqual(null, core.pollEvent());
 }
 
-test "handleInput: forwards non-stun data from a known remote candidate pair" {
+test "handleRead: forwards non-stun data from a known remote candidate pair" {
     var core = try testNewAgent(.controlled);
     defer core.deinit();
 
@@ -870,7 +882,7 @@ test "handleInput: forwards non-stun data from a known remote candidate pair" {
     try testing.expectEqual(null, core.pollEvent());
 }
 
-test "handleInput: forwards non-stun data once connected regardless of sender" {
+test "handleRead: forwards non-stun data once connected regardless of sender" {
     var core = try testNewAgent(.controlled);
     defer core.deinit();
     core.connection_state = .connected;
@@ -886,7 +898,7 @@ test "handleInput: forwards non-stun data once connected regardless of sender" {
     }
 }
 
-test "handleInput: completed state answers stun requests via consent freshness" {
+test "handleRead: completed state answers stun requests via consent freshness" {
     var core = try testNewAgent(.controlled);
     defer core.deinit();
     core.connection_state = .completed;
@@ -919,7 +931,7 @@ test "handleInput: completed state answers stun requests via consent freshness" 
     try testing.expectEqual(null, core.pollEvent());
 }
 
-test "handleInput: stun request produces a response event" {
+test "handleRead: stun request produces a response event" {
     var core = try testNewAgent(.controlled);
     defer core.deinit();
 
@@ -948,7 +960,7 @@ test "handleInput: stun request produces a response event" {
     try testing.expectEqual(1, core.pairs.items.len);
 }
 
-test "handleInput: role conflict switches role and produces a response" {
+test "handleRead: role conflict switches role and produces a response" {
     var core = try testNewAgent(.controlled);
     defer core.deinit();
 
@@ -978,7 +990,7 @@ test "handleInput: role conflict switches role and produces a response" {
     try testing.expectEqual(null, core.pollEvent());
 }
 
-test "handleInput: success response completes the pending request and marks the pair succeeded" {
+test "handleRead: success response completes the pending request and marks the pair succeeded" {
     var core = try testNewAgent(.controlling);
     defer core.deinit();
 
@@ -1008,7 +1020,7 @@ test "handleInput: success response completes the pending request and marks the 
     try testing.expectEqual(0, core.pending_requests.items.len);
 }
 
-test "handleInput: success response nominates the pair and transitions to connected" {
+test "handleRead: success response nominates the pair and transitions to connected" {
     var core = try testNewAgent(.controlled);
     defer core.deinit();
 
@@ -1048,6 +1060,45 @@ test "handleInput: success response nominates the pair and transitions to connec
 
     try testing.expectEqual(@as(i64, ice.agent.keep_alive_interval), core.keep_alive_deadline);
     try testing.expectEqual(@as(i64, core.timers.disconnected_timeout), core.disconnected_connection_deadline);
+}
+
+test "handleRead: handle role conflict error response" {
+    var agent = try testNewAgent(.controlling);
+    defer agent.deinit();
+
+    _ = try agent.addLocalCandidate(.initHost(.{ .ip4 = .loopback(10000) }));
+    _ = try agent.addRemoteCandidate(.initHost(.{ .ip4 = .loopback(20000) }), 0);
+    _ = try agent.addRemoteCandidate(.initHost(.{ .ip4 = .loopback(20001) }), 0);
+    try agent.setRemoteCredentials(test_new_credentials, 0);
+
+    var buffer: [1024]u8 = undefined;
+    var resp = try testBuildErrorResponse(
+        @splat(0xee),
+        .role_conflict,
+        "",
+        agent.remote_credentials.?.getPassword(),
+        &buffer,
+    );
+
+    var result = try agent.handleRead(.{ .from = &.{ .ip4 = .loopback(20000) }, .to = &agent.candidates[0].base, .data = resp }, 0);
+    try testing.expectEqual(.consumed, result);
+    try testing.expectEqual(.controlling, agent.role);
+
+    const req = try agent.pollTransmit(&buffer) orelse return error.TestFailed; // connectivity check request
+    const req2 = try agent.pollTransmit(&buffer) orelse return error.TestFailed; // connectivity check request
+
+    for (&[_]stun.TransportMessage{ req, req2 }) |r| {
+        resp = try testBuildErrorResponse(
+            r.data[8..20].*,
+            .role_conflict,
+            "",
+            agent.remote_credentials.?.getPassword(),
+            &buffer,
+        );
+        result = try agent.handleRead(.{ .from = r.to, .to = r.from, .data = resp }, 0);
+        try testing.expectEqual(.controlled, agent.role);
+        try testing.expectEqual(0, agent.pending_requests.items.len);
+    }
 }
 
 test "setRemoteCredentials: connectivity checks start immediately and cover pairs added later" {
