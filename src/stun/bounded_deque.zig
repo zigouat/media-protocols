@@ -16,6 +16,11 @@ pub fn BoundedDeque(comptime T: type, comptime capacity: usize) type {
             self.len += 1;
         }
 
+        pub fn pushBackAssumeCapacity(self: *Self, value: T) void {
+            self.buffer[(self.head + self.len) % capacity] = value;
+            self.len += 1;
+        }
+
         pub fn popFront(self: *Self) ?T {
             if (self.len == 0) return null;
             const value = self.buffer[self.head];
@@ -32,6 +37,10 @@ pub fn BoundedDeque(comptime T: type, comptime capacity: usize) type {
         pub fn clear(self: *Self) void {
             self.head = 0;
             self.len = 0;
+        }
+
+        pub fn ensureUnusedCapacity(self: *Self, required_capacity: usize) error{OutOfMemory}!void {
+            if (capacity - self.len < required_capacity) return error.OutOfMemory;
         }
     };
 }

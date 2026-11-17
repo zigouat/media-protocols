@@ -1397,33 +1397,35 @@ test "stageRestart/discardRestart/applyRestart: staged credentials are advertise
 
 test "applyRestart: the new generation's nomination ends the restart" {
     const addrs = try TestAddrs.init();
-    var core = try testCompletedAgent(.controlled, false, &addrs);
-    defer core.deinit();
+    var agent = try testCompletedAgent(.controlled, false, &addrs);
+    defer agent.deinit();
 
     var buffer: [1024]u8 = undefined;
     var tx_buf: [1024]u8 = undefined;
 
-    try core.restart(test_new_credentials, 0);
-    try core.setRemoteCredentials(test_new_peer, 0);
-    _ = try core.addLocalCandidate(.initHost(addrs.new_local));
-    try core.addRemoteCandidate(.initHost(addrs.new_remote), 0);
+    try agent.restart(test_new_credentials, 0);
+    try expectEvent(&agent, .ice_restarted);
+
+    try agent.setRemoteCredentials(test_new_peer, 0);
+    _ = try agent.addLocalCandidate(.initHost(addrs.new_local));
+    try agent.addRemoteCandidate(.initHost(addrs.new_remote), 0);
 
     // New-generation requests are answered with the new password.
     const req = try testBuildRequest(.{ .ice_controlling = 1, .username = "user2:peer2" }, test_new_credentials.password, &buffer);
-    _ = try core.handleRead(.{ .from = &addrs.new_remote, .to = &addrs.new_local, .data = req.bytes }, 0);
-    const resp = (try core.pollTransmit(&tx_buf)) orelse return error.ExpectedTransmit;
+    _ = try agent.handleRead(.{ .from = &addrs.new_remote, .to = &addrs.new_local, .data = req.bytes }, 0);
+    const resp = (try agent.pollTransmit(&tx_buf)) orelse return error.ExpectedTransmit;
     try expectSignedWith(resp.data, test_new_credentials.password);
 
-    core.pairs.items[0].nominate_on_binding = true;
-    try core.pending_requests.append(testing.allocator, .{ .transaction_id = @splat(2), .pair = 0 });
+    agent.pairs.items[0].nominate_on_binding = true;
+    try agent.pending_requests.append(testing.allocator, .{ .transaction_id = @splat(2), .pair = 0 });
     const success = try testBuildResponse(@splat(2), addrs.new_local, test_new_peer.password, &buffer);
-    _ = try core.handleRead(.{ .from = &addrs.new_remote, .to = &addrs.new_local, .data = success.bytes }, 0);
+    _ = try agent.handleRead(.{ .from = &addrs.new_remote, .to = &addrs.new_local, .data = success.bytes }, 0);
 
-    try expectEvent(&core, .nominated);
-    try expectConnectionStateEvent(&core, .connected);
-    try testing.expectEqual(null, core.ice_restart);
+    try expectEvent(&agent, .nominated);
+    try expectConnectionStateEvent(&agent, .connected);
+    try testing.expectEqual(null, agent.ice_restart);
 
-    const data = try core.handleWrite(&buffer, 4);
+    const data = try agent.handleWrite(&buffer, 4);
     try testing.expect(data.from.eql(&addrs.new_local) and data.to.eql(&addrs.new_remote));
 }
 
@@ -1466,6 +1468,8 @@ test "handleTimeout: losing the pre-restart pair hands over to the new generatio
         core.connection_state = .disconnected;
 
         try core.restart(test_new_credentials, 0);
+        try expectEvent(&core, .ice_restarted);
+
         if (has_remote_credentials) try core.setRemoteCredentials(test_new_peer, 0);
         core.consent_freshness = true;
         core.disconnected_connection_deadline = 1000;
@@ -1562,6 +1566,7 @@ test "applyRestart: a completed agent keeps the pre-restart pair for data and co
     const req = try testBuildRequest(.{ .ice_controlled = 1, .username = "user:peer" }, test_local_password, &buffer);
     _ = try agent.handleRead(.{ .from = &addrs.remote, .to = &addrs.local, .data = req.bytes }, 0);
     try agent.restart(test_new_credentials, 0);
+    try expectEvent(&agent, .ice_restarted);
 
     try testing.expect(agent.ice_restart != null);
     try testing.expectEqual(.completed, agent.connection_state);
