@@ -215,14 +215,16 @@ pub fn Agent(comptime config: struct {
             std.debug.assert(!agent.restarting());
 
             const previous_state = agent.connection_state;
+            if (previous_state == .new) {
+                agent.credentials.clear();
+                agent.credentials = agent.pending_credentials.?;
+                agent.pending_credentials = null;
+                return;
+            }
+
+            try agent.events_out.ensureUnusedCapacity(2);
             switch (previous_state) {
-                .closed => unreachable,
-                .new => {
-                    agent.credentials.clear();
-                    agent.credentials = agent.pending_credentials.?;
-                    agent.pending_credentials = null;
-                    return;
-                },
+                .closed, .new => unreachable,
                 .checking, .failed => {
                     agent.credentials.clear();
                     if (agent.remote_credentials) |*rc| rc.clear();
@@ -254,13 +256,15 @@ pub fn Agent(comptime config: struct {
             agent.gathering_state = .new;
             agent.candidates_len = 0;
             agent.remote_candidates_len = 0;
+            agent.events_out.pushBackAssumeCapacity(.ice_restarted);
 
             if (config.restart_mode == .hard) switch (previous_state) {
                 .connected, .completed, .disconnected => {
                     agent.consent_freshness = false;
                     agent.consent_tx_id = null;
                     agent.keep_alive_deadline = std.math.maxInt(i64);
-                    try agent.setConnectionState(.checking, now);
+                    // Capacity reserved above; pushing the event is the only failure.
+                    agent.setConnectionState(.checking, now) catch unreachable;
                 },
                 else => {},
             };
@@ -1146,6 +1150,7 @@ test "LiteAgent.applyRestart: graceful restart keeps the old pair until the new 
 
     try agent.restart(test_new_credentials, 0);
     try testing.expectEqual(.connected, agent.connection_state);
+    try testing.expectEqual(.ice_restarted, std.meta.activeTag(agent.pollEvent().?));
     try testing.expectEqual(null, agent.pollEvent());
     try testing.expectEqual(null, agent.nominated_pair);
 
@@ -1191,6 +1196,7 @@ test "LiteAgent.applyRestart: hard restart drops the pair and goes back to check
     var tx_buf: [1024]u8 = undefined;
 
     try agent.restart(test_new_credentials, 0);
+    try testing.expectEqual(.ice_restarted, std.meta.activeTag(agent.pollEvent().?));
     try expectConnectionStateEvent(&agent, .checking);
     try testing.expectEqual(null, agent.nominated_pair);
     try testing.expectEqual(null, agent.getRemoteCredentials());

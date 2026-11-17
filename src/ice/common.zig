@@ -77,6 +77,8 @@ pub const Event = union(enum) {
     gathering_state: ice.GatheringState,
     nominated: NominatedPair,
     candidate: struct { CandidateIndex, CandidateIndex }, // range inclusive
+    /// Candidates were reset by a restart; not emitted from the `new` state.
+    ice_restarted: void,
 };
 
 pub const ReadResult = union(enum) {
